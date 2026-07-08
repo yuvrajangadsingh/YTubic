@@ -2003,6 +2003,112 @@ async fn clear_cover_cache(app: tauri::AppHandle) -> Result<u64, String> {
     Ok(freed)
 }
 
+#[derive(serde::Serialize)]
+struct PerfStats {
+    /// Resident memory attributed to the app, bytes.
+    #[serde(rename = "appMem")]
+    app_mem: u64,
+    /// App CPU %, summed across the attributed processes — can exceed
+    /// 100 on multi-core, the same way `top` reports per-process CPU.
+    #[serde(rename = "appCpu")]
+    app_cpu: f32,
+    /// Helper processes folded into the app figures beyond the core
+    /// process (webview children). 0 → the figures are the core
+    /// process alone, so the UI labels it "app (core)".
+    helpers: usize,
+    /// System-wide CPU %, 0..100 averaged across cores.
+    #[serde(rename = "sysCpu")]
+    sys_cpu: f32,
+    /// Used / total physical memory, bytes.
+    #[serde(rename = "memUsed")]
+    mem_used: u64,
+    #[serde(rename = "memTotal")]
+    mem_total: u64,
+}
+
+/// Sample process + system metrics for the optional stats overlay.
+/// CPU usage is a delta between two samples, so we refresh, wait the
+/// crate's minimum interval, and refresh again inside the one call —
+/// self-contained, with no long-lived `System` kept in app state.
+///
+/// App attribution walks the process tree rooted at our own PID and
+/// sums every descendant, which folds in the out-of-process webview
+/// helpers (macOS `com.apple.WebKit.*`, Windows `msedgewebview2`) when
+/// the OS reports them as our children. Helpers the OS reparents
+/// elsewhere (macOS can hand a WebContent process to launchd) fall
+/// outside that tree and aren't counted — `helpers` reflects what we
+/// could actually attribute, so the UI stays honest instead of faking
+/// precision.
+#[tauri::command]
+async fn perf_stats() -> Result<PerfStats, String> {
+    tokio::task::spawn_blocking(sample_perf_stats)
+        .await
+        .map_err(|e| format!("perf sample join: {e}"))
+}
+
+fn sample_perf_stats() -> PerfStats {
+    use std::collections::HashSet;
+    use sysinfo::{
+        CpuRefreshKind, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate,
+        RefreshKind, System,
+    };
+
+    let refresh = RefreshKind::nothing()
+        .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+        .with_memory(MemoryRefreshKind::nothing().with_ram());
+    let proc_kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
+    let mut sys = System::new_with_specifics(refresh);
+
+    // First sample establishes the CPU baseline; the second, one
+    // minimum-interval later, populates the deltas.
+    sys.refresh_specifics(refresh);
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, proc_kind);
+    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    sys.refresh_specifics(refresh);
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, proc_kind);
+
+    let self_pid = Pid::from_u32(std::process::id());
+
+    // Our PID plus every descendant. Iterate to a fixed point because a
+    // helper's own children (a WebKit GPU/Network process under a
+    // WebContent process) sit a level deeper than our direct children.
+    let mut attributed: HashSet<Pid> = HashSet::new();
+    attributed.insert(self_pid);
+    loop {
+        let mut grew = false;
+        for (pid, proc) in sys.processes() {
+            if attributed.contains(pid) {
+                continue;
+            }
+            if proc.parent().map_or(false, |p| attributed.contains(&p)) {
+                attributed.insert(*pid);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let mut app_mem = 0u64;
+    let mut app_cpu = 0f32;
+    for pid in &attributed {
+        if let Some(proc) = sys.process(*pid) {
+            app_mem += proc.memory();
+            app_cpu += proc.cpu_usage();
+        }
+    }
+
+    PerfStats {
+        app_mem,
+        app_cpu,
+        helpers: attributed.len().saturating_sub(1),
+        sys_cpu: sys.global_cpu_usage(),
+        mem_used: sys.used_memory(),
+        mem_total: sys.total_memory(),
+    }
+}
+
 #[derive(Default)]
 struct StreamServerState {
     port: Arc<Mutex<Option<u16>>>,
@@ -2680,6 +2786,7 @@ pub fn run() {
             focus_main_window,
             open_player_window,
             close_player_window,
+            perf_stats,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -2815,6 +2922,18 @@ mod tests {
     }
 
     use super::merge_set_cookies_into_jar;
+
+    #[test]
+    fn perf_stats_reports_live_totals() {
+        // Smoke test the sysinfo wiring: total physical memory is always
+        // non-zero on a real host, and our own process has resident
+        // memory, so the app figure must include at least ourselves.
+        // CPU is deliberately not asserted — it can legitimately read 0.
+        let s = super::sample_perf_stats();
+        assert!(s.mem_total > 0, "total memory should be known");
+        assert!(s.mem_used <= s.mem_total, "used never exceeds total");
+        assert!(s.app_mem > 0, "our own process contributes memory");
+    }
 
     const NOW: i64 = 1_700_000_000;
     const HOST: &str = "music.youtube.com";

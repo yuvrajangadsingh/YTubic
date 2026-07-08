@@ -50,6 +50,10 @@ tower-http = { version = "0.6", features = ["cors", "fs"] }
 tower = "0.5"
 cookie = "0.18"
 time = "0.3"
+# Process + system metrics for the optional performance-stats overlay.
+# Default features pull in components we don't need (disk/net/temps);
+# keep just the system (memory/cpu) and process readers.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
 tauri-plugin-autostart = "2"

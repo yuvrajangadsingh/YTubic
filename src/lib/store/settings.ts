@@ -21,11 +21,16 @@ type State = {
   /** System toast on track change while the app is in the background
    *  (see `lib/playback-notifications.ts`). */
   playbackNotifications: boolean;
+  /** Floating chip with app/system CPU + memory readouts. Off by
+   *  default — it polls a Rust command every couple seconds, so it
+   *  only runs while explicitly enabled. */
+  showPerfStats: boolean;
   setCloseAction: (v: CloseButtonAction) => void;
   setCacheAutoClean: (v: CacheAutoCleanPeriod) => void;
   markCacheCleaned: () => void;
   setBackground: (v: BackgroundMode) => void;
   setPlaybackNotifications: (v: boolean) => void;
+  setShowPerfStats: (v: boolean) => void;
 };
 
 /**
@@ -42,12 +47,14 @@ export const useSettingsStore = create<State>()(
       lastCacheCleanAt: 0,
       background: "ambient",
       playbackNotifications: false,
+      showPerfStats: false,
       setCloseAction: (closeAction) => set({ closeAction }),
       setCacheAutoClean: (cacheAutoClean) => set({ cacheAutoClean }),
       markCacheCleaned: () => set({ lastCacheCleanAt: Date.now() }),
       setBackground: (background) => set({ background }),
       setPlaybackNotifications: (playbackNotifications) =>
         set({ playbackNotifications }),
+      setShowPerfStats: (showPerfStats) => set({ showPerfStats }),
     }),
     { name: "ytm-settings" },
   ),

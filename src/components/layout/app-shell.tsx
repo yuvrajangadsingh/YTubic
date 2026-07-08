@@ -15,6 +15,7 @@ import { SettingsDialog } from "@/components/settings/settings-dialog";
 import { PremiumGateDialog } from "@/components/layout/premium-gate-dialog";
 import { ChannelPickerDialog } from "@/components/layout/channel-picker-dialog";
 import { WhatsNewDialog } from "@/components/layout/whats-new-dialog";
+import { PerfStatsChip } from "@/components/layout/perf-stats-chip";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAudioEngine } from "@/lib/audio-engine";
@@ -238,6 +239,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <PremiumGateDialog />
           <ChannelPickerDialog />
           <WhatsNewDialog />
+          <PerfStatsChip />
         </div>
       </SidebarProvider>
       <Toaster />

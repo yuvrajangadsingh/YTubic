@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   BellIcon,
+  GaugeIcon,
   Loader2Icon,
   LogInIcon,
   RocketIcon,
@@ -120,6 +121,8 @@ function BehaviorGroup() {
   const setPlaybackNotifications = useSettingsStore(
     (s) => s.setPlaybackNotifications,
   );
+  const showPerfStats = useSettingsStore((s) => s.showPerfStats);
+  const setShowPerfStats = useSettingsStore((s) => s.setShowPerfStats);
 
   const qc = useQueryClient();
   const autostart = useQuery({
@@ -176,6 +179,18 @@ function BehaviorGroup() {
             checked={closeAction === "tray"}
             onCheckedChange={(v) => setCloseAction(v ? "tray" : "quit")}
             aria-label="Close to tray"
+          />
+        }
+      />
+      <SettingRow
+        icon={GaugeIcon}
+        title="Show performance stats"
+        description="Overlay a small chip with app and system CPU and memory usage."
+        control={
+          <Switch
+            checked={showPerfStats}
+            onCheckedChange={setShowPerfStats}
+            aria-label="Show performance stats"
           />
         }
       />
