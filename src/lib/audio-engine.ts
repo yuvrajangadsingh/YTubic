@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { listen } from "@tauri-apps/api/event";
+import { toast } from "sonner";
 import { fetchRadio } from "@/lib/innertube/radio";
 import { prefetchStream, streamUrlFor } from "@/lib/stream";
 import { usePlaybackStore, type QueueTrack } from "@/lib/store/playback";
@@ -18,8 +19,23 @@ import { pickThumbnail } from "@/components/shared/thumbnail";
  *
  * Mount this hook once, near the root. It owns the <audio> element's lifecycle.
  */
+/**
+ * Module-level singleton for the engine's media element. It's a
+ * <video> element rather than <audio>: audio-only playback behaves
+ * identically, but when a track is flipped to its music-video source
+ * the SAME element gets mounted into the player card to show the
+ * picture — one element, one stream, nothing to keep in sync. Only
+ * the window running the engine ever creates it, so the getter
+ * returns null in the floating player window.
+ */
+let mediaEl: HTMLVideoElement | null = null;
+
+export function getPlayerMediaElement(): HTMLVideoElement | null {
+  return mediaEl;
+}
+
 export function useAudioEngine() {
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioRef = useRef<HTMLVideoElement | null>(null);
   // Guard against stale stream resolutions when the user skips mid-fetch.
   const resolveTokenRef = useRef(0);
   // Counts how many tracks have failed in a row without a successful
@@ -27,18 +43,33 @@ export function useAudioEngine() {
   // auto-skip after a few consecutive failures so we don't burn through
   // the whole queue if e.g. the network is dead.
   const consecutiveErrorsRef = useRef(0);
+  // The last videoId we auto-reverted from video→audio after a decode
+  // failure, so we do it at most once per track (a manual re-toggle can
+  // try again — the ref is cleared on the next successful play).
+  const videoFallbackRef = useRef<string | null>(null);
 
-  // Ensure a single <audio> element exists.
+  // Ensure the singleton media element exists. The element itself
+  // outlives the hook (StrictMode remounts, HMR) — cleanup only stops
+  // playback, it never destroys the node a <VideoSurface> might still
+  // be holding.
   useEffect(() => {
     if (audioRef.current) return;
-    const el = new Audio();
-    el.preload = "auto";
-    // Note: do NOT set crossOrigin — googlevideo.com doesn't return CORS
-    // headers, and setting it makes the media fail to load in the webview.
+    if (!mediaEl) {
+      const el = document.createElement("video");
+      el.preload = "auto";
+      // Keep playback inside our own surface — without this WKWebView
+      // is allowed to promote the element to native fullscreen.
+      el.playsInline = true;
+      // Note: do NOT set crossOrigin — googlevideo.com doesn't return CORS
+      // headers, and setting it makes the media fail to load in the webview.
+      mediaEl = el;
+    }
+    const el = mediaEl;
     audioRef.current = el;
     return () => {
       el.pause();
-      el.src = "";
+      el.removeAttribute("src");
+      el.load();
       audioRef.current = null;
     };
   }, []);
@@ -76,6 +107,30 @@ export function useAudioEngine() {
       if (import.meta.env.DEV) {
         console.error("[audio] element error:", msg, "src=", el.currentSrc);
       }
+
+      // Graceful macOS video fallback. A DECODE (3) / SRC_NOT_SUPPORTED
+      // (4) failure while the VIDEO source is selected means even the
+      // h264 selection couldn't be served for this track — revert to
+      // its audio source once instead of surfacing the raw MEDIA_ERR
+      // banner. The source flip re-runs the resolve effect (its deps
+      // include the selection), so playback recovers on the audio
+      // stream without advancing the queue.
+      const st = store();
+      const cur = st.index >= 0 ? st.queue[st.index] : undefined;
+      const code = mediaErr?.code;
+      if (
+        cur &&
+        (code === 3 || code === 4) &&
+        useTrackSourceStore.getState().byVideoId[cur.videoId]?.selected ===
+          "video" &&
+        videoFallbackRef.current !== cur.videoId
+      ) {
+        videoFallbackRef.current = cur.videoId;
+        useTrackSourceStore.getState().setSelected(cur.videoId, "song");
+        toast.error("Video isn't supported here — playing audio");
+        return;
+      }
+
       store().setStatus("error", msg);
 
       // Auto-advance: if the user wanted playback and we have a next
@@ -93,6 +148,7 @@ export function useAudioEngine() {
     };
     const onPlaying = () => {
       consecutiveErrorsRef.current = 0;
+      videoFallbackRef.current = null;
       store().setStatus("ready");
     };
     const onWaiting = () => {
@@ -129,6 +185,13 @@ export function useAudioEngine() {
   // source on the currently playing track.
   const streamVideoId = useTrackSourceStore((s) =>
     videoId ? resolveStreamId(videoId, s.byVideoId) : undefined,
+  );
+
+  // Whether that stream should be the actual VIDEO. Tracked separately
+  // from the id: a track whose source record only has one id still
+  // flips between the audio and video renditions of that same id.
+  const wantsVideo = useTrackSourceStore((s) =>
+    videoId ? s.byVideoId[videoId]?.selected === "video" : false,
   );
 
   // Reactive Premium check for the gate below. Subscribing (rather than
@@ -183,7 +246,7 @@ export function useAudioEngine() {
     // yt-dlp and pipes the audio bytes progressively so playback starts
     // as soon as the first chunk lands (typically ~200ms after the
     // yt-dlp subprocess starts emitting bytes).
-    streamUrlFor(streamVideoId)
+    streamUrlFor(streamVideoId, { video: wantsVideo })
       .then((src) => {
         if (token !== resolveTokenRef.current) return;
         if (import.meta.env.DEV) {
@@ -221,7 +284,9 @@ export function useAudioEngine() {
     // index, so the store replays it via pendingSeek instead — see
     // `next()` in store/playback.ts. `premiumOk` so that gaining Premium
     // (sign-in, status re-check) re-resolves a track the gate parked.
-  }, [streamVideoId, videoId, index, premiumOk]);
+    // `wantsVideo` so a Song ↔ Video flip on a track whose record maps
+    // both sides to one id still swaps the rendition.
+  }, [streamVideoId, videoId, index, premiumOk, wantsVideo]);
 
   // Play / pause follow store.
   const playing = usePlaybackStore((s) => s.playing);
@@ -393,11 +458,14 @@ export function useAudioEngine() {
   const nextStreamVideoId = useTrackSourceStore((s) =>
     nextVideoId ? resolveStreamId(nextVideoId, s.byVideoId) : undefined,
   );
+  const nextWantsVideo = useTrackSourceStore((s) =>
+    nextVideoId ? s.byVideoId[nextVideoId]?.selected === "video" : false,
+  );
   useEffect(() => {
     if (status !== "ready") return;
     if (!nextStreamVideoId) return;
-    void prefetchStream(nextStreamVideoId);
-  }, [status, nextStreamVideoId]);
+    void prefetchStream(nextStreamVideoId, { video: nextWantsVideo });
+  }, [status, nextStreamVideoId, nextWantsVideo]);
 
   // Auto-extend the queue with radio tracks when we're near the end, so
   // playback continues past the explicit queue.

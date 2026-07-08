@@ -37,6 +37,7 @@ import { LikeDislikeButtons } from "@/components/shared/like-buttons";
 import { ArtistLinks } from "@/components/shared/artist-links";
 import { PlayerMoreMenu } from "@/components/layout/player-more-menu";
 import { cn } from "@/lib/utils";
+import { getPlayerMediaElement } from "@/lib/audio-engine";
 import { usePlayerCoverDrag } from "@/lib/player-drag";
 import { usePlaybackStore, currentTrack } from "@/lib/store/playback";
 import {
@@ -77,6 +78,42 @@ export function useITunesCover(track: QueueTrack | undefined): string | null {
   }, [artistKey, titleKey]);
 
   return url;
+}
+
+/**
+ * Hosts the engine's media element while the current track plays its
+ * music-video source, so the picture shows where the cover art sits.
+ * The element is a singleton owned by the audio engine — this only
+ * parents/unparents it, playback state is never touched. Attach runs
+ * on a rAF retry because on the very first mount the engine's own
+ * effect (which creates the element) fires after this child's.
+ */
+function VideoSurface({ className }: { className?: string }) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    let raf: number | null = null;
+    let attached: HTMLVideoElement | null = null;
+    const attach = () => {
+      const el = getPlayerMediaElement();
+      if (!el) {
+        raf = requestAnimationFrame(attach);
+        return;
+      }
+      el.className = "h-full w-full object-contain";
+      host.appendChild(el);
+      attached = el;
+    };
+    attach();
+    return () => {
+      if (raf !== null) cancelAnimationFrame(raf);
+      if (attached && attached.parentNode === host) {
+        host.removeChild(attached);
+      }
+    };
+  }, []);
+  return <div ref={hostRef} className={className} />;
 }
 
 export function formatTime(seconds: number): string {
@@ -415,6 +452,13 @@ export function PlayerBar({
     })),
   );
   const track = usePlaybackStore(currentTrack);
+  // Show the actual video where the cover sits when this track streams
+  // its music-video source. Only where the engine (and so the element)
+  // lives — the floating window mirrors state but plays nothing.
+  const isVideoSource = useTrackSourceStore((s) =>
+    track ? s.byVideoId[track.videoId]?.selected === "video" : false,
+  );
+  const showVideo = isVideoSource && variant !== "floating";
   const toggle = usePlaybackStore((s) => s.toggle);
   const next = usePlaybackStore((s) => s.next);
   const prev = usePlaybackStore((s) => s.prev);
@@ -521,7 +565,9 @@ export function PlayerBar({
             variant !== "floating" && "cursor-grab active:cursor-grabbing",
           )}
         >
-          {track ? (
+          {track && showVideo ? (
+            <VideoSurface className="pointer-events-none aspect-video w-full overflow-hidden rounded-md border border-hairline bg-black" />
+          ) : track ? (
             <Thumbnail
               thumbnails={track.thumbnails}
               alt={track.title}

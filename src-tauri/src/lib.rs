@@ -1710,8 +1710,13 @@ async fn delete_cache_entries(
         let mut out = Vec::new();
         while let Ok(Some(e)) = rd.next_entry().await {
             if let Some(name) = e.file_name().to_str() {
-                if let Some(id) = name.strip_suffix(".webm") {
-                    if sanitize_video_id(id) {
+                // A track cached only as video (`<id>.video.mp4`) still
+                // has to be swept, so enumerate both variants.
+                let id = name
+                    .strip_suffix(".webm")
+                    .or_else(|| name.strip_suffix(".video.mp4"));
+                if let Some(id) = id {
+                    if sanitize_video_id(id) && !out.contains(&id.to_string()) {
                         out.push(id.to_string());
                     }
                 }
@@ -1726,13 +1731,17 @@ async fn delete_cache_entries(
     };
 
     for id in targets {
-        let path = dir.join(format!("{id}.webm"));
-        if let Ok(meta) = tokio::fs::metadata(&path).await {
-            freed += meta.len();
+        // Both stream variants for the id, plus stray .part files from
+        // crashed downloads.
+        for video in [false, true] {
+            let (part_name, final_name) = stream_file_names(&id, video);
+            let path = dir.join(final_name);
+            if let Ok(meta) = tokio::fs::metadata(&path).await {
+                freed += meta.len();
+            }
+            let _ = tokio::fs::remove_file(&path).await;
+            let _ = tokio::fs::remove_file(dir.join(part_name)).await;
         }
-        let _ = tokio::fs::remove_file(&path).await;
-        // Stray .part file from a crashed download, if any.
-        let _ = tokio::fs::remove_file(dir.join(format!("{id}.part"))).await;
     }
     Ok(freed)
 }
@@ -1824,10 +1833,9 @@ struct StreamServer {
     ytdlp_bin: PathBuf,
 }
 
-/// Read the `ephemeral` query flag from a stream/prefetch request.
-/// True when `?ephemeral=1` (or `=true`) appears — used to route the
-/// download to `ephemeral_dir` instead of the persistent cache.
-fn is_ephemeral(req: &Request) -> bool {
+/// Read a boolean query flag (`?name=1` / `?name=true`) off a stream/
+/// prefetch request.
+fn query_flag(req: &Request, name: &str) -> bool {
     let Some(query) = req.uri().query() else {
         return false;
     };
@@ -1835,8 +1843,36 @@ fn is_ephemeral(req: &Request) -> bool {
         let mut it = kv.splitn(2, '=');
         let key = it.next().unwrap_or("");
         let val = it.next().unwrap_or("");
-        key == "ephemeral" && (val == "1" || val == "true")
+        key == name && (val == "1" || val == "true")
     })
+}
+
+/// `?ephemeral=1` routes the download to `ephemeral_dir` instead of the
+/// persistent cache.
+fn is_ephemeral(req: &Request) -> bool {
+    query_flag(req, "ephemeral")
+}
+
+/// `?video=1` asks for the music-video stream (progressive h264/mp4)
+/// instead of the audio-only one. Cached side by side with the audio
+/// variant under a distinct filename.
+fn is_video(req: &Request) -> bool {
+    query_flag(req, "video")
+}
+
+/// On-disk names for one videoId's cached stream + its in-flight part
+/// file. Audio keeps the historical `.webm` name (regardless of actual
+/// container — see `sniff_stream_mime`); the video variant lives next
+/// to it so the same id can have both cached.
+fn stream_file_names(video_id: &str, video: bool) -> (String, String) {
+    if video {
+        (
+            format!("{video_id}.video.part"),
+            format!("{video_id}.video.mp4"),
+        )
+    } else {
+        (format!("{video_id}.part"), format!("{video_id}.webm"))
+    }
 }
 
 /// Hash a URL into a stable hex filename. Uses Rust's stdlib
@@ -2027,32 +2063,58 @@ async fn get_stream_base_url(
 }
 
 /// Spawn a yt-dlp downloader that writes into the shared memory buffer
-/// AND to a `<videoId>.part` file on disk. On successful exit, renames
-/// .part → .webm. Updates `state.complete` + pings `notify` on every
-/// new chunk.
+/// AND to a part file on disk (names per `stream_file_names`). On
+/// successful exit, renames the part file to its final name. Updates
+/// `state.complete` + pings `notify` on every new chunk.
 ///
-/// `target_dir` selects which on-disk pool to write to (persistent or
-/// ephemeral). `map_key` is the prefixed key in `srv.downloads` so a
-/// single videoId can be in-flight independently for both pools.
+/// `video` picks the music-video stream (progressive h264/mp4) over
+/// the audio-only one. `target_dir` selects which on-disk pool to
+/// write to (persistent or ephemeral). `map_key` is the prefixed key
+/// in `srv.downloads` so a single videoId can be in-flight
+/// independently for every pool/variant combination.
 fn spawn_downloader(
     video_id: String,
+    video: bool,
     target_dir: PathBuf,
     map_key: String,
     srv: StreamServer,
     state: Arc<DownloadState>,
 ) {
+    // Video is progressive-only (a single muxed file): yt-dlp pipes to
+    // stdout here, and merging separate video+audio tracks would need
+    // ffmpeg, which we don't ship. On macOS the selection pins
+    // h264-in-mp4 — WKWebView can't decode the vp9/av01 webm streams
+    // YouTube favours (WebView2's Chromium can), which left video mode
+    // showing MEDIA_ERR_SRC_NOT_SUPPORTED. Other platforms keep a
+    // last-resort `/b`. `b`/`best` only ever matches muxed formats, so
+    // the picked file always carries its own audio.
+    #[cfg(target_os = "macos")]
+    const VIDEO_FORMAT: &str = "b[ext=mp4][vcodec^=avc1]/b[ext=mp4]";
+    #[cfg(not(target_os = "macos"))]
+    const VIDEO_FORMAT: &str = "b[ext=mp4][vcodec^=avc1]/b[ext=mp4]/b";
+    // Audio prefers an adaptive audio-only stream (smallest download).
+    // A video-only upload with no audio-only format falls through to a
+    // muxed progressive file — `best[ext=mp4]` is itag 18 (h264 + AAC),
+    // so its audio track plays even though we requested "audio", the
+    // same way real YT Music keeps sound on a video-only track. mp4
+    // first so the fallback is WKWebView-decodable on macOS; the opus
+    // primary already decodes there for normal tracks.
+    const AUDIO_FORMAT: &str =
+        "bestaudio[ext=webm]/bestaudio/best[ext=mp4]/best";
+
     let downloads = srv.downloads.clone();
     tokio::spawn(async move {
         let url = format!("https://www.youtube.com/watch?v={video_id}");
-        let part_path = target_dir.join(format!("{video_id}.part"));
-        let final_path = target_dir.join(format!("{video_id}.webm"));
+        let (part_name, final_name) = stream_file_names(&video_id, video);
+        let part_path = target_dir.join(part_name);
+        let final_path = target_dir.join(final_name);
         let _ = tokio::fs::create_dir_all(&target_dir).await;
         let _ = tokio::fs::remove_file(&part_path).await; // clean stale
 
         let mut cmd = TokioCommand::new(ytdlp::program(&srv.ytdlp_bin));
         cmd.args([
             "-f",
-            "bestaudio[ext=webm]/bestaudio",
+            if video { VIDEO_FORMAT } else { AUDIO_FORMAT },
             "--no-playlist",
             "--no-warnings",
             "--no-part",
@@ -2181,20 +2243,23 @@ fn spawn_downloader(
 }
 
 /// Read the first 16 bytes of a completed track file and map the
-/// container magic to the right `audio/*` mime. Every track is saved
-/// with a `.webm` extension regardless of what yt-dlp actually
-/// produced, so we can't trust the extension.
-async fn sniff_audio_mime(path: &std::path::Path) -> &'static str {
+/// container magic to the right mime. Audio tracks are saved with a
+/// `.webm` extension regardless of what yt-dlp actually produced, so
+/// we can't trust the extension; the `video` flag only switches the
+/// top-level type, the container still comes from the magic bytes.
+async fn sniff_stream_mime(path: &std::path::Path, video: bool) -> &'static str {
     let mut buf = [0u8; 16];
     if let Ok(mut f) = tokio::fs::File::open(path).await {
         let _ = f.read(&mut buf).await;
     }
     if &buf[4..8] == b"ftyp" {
-        "audio/mp4"
+        if video { "video/mp4" } else { "audio/mp4" }
     } else if &buf[..4] == &[0x1A, 0x45, 0xDF, 0xA3] {
-        "audio/webm"
+        if video { "video/webm" } else { "audio/webm" }
     } else if &buf[..3] == b"ID3" {
         "audio/mpeg"
+    } else if video {
+        "video/mp4"
     } else {
         "audio/webm"
     }
@@ -2212,17 +2277,21 @@ async fn stream_handler(
     }
 
     let ephemeral = is_ephemeral(&req);
+    let video = is_video(&req);
     let target_dir = if ephemeral {
         srv.ephemeral_dir.clone()
     } else {
         srv.cache_dir.clone()
     };
-    let map_key = if ephemeral {
-        format!("e:{video_id}")
-    } else {
-        format!("p:{video_id}")
-    };
-    let final_path = target_dir.join(format!("{video_id}.webm"));
+    // Four independent in-flight pools: {persistent, ephemeral} ×
+    // {audio, video} — the same id may legitimately be downloading in
+    // more than one of them.
+    let map_key = format!(
+        "{}{}:{video_id}",
+        if ephemeral { "e" } else { "p" },
+        if video { "v" } else { "" },
+    );
+    let final_path = target_dir.join(stream_file_names(&video_id, video).1);
 
     // If the full file isn't on disk yet, start (or attach to) the
     // download and block until it completes. Attempting to progressively
@@ -2252,7 +2321,7 @@ async fn stream_handler(
         .unwrap_or("")
         .to_string();
     eprintln!(
-        "[stream] GET /stream/{video_id} range={range_hdr:?} cached={} ephemeral={ephemeral}",
+        "[stream] GET /stream/{video_id} range={range_hdr:?} cached={} ephemeral={ephemeral} video={video}",
         final_path.exists()
     );
 
@@ -2270,6 +2339,7 @@ async fn stream_handler(
                 drop(map);
                 spawn_downloader(
                     video_id.clone(),
+                    video,
                     target_dir.clone(),
                     map_key.clone(),
                     srv.clone(),
@@ -2312,7 +2382,7 @@ async fn stream_handler(
     // to m4a when a video has no webm audio — serving that as
     // `video/webm` (what tower-http guesses from the extension) makes
     // Chromium refuse to decode.
-    let sniffed_ct = sniff_audio_mime(&final_path).await;
+    let sniffed_ct = sniff_stream_mime(&final_path, video).await;
     let mut resp = ServeFile::new(&final_path)
         .oneshot(req)
         .await
@@ -2396,17 +2466,18 @@ async fn prefetch_handler(
         return StatusCode::BAD_REQUEST;
     }
     let ephemeral = is_ephemeral(&req);
+    let video = is_video(&req);
     let target_dir = if ephemeral {
         srv.ephemeral_dir.clone()
     } else {
         srv.cache_dir.clone()
     };
-    let map_key = if ephemeral {
-        format!("e:{video_id}")
-    } else {
-        format!("p:{video_id}")
-    };
-    let final_path = target_dir.join(format!("{video_id}.webm"));
+    let map_key = format!(
+        "{}{}:{video_id}",
+        if ephemeral { "e" } else { "p" },
+        if video { "v" } else { "" },
+    );
+    let final_path = target_dir.join(stream_file_names(&video_id, video).1);
     if final_path.exists() {
         return StatusCode::OK;
     }
@@ -2426,7 +2497,7 @@ async fn prefetch_handler(
         map.insert(map_key.clone(), state.clone());
         state
     };
-    spawn_downloader(video_id, target_dir, map_key, srv.clone(), state);
+    spawn_downloader(video_id, video, target_dir, map_key, srv.clone(), state);
     StatusCode::ACCEPTED
 }
 
