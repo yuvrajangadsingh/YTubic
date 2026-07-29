@@ -58,6 +58,7 @@ import {
   usePinned,
   usePinnedPlaylistsStore,
 } from "@/lib/store/pinned-playlists";
+import { IS_BETA_PLATFORM } from "@/lib/platform";
 import { openChannelPicker } from "@/lib/store/channel-picker";
 import { openSettings } from "@/lib/store/settings-dialog";
 import { UpdateBanner } from "@/components/layout/update-banner";
@@ -114,6 +115,14 @@ export function AppSidebar() {
         <span className="text-xl font-semibold leading-none tracking-tight transition-opacity duration-200 group-data-[collapsible=icon]:hidden">
           YTubic
         </span>
+        {IS_BETA_PLATFORM && (
+          <span
+            title="The build for this OS is in beta — report anything broken via ⋯ → Report an issue."
+            className="rounded-[4px] border border-border/60 bg-muted/40 px-1 pb-px pt-0.5 text-[10px] font-semibold uppercase leading-none tracking-wider text-muted-foreground group-data-[collapsible=icon]:hidden"
+          >
+            Beta
+          </span>
+        )}
       </SidebarHeader>
 
       {/* The content column itself doesn't scroll: Browse stays pinned
@@ -412,7 +421,10 @@ function SidebarSignInButton() {
               toast.error(`Sign-in failed: ${String(e)}`),
             );
           }}
-          className="h-9 w-full gap-2 group-data-[collapsible=icon]:mx-auto group-data-[collapsible=icon]:size-8 group-data-[collapsible=icon]:p-0"
+          // `flex` (not the Button's inline-flex) in collapsed mode:
+          // mx-auto only centers block-level boxes, so without it the
+          // icon button hugs the rail's left edge.
+          className="h-9 w-full gap-2 group-data-[collapsible=icon]:mx-auto group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:size-8 group-data-[collapsible=icon]:p-0"
         >
           <LogInIcon />
           <span className="group-data-[collapsible=icon]:hidden">Sign in</span>

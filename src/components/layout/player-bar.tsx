@@ -504,11 +504,13 @@ export function ProgressSlider({
 
 export function VolumeControl({
   direction = "horizontal",
+  compact = false,
 }: {
   /** "horizontal"/"vertical" are hover-popover variants for the
    *  compact bars; "inline" renders a persistent icon+slider row
    *  (the Apple Music fullscreen volume). */
   direction?: "horizontal" | "vertical" | "inline";
+  compact?: boolean;
 }) {
   const { volume, muted } = usePlaybackStore(
     useShallow((s) => ({ volume: s.volume, muted: s.muted })),
@@ -641,11 +643,19 @@ export function VolumeControl({
               value={[pct]}
               max={100}
               step={1}
-              className="w-16 [&_[data-slot=slider-track]]:bg-white/20"
+              className={cn(
+                compact ? "w-9" : "w-16",
+                "[&_[data-slot=slider-track]]:bg-white/20",
+              )}
               aria-label="Volume"
               onValueChange={([v]) => setVolume(v / 100)}
             />
-            <span className="w-7 text-right text-xs font-medium tabular-nums text-foreground">
+            <span
+              className={cn(
+                compact ? "w-6" : "w-7",
+                "ml-2 text-left text-xs font-medium tabular-nums text-foreground",
+              )}
+            >
               {pct}
             </span>
           </div>
@@ -656,6 +666,8 @@ export function VolumeControl({
 }
 
 export type PlayerBarVariant = "right" | "floating";
+
+const COMPACT_PLAYER_CONTROLS_WIDTH = 336;
 
 export function PlayerBar({
   variant = "right",
@@ -692,6 +704,8 @@ export function PlayerBar({
   const [scrub, setScrub] = useState<number | null>(null);
   const [queueOpen, setQueueOpen] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
+  const [compactControls, setCompactControls] = useState(false);
+  const playerRef = useRef<HTMLElement>(null);
   const streamKind = usePlaybackStore((s) => s.streamKind);
   const videoBuffering = usePlaybackStore((s) => s.videoBuffering);
   const videoStartup = usePlaybackStore((s) => s.videoStartup);
@@ -705,6 +719,23 @@ export function PlayerBar({
   ]);
   const accentStyle = accentStyleFor(accent);
   const lyricsState = useLyricsView(track);
+
+  // At compact widths the horizontal volume popup runs into the
+  // Song/Video switch. Shorten it while keeping the same interaction.
+  // ResizeObserver watches the actual card width, including live
+  // CSS-variable resizing, without tying every pointer move to React.
+  useEffect(() => {
+    const player = playerRef.current;
+    if (!player) return;
+    const update = (width: number) =>
+      setCompactControls(width < COMPACT_PLAYER_CONTROLS_WIDTH);
+    update(player.getBoundingClientRect().width);
+    const observer = new ResizeObserver(([entry]) => {
+      update(entry.contentRect.width);
+    });
+    observer.observe(player);
+    return () => observer.disconnect();
+  }, []);
   // The cover doubles as a drag handle for layout switching. In the
   // floating window the OS title bar already owns drag, so we don't
   // attach our own handler there.
@@ -733,7 +764,7 @@ export function PlayerBar({
   // window's own layout.
   const wrapperClass =
     variant === "right"
-      ? "fixed bottom-2 right-2 top-(--titlebar-h) z-10 flex w-[22rem] flex-col rounded-[10px] border border-sidebar-border bg-surface"
+      ? "fixed bottom-2 right-2 top-(--titlebar-h) z-10 flex w-(--player-width) flex-col rounded-[10px] border border-sidebar-border bg-surface"
       : "absolute inset-0 flex flex-col bg-surface";
 
   return (
@@ -747,7 +778,7 @@ export function PlayerBar({
     // 300ms, which makes the next tooltip pop up instantly — annoying
     // when the buttons are densely packed).
     <TooltipProvider delayDuration={800} skipDelayDuration={0}>
-    <aside className={wrapperClass} style={accentStyle}>
+    <aside ref={playerRef} className={wrapperClass} style={accentStyle}>
       {/* Queue overlay vs. cover-and-lyrics body. AnimatePresence
           crossfades the two when the user toggles the queue button.
           Both branches fill the card above the bottom action row
@@ -793,16 +824,14 @@ export function PlayerBar({
           </div>
         ) : null}
 
-        {/* `max-w-[20rem]` caps the cover at 320px so it can't grow
-            arbitrarily tall in the floating variant when the user
-            resizes the window wider — that would push the Play/Pause
-            button below the visible area. The right-card variant has
-            an effective inner width of 320 anyway (22rem - p-4*2), so
-            the cap is a no-op there. */}
+        {/* The right-card cover follows the resizable card width. Only
+            the floating variant stays capped at 320px so making that
+            window wider cannot push the controls below the viewport. */}
         <div
           onPointerDown={onCoverPointerDown}
           className={cn(
-            "mx-auto w-full max-w-[20rem] touch-none select-none",
+            "mx-auto w-full touch-none select-none",
+            variant === "floating" && "max-w-[20rem]",
             variant !== "floating" && "cursor-grab active:cursor-grabbing",
           )}
         >
@@ -1000,7 +1029,7 @@ export function PlayerBar({
             open={queueOpen}
             onToggle={() => setQueueOpen((v) => !v)}
           />
-          <VolumeControl />
+          <VolumeControl compact={compactControls} />
           {/* No expand in the floating window: a "full screen" view of a
               350px window isn't one, and the main window already offers
               the real thing. */}

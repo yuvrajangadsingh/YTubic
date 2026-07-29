@@ -45,9 +45,12 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  frostedDialogOverlay,
+  frostedDialogPanel,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { useLayoutStore, type LayoutMode } from "@/lib/store/layout";
+import { IS_MAC } from "@/lib/platform";
 import { openSettings } from "@/lib/store/settings-dialog";
 import { checkForUpdates } from "@/lib/updater";
 import { AboutDialog } from "@/components/layout/about-dialog";
@@ -65,18 +68,16 @@ const NAV_BTN_CLS =
 const IS_TAURI =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-// On macOS the window uses native decorations with an overlay title bar
-// (tauri.macos.conf.json), so the OS draws traffic lights top-left and the
-// Windows-style min/max/close cells must not render. The WKWebView UA
-// always contains "Macintosh" — no plugin needed for the platform check.
-const IS_MAC =
-  typeof navigator !== "undefined" && navigator.userAgent.includes("Mac");
+// NB: IS_MAC comes from @/lib/platform (imported above). On macOS the window
+// uses native decorations with an overlay title bar (tauri.macos.conf.json),
+// so the OS draws traffic lights top-left and the Windows-style
+// min/max/close cells must not render.
 
 /**
- * Custom title bar. The native window frame is disabled
- * (`decorations: false` in tauri.conf.json) so we draw the strip
- * ourselves: drag region down the middle, navigation controls on the
- * left, Windows-style min/maximize/close on the right.
+ * Cross-platform title bar. Windows and Linux use the frameless base config,
+ * so we draw the caption controls ourselves. macOS uses native traffic lights
+ * over an overlay title bar; the navigation cluster is inset around them and
+ * the Windows-style controls are omitted.
  *
  * Clicking our close button still goes through the Rust
  * `WindowEvent::CloseRequested` handler, which either hides the window
@@ -95,7 +96,9 @@ export function TopBar() {
   const [aboutOpen, setAboutOpen] = useState(false);
 
   useEffect(() => {
-    if (!IS_TAURI) return;
+    // macOS has no custom maximize glyph to keep in sync; native traffic
+    // lights own that state entirely.
+    if (!IS_TAURI || IS_MAC) return;
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     const win = getCurrentWindow();
@@ -138,8 +141,13 @@ export function TopBar() {
       >
         {/* On macOS the native traffic lights overlay the top-left corner
             (trafficLightPosition x:14 + ~54px of buttons), so the nav
-            cluster starts clear of them. */}
-        <div className={IS_MAC && !fullscreen ? "flex items-center gap-1 pl-[78px]" : "flex items-center gap-1 pl-2"}>
+            cluster starts clear of them. In fullscreen the lights are gone,
+            so the padding goes with them. */}
+        <div
+          className={`flex items-center gap-1 ${
+            IS_MAC && !fullscreen ? "pl-[78px]" : "pl-2"
+          }`}
+        >
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
@@ -216,33 +224,33 @@ export function TopBar() {
             almost anywhere in the bar to move the window. */}
         <div data-tauri-drag-region className="h-full flex-1" />
 
-        {IS_MAC ? null : (
-        <div className="flex h-full items-center">
-          <button
-            type="button"
-            onClick={() => win().minimize()}
-            aria-label="Minimize"
-            className="flex h-full w-11 items-center justify-center text-foreground/85 transition-colors hover:bg-titlebar-hover"
-          >
-            <MinimizeGlyph />
-          </button>
-          <button
-            type="button"
-            onClick={() => win().toggleMaximize()}
-            aria-label={maximized ? "Restore" : "Maximize"}
-            className="flex h-full w-11 items-center justify-center text-foreground/85 transition-colors hover:bg-titlebar-hover"
-          >
-            {maximized ? <RestoreGlyph /> : <MaximizeGlyph />}
-          </button>
-          <button
-            type="button"
-            onClick={() => win().close()}
-            aria-label="Close"
-            className="flex h-full w-11 items-center justify-center text-foreground/85 transition-colors hover:bg-[#c42b1c] hover:text-white"
-          >
-            <CloseGlyph />
-          </button>
-        </div>
+        {!IS_MAC && (
+          <div className="flex h-full items-center">
+            <button
+              type="button"
+              onClick={() => win().minimize()}
+              aria-label="Minimize"
+              className="flex h-full w-11 items-center justify-center text-foreground/85 transition-colors hover:bg-titlebar-hover"
+            >
+              <MinimizeGlyph />
+            </button>
+            <button
+              type="button"
+              onClick={() => win().toggleMaximize()}
+              aria-label={maximized ? "Restore" : "Maximize"}
+              className="flex h-full w-11 items-center justify-center text-foreground/85 transition-colors hover:bg-titlebar-hover"
+            >
+              {maximized ? <RestoreGlyph /> : <MaximizeGlyph />}
+            </button>
+            <button
+              type="button"
+              onClick={() => win().close()}
+              aria-label="Close"
+              className="flex h-full w-11 items-center justify-center text-foreground/85 transition-colors hover:bg-[#c42b1c] hover:text-white"
+            >
+              <CloseGlyph />
+            </button>
+          </div>
         )}
       </header>
 
@@ -372,13 +380,16 @@ function ReportIssueDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+      <DialogContent
+        className={frostedDialogPanel}
+        overlayClassName={frostedDialogOverlay}
+      >
         <DialogHeader>
           <DialogTitle>Report an issue</DialogTitle>
           <DialogDescription>
-            Tell us what went wrong or what you'd like to see. Submitting
-            opens a prefilled GitHub issue in your browser — app version
-            and OS are attached automatically.
+            Tell us what went wrong or what you'd like to see. Submitting opens
+            a prefilled GitHub issue in your browser — app version and OS are
+            attached automatically.
           </DialogDescription>
         </DialogHeader>
 
@@ -467,11 +478,7 @@ function RestoreGlyph() {
 function CloseGlyph() {
   return (
     <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden>
-      <path
-        d="M0 0 L10 10 M10 0 L0 10"
-        stroke="currentColor"
-        strokeWidth="1"
-      />
+      <path d="M0 0 L10 10 M10 0 L0 10" stroke="currentColor" strokeWidth="1" />
     </svg>
   );
 }

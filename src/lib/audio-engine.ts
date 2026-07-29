@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { fetchRadio } from "@/lib/innertube/radio";
+import { fetchRadio, fetchWatchQueueContinuation } from "@/lib/innertube/radio";
 import { prefetchStream, saveTrackMeta, streamUrlFor } from "@/lib/stream";
 import { usePlaybackStore, type QueueTrack } from "@/lib/store/playback";
 import { usePremiumStore } from "@/lib/store/premium";
@@ -21,11 +21,11 @@ import { useLyricsSources } from "@/lib/lyrics/sources";
 import { correctedDuration, shouldSkipOutro } from "@/lib/outro";
 
 /**
- * AudioEngine binds the playback store to a singleton HTMLAudioElement
- * and drives the OS media controls (Windows SMTC) from Rust via souvlaki (see
- * the media effects below and src-tauri/src/media.rs) rather than the webview's
- * own media session — that one runs in the WebView2 child process and shows up
- * as "Unknown app" in the Windows Now Playing tile.
+ * AudioEngine binds the playback store to a singleton HTMLAudioElement and
+ * drives native media controls from Rust via souvlaki (SMTC, MPRIS, and macOS
+ * Now Playing; see src-tauri/src/media.rs). The webview media session stays
+ * disabled on Windows because it belongs to WebView2 and appears as an
+ * "Unknown app" duplicate.
  *
  * Mount this hook once, near the root. It owns the <audio> element's lifecycle.
  */
@@ -1044,14 +1044,12 @@ export function useAudioEngine() {
     ) {
       void el.play().catch((e) => {
         if (e?.name === "AbortError") return;
-        usePlaybackStore
-          .getState()
-          .setStatus("error", e?.message ?? String(e));
+        usePlaybackStore.getState().setStatus("error", e?.message ?? String(e));
       });
     }
   }, [pendingSeek]);
 
-  // OS media controls (Windows SMTC) are driven from Rust via souvlaki, not
+  // OS media controls are driven from Rust via souvlaki, not
   // navigator.mediaSession — the webview's own media session shows up as
   // "Unknown app" because it belongs to the WebView2 child process. Metadata /
   // state is pushed by the media_update effect lower down; buttons come back
@@ -1104,7 +1102,8 @@ export function useAudioEngine() {
   // every press could fire twice.)
 
 
-  // SMTC / media-key button presses arrive from Rust (souvlaki) as a
+  // System media-control / media-key button presses (SMTC on Windows, MPRIS
+  // on Linux) arrive from Rust via souvlaki as a
   // `media-control` event. Drive the store the same way the old
   // navigator.mediaSession action handlers did. `cancelled` guards against
   // StrictMode's mount→unmount→mount double-listen, like the tray listener.
@@ -1131,7 +1130,8 @@ export function useAudioEngine() {
           store.prev();
           break;
         case "seek":
-          if (typeof e.payload.position === "number") store.seek(e.payload.position);
+          if (typeof e.payload.position === "number")
+            store.seek(e.payload.position);
           break;
       }
     }).then((un) => {
@@ -1223,13 +1223,54 @@ export function useAudioEngine() {
     useShallow((s) => ({
       qLen: s.queue.length,
       qIndex: s.index,
-      seedVideoId:
-        s.index >= 0 ? s.queue[s.index]?.videoId : undefined,
+      seedVideoId: s.index >= 0 ? s.queue[s.index]?.videoId : undefined,
     })),
   );
+
+  // Drain a pending server-side shuffle continuation: when playback nears
+  // the tail of the queue, pull the next ~50 tracks of the permutation and
+  // append them. Deduped against the queue — once the permutation is
+  // exhausted YTM starts repeating tracks, which is the signal to stop.
+  const queueContinuation = usePlaybackStore((s) => s.queueContinuation);
+  const continuationFetchingRef = useRef(false);
+  useEffect(() => {
+    if (!queueContinuation) return;
+    if (qIndex < 0 || qLen === 0) return;
+    // Only fetch once the playhead is close to the tail, so a freshly
+    // built 50-track queue doesn't immediately drain its whole source.
+    if (qLen - 1 - qIndex > 5) return;
+    if (continuationFetchingRef.current) return;
+    continuationFetchingRef.current = true;
+    const token = queueContinuation;
+    fetchWatchQueueContinuation(token)
+      .then((page) => {
+        const s = usePlaybackStore.getState();
+        // Stale guard: the queue was replaced while the fetch was in flight.
+        if (s.queueContinuation !== token) return;
+        const seen = new Set(s.queue.map((t) => t.videoId));
+        const fresh = page.tracks.filter((t) => !seen.has(t.id));
+        if (fresh.length) s.appendToQueue(fresh);
+        s.setQueueContinuation(
+          fresh.length > 0 ? page.continuationToken : undefined,
+        );
+      })
+      .catch(() => {
+        // Fail open: drop the token so auto-radio (if on) can take over at
+        // the end of the queue instead of wedging on a broken continuation.
+        const s = usePlaybackStore.getState();
+        if (s.queueContinuation === token) s.setQueueContinuation(undefined);
+      })
+      .finally(() => {
+        continuationFetchingRef.current = false;
+      });
+  }, [queueContinuation, qIndex, qLen]);
+
   const radioFetchedForRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (!autoRadio) return;
+    // A pending shuffle continuation owns the tail; radio only takes over
+    // once it's exhausted (the drain effect clears it).
+    if (queueContinuation) return;
     if (qIndex < 0 || !seedVideoId) return;
     // Only fire when the current track is the last queued one.
     if (qIndex < qLen - 1) return;
@@ -1250,10 +1291,10 @@ export function useAudioEngine() {
         // Allow a retry on transient failure.
         radioFetchedForRef.current = undefined;
       });
-  }, [autoRadio, qIndex, qLen, seedVideoId]);
+  }, [autoRadio, queueContinuation, qIndex, qLen, seedVideoId]);
 
-  // Push metadata + playback state to the OS media controls (Windows SMTC).
-  // Windows interpolates the scrubber between pushes while the state is
+  // Push metadata + playback state to the OS media controls. Native backends
+  // interpolate the scrubber between pushes while the state is
   // Playing, so we don't push on every timeupdate — just on track / play-state
   // / duration change, plus a light 2s refresh while playing to correct drift
   // and reflect seeks. Live values are read imperatively so this OS sync never

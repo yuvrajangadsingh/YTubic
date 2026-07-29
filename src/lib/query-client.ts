@@ -1,5 +1,6 @@
 import { QueryClient } from "@tanstack/react-query";
-import { createSyncStoragePersister } from "@tanstack/query-sync-storage-persister";
+import { createAsyncStoragePersister } from "@tanstack/query-async-storage-persister";
+import { createStore, del, get, set } from "idb-keyval";
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -12,18 +13,50 @@ export const queryClient = new QueryClient({
   },
 });
 
+// DevTools escape hatch: console `import()` of this module gets a SEPARATE
+// vite module instance (HMR `?t=` stamps), so the only way to poke the live
+// cache from the console is through a window global.
+if (import.meta.env.DEV && typeof window !== "undefined") {
+  (window as unknown as Record<string, unknown>).__qc = queryClient;
+}
+
+const idbStore =
+  typeof window !== "undefined"
+    ? createStore("ytubic-cache", "query-cache")
+    : undefined;
+
+const idbStorage = {
+  getItem: (key: string) =>
+    idbStore
+      ? get<string>(key, idbStore).then((value) => value ?? null)
+      : Promise.resolve(null),
+  setItem: (key: string, value: string) =>
+    idbStore ? set(key, value, idbStore) : Promise.resolve(),
+  removeItem: (key: string) =>
+    idbStore ? del(key, idbStore) : Promise.resolve(),
+};
+
 /**
- * Persist the entire query cache to localStorage. On next launch the
+ * Persist the query cache to IndexedDB. On next launch the
  * `PersistQueryClientProvider` rehydrates queries from disk and shows
  * cached data instantly while a background refetch happens per
  * staleTime. Keys we don't want on disk (e.g. search by query) get
  * filtered out via `dehydrateOptions`.
  */
-export const persister = createSyncStoragePersister({
-  storage: typeof window !== "undefined" ? window.localStorage : undefined,
+export const persister = createAsyncStoragePersister({
+  storage: idbStorage,
   key: "ytubic-query-cache",
-  throttleTime: 1000,
+  throttleTime: 5000,
 });
+
+// Reclaim the old WebKitGTK localStorage quota after moving this cache.
+if (typeof window !== "undefined") {
+  try {
+    window.localStorage.removeItem("ytubic-query-cache");
+  } catch {
+    // Best-effort migration; persistence remains usable through IndexedDB.
+  }
+}
 
 export const PERSIST_MAX_AGE = 1000 * 60 * 60 * 24 * 7; // 7 days
 
@@ -52,7 +85,7 @@ export function shouldPersistQuery(queryKey: readonly unknown[]): boolean {
     // Lyrics are immutable per (title, artist, album, duration) tuple
     // and the LRCLIB / YTM round-trip is the slowest part of
     // a track switch. Persisting collapses repeat plays of the same
-    // track across sessions to a free localStorage hit. The
+    // track across sessions to a free disk-cache hit. The
     // `staleTime: ONE_HOUR` in `useLyricsSources` still triggers a
     // background revalidate so newly-added LRCLIB entries surface
     // within an hour of the next play.
@@ -62,7 +95,7 @@ export function shouldPersistQuery(queryKey: readonly unknown[]): boolean {
 
 /**
  * Hard ceiling per persisted query. Beyond this size the cost of
- * serializing + writing to localStorage on every mutation outweighs the
+ * serializing + writing to disk on every mutation outweighs the
  * cold-start win. Liked-songs accounts of 5k+ tracks easily blow past
  * this, but the in-session fetch is fast enough that not persisting them
  * costs ~5 s on first cold start instead of frame-blocking serializes

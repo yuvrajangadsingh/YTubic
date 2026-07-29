@@ -53,13 +53,16 @@ export function pickThumbnail(
   return (match ?? sorted[sorted.length - 1]).url;
 }
 
+/** WebKitGTK decodes YouTube's 404 placeholder as a successful image. */
+function isYtPlaceholder(img: HTMLImageElement): boolean {
+  return img.naturalWidth <= 120 && img.naturalHeight <= 90;
+}
+
 /**
  * Pick the largest thumbnail variant the API shipped — used as the
  * safe fallback when a `high-res` upgrade attempt fails to load.
  */
-export function pickHighResThumbnail(
-  thumbnails: YtThumbnail[],
-): string | null {
+export function pickHighResThumbnail(thumbnails: YtThumbnail[]): string | null {
   if (!thumbnails.length) return null;
   const sorted = [...thumbnails].sort(
     (a, b) => (a.width ?? 0) - (b.width ?? 0),
@@ -128,9 +131,7 @@ export function Thumbnail({
   // Rust side has the bytes pinned to disk) or the original `upgraded`
   // URL if the resolve failed. Stays null until the resolve completes
   // — until then the blur-up base layer is what the user sees.
-  const [resolvedUpgraded, setResolvedUpgraded] = useState<string | null>(
-    null,
-  );
+  const [resolvedUpgraded, setResolvedUpgraded] = useState<string | null>(null);
 
   useEffect(() => {
     setErrored(false);
@@ -166,6 +167,14 @@ export function Thumbnail({
         ? resolvedUpgraded
         : fallback;
   const showLayered = !!(target && lowRes && target !== lowRes);
+
+  // Make Chromium's error path and WebKitGTK's placeholder path fall
+  // through to the same next image in the chain.
+  const demoteTarget = () => {
+    if (target === fallback) return;
+    if (target === overrideHighRes) setOverrideErrored(true);
+    else if (target === resolvedUpgraded) setErrored(true);
+  };
 
   const sharedImgProps = {
     loading: "lazy",
@@ -204,11 +213,11 @@ export function Thumbnail({
             {...sharedImgProps}
             src={target!}
             alt={alt}
-            onLoad={() => setHiResLoaded(true)}
-            onError={() => {
-              if (target === overrideHighRes) setOverrideErrored(true);
-              else if (target === resolvedUpgraded) setErrored(true);
+            onLoad={(e) => {
+              if (isYtPlaceholder(e.currentTarget)) demoteTarget();
+              else setHiResLoaded(true);
             }}
+            onError={demoteTarget}
             className={cn(
               "absolute inset-0 size-full object-cover transition-opacity duration-200",
               hiResLoaded ? "opacity-100" : "opacity-0",
@@ -220,10 +229,10 @@ export function Thumbnail({
           {...sharedImgProps}
           src={target}
           alt={alt}
-          onError={() => {
-            if (target === overrideHighRes) setOverrideErrored(true);
-            else if (target === resolvedUpgraded) setErrored(true);
+          onLoad={(e) => {
+            if (isYtPlaceholder(e.currentTarget)) demoteTarget();
           }}
+          onError={demoteTarget}
           className="size-full object-cover"
         />
       ) : null}

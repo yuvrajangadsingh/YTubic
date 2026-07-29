@@ -1,5 +1,6 @@
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { invoke } from "@tauri-apps/api/core";
+import { createStore, del, entries, get, set } from "idb-keyval";
 
 /**
  * iTunes Search API as a hi-res cover-art fallback.
@@ -30,6 +31,7 @@ import { invoke } from "@tauri-apps/api/core";
 // no longer wears a different release's art (Portrait Of You showing
 // the Saroor cover). Old v2 entries are orphaned.
 const CACHE_KEY_PREFIX = "ytm-cover-itunes-v3:";
+const LEGACY_LOCALSTORAGE_PREFIX = "ytm-cover-itunes:";
 const POSITIVE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const NEGATIVE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const REQUEST_TIMEOUT_MS = 5000;
@@ -57,74 +59,112 @@ function normalizeAlbum(s: string): string {
     .trim();
 }
 
-function readCache(key: string): CacheEntry | null {
+const coverCacheStore =
+  typeof window !== "undefined"
+    ? createStore("ytubic-cover-cache", "urls")
+    : undefined;
+const memoCache = new Map<string, CacheEntry>();
+
+async function readCache(key: string): Promise<CacheEntry | null> {
+  const memoed = memoCache.get(key);
+  if (memoed) {
+    if (memoed.expiresAt < Date.now()) {
+      memoCache.delete(key);
+      return null;
+    }
+    return memoed;
+  }
+  if (!coverCacheStore) return null;
   try {
-    const raw = localStorage.getItem(key);
+    const raw = await get<string>(key, coverCacheStore);
     if (!raw) return null;
     const entry = JSON.parse(raw) as CacheEntry;
     if (entry.expiresAt < Date.now()) {
-      localStorage.removeItem(key);
+      void del(key, coverCacheStore);
       return null;
     }
+    memoCache.set(key, entry);
     return entry;
   } catch {
     return null;
   }
 }
 
-// Hard cap on cover cache entries. Lazy TTL eviction (only on re-lookup)
-// let this grow without bound — thousands of ~200-byte keys accumulate in
-// the same localStorage quota that also holds the query cache and stores.
+// Keep the IndexedDB cache bounded even though it has a larger quota.
 const MAX_COVER_KEYS = 500;
 let writesSinceSweep = 0;
 
 /** Drop expired/malformed cover entries and cap the total, evicting the
  *  soonest-to-expire first. Best-effort — never throws. */
-function sweepCoverCache(): void {
+async function sweepCoverCache(): Promise<void> {
+  if (!coverCacheStore) return;
   try {
+    const all = await entries<string, string>(coverCacheStore);
+    const now = Date.now();
     const live: { key: string; expiresAt: number }[] = [];
     const dead: string[] = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (!key || !key.startsWith(CACHE_KEY_PREFIX)) continue;
+    for (const [key, raw] of all) {
+      const k = String(key);
       try {
-        const e = JSON.parse(localStorage.getItem(key) ?? "") as CacheEntry;
-        if (e.expiresAt < Date.now()) dead.push(key);
-        else live.push({ key, expiresAt: e.expiresAt });
+        const entry = JSON.parse(raw) as CacheEntry;
+        if (entry.expiresAt < now) dead.push(k);
+        else live.push({ key: k, expiresAt: entry.expiresAt });
       } catch {
-        dead.push(key);
+        dead.push(k);
       }
     }
-    for (const key of dead) localStorage.removeItem(key);
+    await Promise.all(
+      dead.map((key) => {
+        memoCache.delete(key);
+        return del(key, coverCacheStore);
+      }),
+    );
     if (live.length > MAX_COVER_KEYS) {
       live.sort((a, b) => a.expiresAt - b.expiresAt);
-      for (const e of live.slice(0, live.length - MAX_COVER_KEYS)) {
-        localStorage.removeItem(e.key);
-      }
+      await Promise.all(
+        live.slice(0, live.length - MAX_COVER_KEYS).map((entry) => {
+          memoCache.delete(entry.key);
+          return del(entry.key, coverCacheStore);
+        }),
+      );
     }
   } catch {
     /* best-effort */
   }
 }
 
-function writeCache(key: string, url: string | null): void {
+async function writeCache(key: string, url: string | null): Promise<void> {
+  if (!coverCacheStore) return;
   const ttl = url ? POSITIVE_TTL_MS : NEGATIVE_TTL_MS;
   const entry: CacheEntry = { url, expiresAt: Date.now() + ttl };
+  memoCache.set(key, entry);
   try {
-    localStorage.setItem(key, JSON.stringify(entry));
+    await set(key, JSON.stringify(entry), coverCacheStore);
   } catch {
-    // Quota exceeded (or disabled): sweep and retry once so a full cache
-    // doesn't silently break persistence for everything sharing the quota.
-    sweepCoverCache();
+    await sweepCoverCache();
     try {
-      localStorage.setItem(key, JSON.stringify(entry));
+      await set(key, JSON.stringify(entry), coverCacheStore);
     } catch {
       /* still failing — skip caching this lookup */
     }
   }
   if (++writesSinceSweep >= 100) {
     writesSinceSweep = 0;
-    sweepCoverCache();
+    void sweepCoverCache();
+  }
+}
+
+// Reclaim the many legacy per-cover localStorage keys after migration.
+if (typeof window !== "undefined") {
+  try {
+    const staleKeys: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i);
+      if (key?.startsWith(LEGACY_LOCALSTORAGE_PREFIX)) staleKeys.push(key);
+    }
+    for (const key of staleKeys) window.localStorage.removeItem(key);
+  } catch {
+    // Best-effort migration.
   }
 }
 
@@ -137,10 +177,9 @@ function writeCache(key: string, url: string | null): void {
  * for a plain bb size the CDN still serves.
  */
 function upgradeITunesArtwork(url: string): string {
-  return url.replace(
-    /\/\d+x\d+[a-z-]*\.(jpg|png)$/i,
-    "/3000x3000bb.$1",
-  );
+  // NB: the old "100000x100000-999" trick is dead — Apple returns HTTP 400
+  // for it now. 3000x3000bb is the largest size mzstatic still serves.
+  return url.replace(/\/\d+x\d+[a-z-]*\.(jpg|png)$/i, "/3000x3000bb.$1");
 }
 
 export async function lookupITunesCover(
@@ -151,14 +190,14 @@ export async function lookupITunesCover(
   if (!artist.trim() || !title.trim()) return null;
   const key = cacheKey(artist, title, album);
 
-  const cached = readCache(key);
-  if (cached) return cached.url;
-
   const existing = inflight.get(key);
   if (existing) return existing;
 
   const promise = (async () => {
     try {
+      const cached = await readCache(key);
+      if (cached) return cached.url;
+
       const term = encodeURIComponent(`${artist} ${title}`);
       const url = `https://itunes.apple.com/search?term=${term}&entity=song&limit=5`;
       const res = await tauriFetch(url, {
@@ -188,7 +227,7 @@ export async function lookupITunesCover(
         : rows[0];
       const artwork100 = hit?.artworkUrl100;
       const result = artwork100 ? upgradeITunesArtwork(artwork100) : null;
-      writeCache(key, result);
+      await writeCache(key, result);
       return result;
     } catch {
       // Network error / timeout — also don't cache, let the next track

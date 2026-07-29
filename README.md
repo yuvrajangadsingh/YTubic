@@ -2,7 +2,7 @@
   <img src="assets/branding/ytubic-logo-full.svg" width="260"
        alt="YTubic" />
 
-  <p><em>YouTube Music, as an actual Mac app.</em></p>
+  <p><em>YouTube Music, as an actual Mac app — with the player turned up.</em></p>
 
   <p>
     <img src="https://img.shields.io/badge/macOS-Apple%20Silicon-2a2933?style=flat-square&labelColor=14131a" alt="macOS, Apple Silicon" />
@@ -12,8 +12,8 @@
 
   <p>
     <a href="#install">Install</a> ·
-    <a href="#what-you-get">What you get</a> ·
-    <a href="#what-the-mac-port-adds">The Mac port</a> ·
+    <a href="#what-this-fork-adds">What this fork adds</a> ·
+    <a href="#which-one-should-you-use">Which one should you use?</a> ·
     <a href="#building-it-yourself">Building it</a>
   </p>
 
@@ -36,13 +36,21 @@ that talks to YouTube's API directly and draws its own interface instead of
 wrapping the website, so pages open instantly and playback starts without the
 spinner.
 
-This repo is the **macOS port**. The app itself is
-[@NUber-dev](https://github.com/NUber-dev)'s work and it ships Windows-only —
-what's here is that app plus the Mac half: native window chrome, system media
-controls, an Apple Music style fullscreen, video playback, and the sign-in fix
-Google's consumer accounts need inside a Mac webview. Same GPL-3.0 license as
-upstream. **On Windows?** [Use the original](https://github.com/NUber-dev/YTubic)
-— it has a proper installer and updates itself.
+This is a fork of [YTubic](https://github.com/NUber-dev/YTubic) by
+[@NUber-dev](https://github.com/NUber-dev) — their app, their work. It started as
+the macOS port back when upstream was Windows-only; **upstream now ships official
+macOS builds of its own**, so what's left here is a set of player features that
+haven't landed upstream: a fullscreen player, video playback with a quality
+picker, and a chunk of lyrics work. Same GPL-3.0 license.
+
+## Which one should you use?
+
+**Probably [upstream's](https://github.com/NUber-dev/YTubic/releases/latest).**
+It's the maintained one, its Mac build is Universal so it runs on Intel Macs too,
+it updates itself, and it gets fixes first. It also has Windows and Linux builds.
+
+Use this fork if you specifically want the extras below and don't mind that it
+lags upstream and can't auto-update.
 
 ## Install
 
@@ -66,9 +74,9 @@ app again and it launches normally, this time and every time after.
 **4.** Sign in with your Google account. If that account has YouTube Premium you
 get no ads; without it, you get them.
 
-You need an **Apple Silicon Mac** — M1 or newer, so anything from late 2020
-onward. The first song stalls for a few seconds while the app fetches a small
-streaming helper in the background; everything after that is quick.
+This build is **Apple Silicon only** (M1 or newer — upstream's is Universal if
+you're on Intel). The first song stalls for a few seconds while the app fetches a
+small streaming helper in the background; everything after that is quick.
 
 <details>
 <summary>I'd rather not touch Terminal</summary>
@@ -76,16 +84,6 @@ streaming helper in the background; everything after that is quick.
 Try to open YTubic, let macOS block it, then go to **System Settings → Privacy &
 Security** and scroll to the bottom. There'll be a line about YTubic being
 blocked with an **Open Anyway** button next to it. Same result, more clicking.
-
-</details>
-
-<details>
-<summary>Google says "this browser or app may not be secure"</summary>
-
-That's Google refusing to sign a consumer account into a webview it doesn't
-recognise. The port works around it by sending a Safari user agent on the login
-window specifically, so if you're seeing this you're on an old build — grab the
-[latest release](../../releases/latest).
 
 </details>
 
@@ -98,17 +96,30 @@ yt-dlp every few days, and restarting it forces the check.
 
 </details>
 
-## What you get
+## What this fork adds
 
-- **Instant navigation** — pages are prefetched and cached, so moving around the
-  library doesn't reload anything or spin
-- **A player that moves** — dock it along the bottom or as a right-hand panel,
-  or pop it out into a small always-on-top window
-- **Synced lyrics** — line by line, pulled from LRCLIB and Musixmatch
-- **Cover art at full size** — album art upgraded to the high-resolution studio
-  version when one exists
+On top of everything upstream already does:
+
+- **A fullscreen player** — Apple Music style, with an ambient backdrop that
+  crossfades between tracks and the notch band blended into the artwork
+- **Video mode** — watch the video version of a track at 1080p, 1440p or 4K,
+  through a quality picker that only offers the tiers a given video actually has
+- **Lyrics that pick the right record** — matched on identity rather than the
+  closest guess, padded intros auto-aligned, and manual timing nudges that stick
+  to the track instead of resetting
+- **Accent colour from the cover** — the seek bar, play button and active toggles
+  take their colour from the album art instead of staying brand red
+- **Search history** — recent queries saved and offered on the empty search page
+
+## What you get from upstream
+
+- **Instant navigation** — pages prefetched and cached, no reloads, no spinners
+- **A player that moves** — dock it along the bottom or as a right-hand panel, or
+  pop it out into a small always-on-top window
+- **Synced lyrics** — line by line, from LRCLIB and Musixmatch
+- **Cover art at full size** — upgraded to the high-resolution studio version
 - **Your whole library** — playlists, likes, albums, artists, search with
-  filters, and radio queues that keep going
+  filters, radio queues, and playlist suggestions
 - **Mac media controls** — media keys, Now Playing in Control Center and on the
   lock screen, playback state kept in sync both ways
 
@@ -117,26 +128,6 @@ yt-dlp every few days, and restarting it forces the check.
 > Google LLC. Audio streams through [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 > and can break whenever YouTube changes its internals. Use at your own risk.
 
-## What the Mac port adds
-
-Everything above is upstream's. This is the part that makes it a Mac app:
-
-- **A native window** — traffic lights sitting on an overlay titlebar, window
-  edges melted into the app's own chrome instead of a grey frame
-- **System media controls** — Now Playing in Control Center and on the lock
-  screen, media keys, and the app's state staying in sync when you pause from
-  either side
-- **Apple Music style fullscreen** — an ambient backdrop that crossfades between
-  tracks, with the notch band blended into the artwork rather than cutting it
-- **Video mode** — watch the video version of a track at 1080p, 1440p or 4K,
-  through a quality picker that only offers the tiers a given video actually has
-- **Lyrics that pick the right record** — matched on identity rather than the
-  closest guess, padded intros auto-aligned, and manual timing nudges that stick
-  to the track instead of resetting
-- **Search history** — recent queries saved and offered on the empty search page
-- **Sign-in that works** — consumer Google accounts get rejected by a Mac webview
-  until the login window presents itself as Safari, which this does
-
 ## Building it yourself
 
 Needs Node 20+, Rust, and pnpm.
@@ -144,8 +135,7 @@ Needs Node 20+, Rust, and pnpm.
 ```bash
 pnpm install
 pnpm tauri dev            # run it
-pnpm tauri build --bundles app,dmg \
-  --config '{"bundle":{"createUpdaterArtifacts":false}}'   # build a .dmg
+pnpm tauri build --bundles app,dmg   # build a .dmg
 ```
 
 The build lands in `src-tauri/target/release/bundle/`. One gotcha worth knowing:
@@ -196,8 +186,8 @@ src-tauri/               # Rust backend (axum stream proxy, cookies, media sessi
 ## Credits
 
 **[YTubic](https://github.com/NUber-dev/YTubic) by
-[@NUber-dev](https://github.com/NUber-dev)** — the app this port is built on.
-Everything except the Mac work listed above is theirs.
+[@NUber-dev](https://github.com/NUber-dev)** — the app this is built on.
+Everything except the fork extras listed above is theirs.
 
 [yt-dlp](https://github.com/yt-dlp/yt-dlp) for audio streaming,
 [LRCLIB](https://lrclib.net) and Musixmatch for synced lyrics, and
@@ -207,5 +197,5 @@ Everything except the Mac work listed above is theirs.
 ## License
 
 [GPL-3.0](LICENSE) — free to use, modify and redistribute; derivative works stay
-open source under the same license. This port keeps the original copyright and
+open source under the same license. This fork keeps the original copyright and
 license intact.

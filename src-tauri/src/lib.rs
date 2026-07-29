@@ -34,14 +34,16 @@ mod ytdlp;
 fn sanitize_video_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() < 32
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Platform-native symmetric "encrypt with current user's credentials"
 /// primitive. On Windows we use DPAPI (CryptProtectData) — the blob is
-/// only decryptable by the same Windows user on the same machine. On
-/// other platforms we currently fall back to plaintext (FIXME: hook
-/// into macOS Keychain / libsecret when we ship beyond Windows).
+/// only decryptable by the same Windows user on the same machine. Linux and
+/// macOS use AES-256-GCM and keep only the random data key in the native
+/// credential store (Secret Service or Keychain).
 ///
 /// A fixed `ENTROPY` byte string is mixed in so a *different* app
 /// running as the same user can't trivially pass our blob to
@@ -58,10 +60,8 @@ mod secure_store {
     #[cfg(windows)]
     pub fn encrypt(plain: &[u8]) -> Result<Vec<u8>, String> {
         use std::ptr;
-        use windows_sys::Win32::Security::Cryptography::{
-            CryptProtectData, CRYPT_INTEGER_BLOB,
-        };
         use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
         unsafe {
             let in_blob = CRYPT_INTEGER_BLOB {
                 cbData: plain.len() as u32,
@@ -85,8 +85,7 @@ mod secure_store {
                 return Err("CryptProtectData failed".into());
             }
             let data =
-                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize)
-                    .to_vec();
+                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
             LocalFree(out_blob.pbData as _);
             Ok(data)
         }
@@ -95,10 +94,8 @@ mod secure_store {
     #[cfg(windows)]
     pub fn decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
         use std::ptr;
-        use windows_sys::Win32::Security::Cryptography::{
-            CryptUnprotectData, CRYPT_INTEGER_BLOB,
-        };
         use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
         unsafe {
             let in_blob = CRYPT_INTEGER_BLOB {
                 cbData: encrypted.len() as u32,
@@ -122,21 +119,160 @@ mod secure_store {
                 return Err("CryptUnprotectData failed".into());
             }
             let data =
-                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize)
-                    .to_vec();
+                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
             LocalFree(out_blob.pbData as _);
             Ok(data)
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const KEYRING_MAGIC: &[u8; 5] = b"YTBC1";
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const KEYRING_NONCE_LEN: usize = 12;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const KEYRING_KEY_LEN: usize = 32;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const KEYRING_SERVICE: &str = "com.github.ivasy.ytubic";
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const KEYRING_USER: &str = "cookie-encryption-key-v1";
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn keyring_encryption_key() -> Result<[u8; KEYRING_KEY_LEN], String> {
+        use keyring::{Entry, Error};
+        use rand::RngCore;
+
+        let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER)
+            .map_err(|error| format!("system credential store is unavailable: {error}"))?;
+
+        match entry.get_secret() {
+            Ok(secret) => secret.try_into().map_err(|secret: Vec<u8>| {
+                format!(
+                    "system credential store returned an invalid YTubic key ({} bytes)",
+                    secret.len()
+                )
+            }),
+            Err(Error::NoEntry) => {
+                let mut key = [0_u8; KEYRING_KEY_LEN];
+                rand::rngs::OsRng.fill_bytes(&mut key);
+                entry.set_secret(&key).map_err(|error| {
+                    format!("failed to save key in system credential store: {error}")
+                })?;
+                Ok(key)
+            }
+            Err(error) => Err(format!(
+                "failed to read key from system credential store: {error}"
+            )),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn keyring_encrypt_with_key(
+        plain: &[u8],
+        key: &[u8; KEYRING_KEY_LEN],
+        nonce: &[u8; KEYRING_NONCE_LEN],
+    ) -> Result<Vec<u8>, String> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Nonce};
+
+        let cipher = Aes256Gcm::new_from_slice(key)
+            .map_err(|_| "failed to initialize cookie encryption".to_string())?;
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(nonce), plain)
+            .map_err(|_| "failed to encrypt cookie jar".to_string())?;
+
+        let mut framed = Vec::with_capacity(KEYRING_MAGIC.len() + nonce.len() + ciphertext.len());
+        framed.extend_from_slice(KEYRING_MAGIC);
+        framed.extend_from_slice(nonce);
+        framed.extend_from_slice(&ciphertext);
+        Ok(framed)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn keyring_decrypt_with_key(
+        encrypted: &[u8],
+        key: &[u8; KEYRING_KEY_LEN],
+    ) -> Result<Vec<u8>, String> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Nonce};
+
+        if !encrypted.starts_with(KEYRING_MAGIC) {
+            // Earlier builds on this platform wrote plaintext jars. Accept
+            // one so the next successful persistence pass can migrate it.
+            return Ok(encrypted.to_vec());
+        }
+
+        let payload = &encrypted[KEYRING_MAGIC.len()..];
+        if payload.len() <= KEYRING_NONCE_LEN {
+            return Err("encrypted cookie jar is truncated".to_string());
+        }
+        let (nonce, ciphertext) = payload.split_at(KEYRING_NONCE_LEN);
+        let cipher = Aes256Gcm::new_from_slice(key)
+            .map_err(|_| "failed to initialize cookie decryption".to_string())?;
+        cipher
+            .decrypt(Nonce::from_slice(nonce), ciphertext)
+            .map_err(|_| "failed to decrypt cookie jar".to_string())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn encrypt(plain: &[u8]) -> Result<Vec<u8>, String> {
+        use rand::RngCore;
+
+        let key = keyring_encryption_key()?;
+        let mut nonce = [0_u8; KEYRING_NONCE_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        keyring_encrypt_with_key(plain, &key, &nonce)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
+        if !encrypted.starts_with(KEYRING_MAGIC) {
+            return Ok(encrypted.to_vec());
+        }
+        let key = keyring_encryption_key()?;
+        keyring_decrypt_with_key(encrypted, &key)
+    }
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     pub fn encrypt(plain: &[u8]) -> Result<Vec<u8>, String> {
         Ok(plain.to_vec())
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     pub fn decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
         Ok(encrypted.to_vec())
+    }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    mod keyring_tests {
+        use super::*;
+
+        const KEY: [u8; KEYRING_KEY_LEN] = [7; KEYRING_KEY_LEN];
+        const NONCE: [u8; KEYRING_NONCE_LEN] = [3; KEYRING_NONCE_LEN];
+
+        #[test]
+        fn encrypted_cookie_jar_round_trips() {
+            let encrypted = keyring_encrypt_with_key(b"SID=secret", &KEY, &NONCE).unwrap();
+            assert!(encrypted.starts_with(KEYRING_MAGIC));
+            assert_eq!(
+                keyring_decrypt_with_key(&encrypted, &KEY).unwrap(),
+                b"SID=secret"
+            );
+        }
+
+        #[test]
+        fn tampered_cookie_jar_is_rejected() {
+            let mut encrypted = keyring_encrypt_with_key(b"SID=secret", &KEY, &NONCE).unwrap();
+            *encrypted.last_mut().unwrap() ^= 1;
+            assert!(keyring_decrypt_with_key(&encrypted, &KEY).is_err());
+        }
+
+        #[test]
+        fn plaintext_cookie_jar_is_accepted_for_migration() {
+            assert_eq!(
+                keyring_decrypt_with_key(b"SID=legacy", &KEY).unwrap(),
+                b"SID=legacy"
+            );
+        }
     }
 }
 
@@ -229,11 +365,17 @@ fn account_webview_dir(app: &tauri::AppHandle, id: &str) -> PathBuf {
     accounts_dir(app).join(id).join("webview")
 }
 
-/// Chrome UA the login and refresh WebViews both present to Google. Kept
+/// Browser UA the login and refresh WebViews both present to Google. Kept
 /// identical so the session Google issues to the login window is the
-/// same one the refresh window later renews.
+/// same one the refresh window later renews. The claimed browser must match
+/// the actual webview engine: WebView2 presents Chrome, while WKWebView must
+/// present Safari or Google rejects the sign-in as an insecure browser.
+#[cfg(not(target_os = "macos"))]
 const YT_LOGIN_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+#[cfg(target_os = "macos")]
+const YT_LOGIN_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
+     (KHTML, like Gecko) Version/17.6 Safari/605.1.15";
 
 /// WebView2 browser args shared by the login window and the session-keeper.
 /// Both open the same per-account profile directory, and WebView2 requires
@@ -404,7 +546,11 @@ fn cookies_to_netscape(cookies: &[cookie::Cookie<'static>]) -> String {
         let dom_out = format!(".{bare}");
         let include_sub = "TRUE";
         let path_str = c.path().unwrap_or("/");
-        let secure = if c.secure().unwrap_or(false) { "TRUE" } else { "FALSE" };
+        let secure = if c.secure().unwrap_or(false) {
+            "TRUE"
+        } else {
+            "FALSE"
+        };
         let expiry = match c.expires() {
             Some(cookie::Expiration::DateTime(dt)) => dt.unix_timestamp(),
             _ => 0,
@@ -535,8 +681,12 @@ fn merge_set_cookies_into_jar(
                     domain: format!(".{bare}"),
                     include_sub: "TRUE".to_string(),
                     path: c.path().unwrap_or("/").to_string(),
-                    secure: if c.secure().unwrap_or(false) { "TRUE" } else { "FALSE" }
-                        .to_string(),
+                    secure: if c.secure().unwrap_or(false) {
+                        "TRUE"
+                    } else {
+                        "FALSE"
+                    }
+                    .to_string(),
                     expiry,
                     name: c.name().to_string(),
                     value: c.value().to_string(),
@@ -620,8 +770,7 @@ async fn dedup_accounts_by_identity(app: &tauri::AppHandle) {
     }
 
     // removed id -> keeper id, so `active` can follow its keeper.
-    let mut remap: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut remap: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     // (source id, keeper id) jars to copy before deleting the source.
     let mut fresh_copies: Vec<(String, String)> = Vec::new();
 
@@ -864,19 +1013,13 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
                 if !nudged_to_yt {
                     let has_google_auth = cookies.iter().any(|c| {
                         let name = c.name();
-                        (name == "SAPISID"
-                            || name == "SID"
-                            || name == "__Secure-1PSID")
+                        (name == "SAPISID" || name == "SID" || name == "__Secure-1PSID")
                             && c.domain()
-                                .map(|d| {
-                                    d.trim_start_matches('.').ends_with("google.com")
-                                })
+                                .map(|d| d.trim_start_matches('.').ends_with("google.com"))
                                 .unwrap_or(false)
                     });
                     if has_google_auth {
-                        if let Ok(url) =
-                            "https://music.youtube.com/".parse::<tauri::Url>()
-                        {
+                        if let Ok(url) = "https://music.youtube.com/".parse::<tauri::Url>() {
                             match win.navigate(url) {
                                 Ok(()) => eprintln!(
                                     "[login] google-auth detected without YT cookies; redirected webview to music.youtube.com"
@@ -917,25 +1060,22 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
                 let _ = tokio::fs::create_dir_all(dir).await;
             }
             let plain = cookies_to_netscape(&cookies).into_bytes();
-            let encrypted = match tokio::task::spawn_blocking(move || {
-                secure_store::encrypt(&plain)
-            })
-            .await
-            {
-                Ok(Ok(e)) => e,
-                Ok(Err(e)) => {
-                    eprintln!("[login] encrypt cookies: {e}");
-                    let _ = win.close();
-                    let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
-                    return;
-                }
-                Err(e) => {
-                    eprintln!("[login] encrypt join: {e}");
-                    let _ = win.close();
-                    let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
-                    return;
-                }
-            };
+            let encrypted =
+                match tokio::task::spawn_blocking(move || secure_store::encrypt(&plain)).await {
+                    Ok(Ok(e)) => e,
+                    Ok(Err(e)) => {
+                        eprintln!("[login] encrypt cookies: {e}");
+                        let _ = win.close();
+                        let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("[login] encrypt join: {e}");
+                        let _ = win.close();
+                        let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
+                        return;
+                    }
+                };
             if let Err(e) = tokio::fs::write(&cookies_path, &encrypted).await {
                 eprintln!("[login] write account cookies: {e}");
                 let _ = win.close();
@@ -958,10 +1098,13 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
                 // frontend at least flips out of the spinning state.
                 eprintln!("[login] write index: {e}");
                 let _ = app_poll.emit("login-cancelled", ());
-                let _ = tokio::fs::remove_dir_all(&account_cookies_path(&app_poll, &new_id)
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_default()).await;
+                let _ = tokio::fs::remove_dir_all(
+                    &account_cookies_path(&app_poll, &new_id)
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_default(),
+                )
+                .await;
                 let _ = win.close();
                 let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
                 return;
@@ -1153,8 +1296,7 @@ async fn read_cookie_header(app: &tauri::AppHandle, host: &str) -> String {
         }
         let domain = fields[0].trim_start_matches('.');
         let include_sub = fields[1] == "TRUE";
-        let matches = host == domain
-            || (include_sub && host.ends_with(&format!(".{domain}")));
+        let matches = host == domain || (include_sub && host.ends_with(&format!(".{domain}")));
         if !matches {
             continue;
         }
@@ -1164,10 +1306,7 @@ async fn read_cookie_header(app: &tauri::AppHandle, host: &str) -> String {
 }
 
 #[tauri::command]
-async fn get_cookie_header(
-    app: tauri::AppHandle,
-    host: String,
-) -> Result<String, String> {
+async fn get_cookie_header(app: tauri::AppHandle, host: String) -> Result<String, String> {
     Ok(read_cookie_header(&app, &host).await)
 }
 
@@ -1197,10 +1336,7 @@ struct CloseBehavior {
 }
 
 #[tauri::command]
-fn set_close_behavior(
-    state: tauri::State<'_, CloseBehavior>,
-    quit_on_close: bool,
-) {
+fn set_close_behavior(state: tauri::State<'_, CloseBehavior>, quit_on_close: bool) {
     state.quit_on_close.store(quit_on_close, Ordering::Relaxed);
 }
 
@@ -1234,11 +1370,7 @@ fn autostart_is_enabled(app: tauri::AppHandle) -> Result<bool, String> {
 /// looking at the app (main window hidden to tray, or another app in
 /// the foreground).
 #[tauri::command]
-fn notify_track(
-    app: tauri::AppHandle,
-    title: String,
-    body: String,
-) -> Result<(), String> {
+fn notify_track(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
     use tauri_plugin_notification::NotificationExt;
     let any_focused = app
         .webview_windows()
@@ -1290,10 +1422,7 @@ async fn open_player_window(
         let _ = existing.unminimize();
         let _ = existing.set_focus();
         if let (Some(cx), Some(cy)) = (x, y) {
-            let _ = existing.set_position(tauri::LogicalPosition::new(
-                cx - 180.0,
-                cy - 18.0,
-            ));
+            let _ = existing.set_position(tauri::LogicalPosition::new(cx - 180.0, cy - 18.0));
         }
         return Ok(());
     }
@@ -1334,10 +1463,7 @@ async fn open_player_window(
         // horizontally on cursor with the 36px-tall title bar just
         // below puts the user's release point on top of the new card,
         // which feels like the window snapped to where they dropped.
-        let _ = win.set_position(tauri::LogicalPosition::new(
-            cx - 180.0,
-            cy - 18.0,
-        ));
+        let _ = win.set_position(tauri::LogicalPosition::new(cx - 180.0, cy - 18.0));
     }
     Ok(())
 }
@@ -1503,8 +1629,7 @@ async fn update_account_meta(
     let dup_pos = incoming.as_ref().and_then(|key| {
         idx.accounts.iter().position(|a| {
             a.id != id
-                && meta_identity(&a.email, a.photo_url.as_deref()).as_deref()
-                    == Some(key.as_str())
+                && meta_identity(&a.email, a.photo_url.as_deref()).as_deref() == Some(key.as_str())
         })
     });
 
@@ -1552,7 +1677,10 @@ async fn update_account_meta(
             let _ = tokio::fs::remove_dir_all(&other_webview).await;
             let mut moved = false;
             for _ in 0..5u8 {
-                if tokio::fs::rename(&this_webview, &other_webview).await.is_ok() {
+                if tokio::fs::rename(&this_webview, &other_webview)
+                    .await
+                    .is_ok()
+                {
                     moved = true;
                     break;
                 }
@@ -1677,10 +1805,7 @@ struct AuthContext {
 }
 
 #[tauri::command]
-async fn get_auth_context(
-    app: tauri::AppHandle,
-    host: String,
-) -> Result<AuthContext, String> {
+async fn get_auth_context(app: tauri::AppHandle, host: String) -> Result<AuthContext, String> {
     let cookie = read_cookie_header(&app, &host).await;
     let page_id = if cookie.is_empty() {
         None
@@ -1837,10 +1962,7 @@ fn get_cache_dir(app: tauri::AppHandle) -> CacheDirInfo {
 /// that the folder exists and is writable before saving; the change
 /// takes effect on the next launch.
 #[tauri::command]
-async fn set_cache_dir(
-    app: tauri::AppHandle,
-    path: Option<String>,
-) -> Result<(), String> {
+async fn set_cache_dir(app: tauri::AppHandle, path: Option<String>) -> Result<(), String> {
     use tauri_plugin_store::StoreExt;
     let store = app
         .store(SETTINGS_STORE_FILE)
@@ -1866,7 +1988,9 @@ async fn set_cache_dir(
             store.set(CACHE_DIR_KEY, serde_json::Value::String(raw));
         }
     }
-    store.save().map_err(|e| format!("save settings store: {e}"))?;
+    store
+        .save()
+        .map_err(|e| format!("save settings store: {e}"))?;
     Ok(())
 }
 
@@ -1876,14 +2000,12 @@ async fn set_cache_dir(
 #[tauri::command]
 async fn pick_cache_folder(app: tauri::AppHandle) -> Option<String> {
     use tauri_plugin_dialog::DialogExt;
-    tauri::async_runtime::spawn_blocking(move || {
-        app.dialog().file().blocking_pick_folder()
-    })
-    .await
-    .ok()
-    .flatten()
-    .and_then(|f| f.into_path().ok())
-    .map(|p| p.display().to_string())
+    tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_folder())
+        .await
+        .ok()
+        .flatten()
+        .and_then(|f| f.into_path().ok())
+        .map(|p| p.display().to_string())
 }
 
 #[derive(serde::Serialize)]
@@ -1954,7 +2076,9 @@ async fn list_cache(app: tauri::AppHandle) -> Result<Vec<CacheEntry>, String> {
         if !sanitize_video_id(video_id) {
             continue;
         }
-        let Ok(meta) = e.metadata().await else { continue };
+        let Ok(meta) = e.metadata().await else {
+            continue;
+        };
         let modified_secs = meta
             .modified()
             .ok()
@@ -2171,9 +2295,7 @@ fn resolve_stream_ytdlp(app: tauri::AppHandle, video_id: String) -> Result<Strin
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let output = command
-        .output()
-        .map_err(|e| format!("spawn yt-dlp: {e}"))?;
+    let output = command.output().map_err(|e| format!("spawn yt-dlp: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -2402,7 +2524,8 @@ async fn cache_cover(
     };
     let token = {
         let t = state.token.lock().await;
-        t.clone().ok_or_else(|| "stream server not ready".to_string())?
+        t.clone()
+            .ok_or_else(|| "stream server not ready".to_string())?
     };
 
     // SSRF guard: cover URLs come from remote metadata (iTunes/mzstatic +
@@ -2451,10 +2574,7 @@ async fn cache_cover(
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("read body: {e}"))?;
+        let bytes = resp.bytes().await.map_err(|e| format!("read body: {e}"))?;
         // Write to a .part file then atomically rename so a concurrent
         // reader never sees a half-written file.
         let part = path.with_extension(format!(
@@ -2493,7 +2613,9 @@ async fn cover_cache_stats(app: tauri::AppHandle) -> Result<CoverCacheStats, Str
         Err(e) => return Err(format!("read_dir: {e}")),
     };
     while let Ok(Some(e)) = rd.next_entry().await {
-        let Ok(meta) = e.metadata().await else { continue };
+        let Ok(meta) = e.metadata().await else {
+            continue;
+        };
         if !meta.is_file() {
             continue;
         }
@@ -2516,7 +2638,9 @@ async fn clear_cover_cache(app: tauri::AppHandle) -> Result<u64, String> {
         Err(e) => return Err(format!("read_dir: {e}")),
     };
     while let Ok(Some(e)) = rd.next_entry().await {
-        let Ok(meta) = e.metadata().await else { continue };
+        let Ok(meta) = e.metadata().await else {
+            continue;
+        };
         if !meta.is_file() {
             continue;
         }
@@ -2791,9 +2915,7 @@ struct StreamServerState {
 }
 
 #[tauri::command]
-async fn get_stream_base_url(
-    state: tauri::State<'_, StreamServerState>,
-) -> Result<String, String> {
+async fn get_stream_base_url(state: tauri::State<'_, StreamServerState>) -> Result<String, String> {
     let port = *state.port.lock().await;
     let token = state.token.lock().await.clone();
     match (port, token) {
@@ -2864,11 +2986,7 @@ fn spawn_downloader(
         // (see resolve_stream_ytdlp for rationale).
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        let mut child = match cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-        {
+        let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn() {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("[stream] spawn {video_id}: {e}");
@@ -3100,8 +3218,7 @@ async fn stream_handler(
         while !state.complete.load(Ordering::Acquire) {
             if tokio::time::Instant::now() >= deadline {
                 eprintln!("[stream] {video_id}: TIMEOUT after 120s");
-                return (StatusCode::GATEWAY_TIMEOUT, "download timeout")
-                    .into_response();
+                return (StatusCode::GATEWAY_TIMEOUT, "download timeout").into_response();
             }
             let notified = state.notify.notified();
             tokio::pin!(notified);
@@ -3132,8 +3249,7 @@ async fn stream_handler(
         .await
         .map(|r| r.into_response())
         .unwrap_or_else(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("serve: {e}"))
-                .into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("serve: {e}")).into_response()
         });
     if resp.status().is_success() || resp.status() == StatusCode::PARTIAL_CONTENT {
         resp.headers_mut().insert(
@@ -3183,8 +3299,7 @@ async fn cover_serve_handler(
         .await
         .map(|r| r.into_response())
         .unwrap_or_else(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("serve: {e}"))
-                .into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("serve: {e}")).into_response()
         });
     if resp.status().is_success() {
         // Filename is content-addressed (hash of the source URL), so
@@ -3366,9 +3481,7 @@ fn show_main_window(app: &tauri::AppHandle) {
 fn runtime_icon(app: &tauri::AppHandle) -> tauri::image::Image<'static> {
     #[cfg(debug_assertions)]
     {
-        if let Ok(icon) =
-            tauri::image::Image::from_bytes(include_bytes!("../icons/icon-dev.png"))
-        {
+        if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!("../icons/icon-dev.png")) {
             return icon;
         }
     }
@@ -3388,7 +3501,9 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 
     let menu = Menu::with_items(
         app,
-        &[&show_item, &sep, &play_item, &prev_item, &next_item, &sep, &quit_item],
+        &[
+            &show_item, &sep, &play_item, &prev_item, &next_item, &sep, &quit_item,
+        ],
     )?;
 
     let _tray = TrayIconBuilder::with_id("main-tray")
@@ -3399,7 +3514,9 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             "YTubic"
         })
         .menu(&menu)
-        .show_menu_on_left_click(false)
+        // macOS menu-bar extras conventionally open on left-click. Windows
+        // and Linux keep left-click reserved for restoring the main window.
+        .show_menu_on_left_click(cfg!(target_os = "macos"))
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => show_main_window(app),
             "play_pause" => {
@@ -3417,6 +3534,9 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
+            if cfg!(target_os = "macos") {
+                return;
+            }
             // Left-click the icon = show the window.
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
@@ -3572,8 +3692,8 @@ pub fn run() {
             // every cache-path computation matches the directories the
             // stream server is about to bind — a preference change made
             // later only applies after relaunch.
-            let cache_root = stored_cache_root(app.handle())
-                .unwrap_or_else(|| default_cache_root(app.handle()));
+            let cache_root =
+                stored_cache_root(app.handle()).unwrap_or_else(|| default_cache_root(app.handle()));
             app.manage(ActiveCacheRoot(cache_root.clone()));
             // Retry any scrobbles stranded offline on the previous run. Spawns
             // its own task; a no-op when Last.fm isn't configured or the queue
@@ -3630,19 +3750,32 @@ pub fn run() {
                     tokio::time::sleep(Duration::from_secs(20 * 60)).await;
                 }
             });
-            // OS media controls (the Windows SMTC tile in Quick Settings / the
-            // volume flyout, plus the hardware media keys). setup() runs on the
-            // main thread, which souvlaki requires and where the main window's
-            // HWND is available.
-            // souvlaki drives SMTC on Windows. macOS has its own
-            // MPRemoteCommandCenter bridge (now_playing.rs); letting both
-            // register would fight over the system Now Playing entry, so
-            // souvlaki stays Windows-only. media_update/media_clear no-op
-            // when init never ran (CONTROLS stays None).
-            #[cfg(windows)]
+            // Native media controls: the SMTC tile on Windows (Quick Settings /
+            // volume flyout) and MPRIS on Linux, plus the hardware media keys.
+            // setup() runs on the main thread, which souvlaki requires and where
+            // the main window's HWND is available.
+            // macOS is deliberately excluded: it has its own
+            // MPRemoteCommandCenter bridge (now_playing.rs), and letting both
+            // register would fight over the system Now Playing entry.
+            // media_update/media_clear no-op when init never ran (CONTROLS
+            // stays None).
+            #[cfg(any(windows, target_os = "linux"))]
             media::init(app.handle());
             if let Err(e) = build_tray(app.handle()) {
                 eprintln!("[tray] build failed: {e}");
+            }
+
+            // WebKitGTK disables smooth (kinetic) scrolling by default, so
+            // wheel scrolling otherwise jumps in coarse steps on Linux.
+            #[cfg(target_os = "linux")]
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.with_webview(|webview| {
+                    use webkit2gtk::{SettingsExt, WebViewExt};
+                    let wv = webview.inner();
+                    if let Some(settings) = WebViewExt::settings(&wv) {
+                        settings.set_enable_smooth_scrolling(true);
+                    }
+                });
             }
             // Debug builds swap the taskbar/window icon to the orange
             // dev variant (see runtime_icon) so a dev instance is
@@ -3653,8 +3786,17 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, _event| {
+            // The native red button follows our close-to-menu-bar setting and
+            // may hide the only window. A later Dock click emits Reopen; show
+            // the window again so the running app never appears unresponsive.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = _event {
+                show_main_window(_app);
+            }
+        });
 }
 
 #[cfg(test)]
@@ -3694,11 +3836,7 @@ mod tests {
             };
 
             assert_eq!(
-                status(
-                    "/deadbeefdeadbeefdeadbeefdeadbeef/ping",
-                    app.clone()
-                )
-                .await,
+                status("/deadbeefdeadbeefdeadbeefdeadbeef/ping", app.clone()).await,
                 StatusCode::OK,
                 "correct token reaches the handler"
             );
@@ -3736,14 +3874,18 @@ mod tests {
         assert!(changed && dirty);
         assert!(out.contains("SIDCC\tnew-sidcc"));
         assert!(!out.contains("old-sidcc"));
-        assert!(out.contains("SAPISID\told-sapisid"), "untouched cookie survives");
+        assert!(
+            out.contains("SAPISID\told-sapisid"),
+            "untouched cookie survives"
+        );
     }
 
     #[test]
     fn merge_inserts_new_cookie_with_domain() {
-        let lines =
-            vec!["LOGIN_INFO=abc; Domain=.youtube.com; Path=/; Secure; HttpOnly; Max-Age=63072000"
-                .to_string()];
+        let lines = vec![
+            "LOGIN_INFO=abc; Domain=.youtube.com; Path=/; Secure; HttpOnly; Max-Age=63072000"
+                .to_string(),
+        ];
         let (out, changed, _) = merge_set_cookies_into_jar(&jar(), &lines, HOST, NOW);
         assert!(changed);
         assert!(out.contains(".youtube.com\tTRUE\t/\tTRUE\t1763072000\tLOGIN_INFO\tabc"));

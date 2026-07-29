@@ -1,8 +1,13 @@
 import { create, type StateCreator } from "zustand";
-import { persist } from "zustand/middleware";
+import {
+  createJSONStorage,
+  persist,
+  type StateStorage,
+} from "zustand/middleware";
 import { emit } from "@tauri-apps/api/event";
 import type { ShelfItem, Thumbnail } from "@/lib/innertube/types";
 import { isFloatingPlayerWindow } from "@/lib/floating-player";
+import { safeLocalStorage } from "./safe-storage";
 
 export type QueueTrack = {
   videoId: string;
@@ -74,6 +79,14 @@ export type PlaybackState = {
   /** When true, auto-append radio tracks to the queue when the last one ends. */
   autoRadio: boolean;
 
+  /**
+   * Pending /next continuation for the current queue's source — set when
+   * the queue came from a server-side playlist shuffle whose remaining
+   * permutation is still on YTM's side. The audio engine drains it as
+   * playback nears the tail; any action that replaces the queue clears it.
+   */
+  queueContinuation?: string;
+
   // Actions — queue
   playNow: (track: QueueTrack | ShelfItem, extras?: QueueTrack[]) => void;
   setQueue: (tracks: QueueTrack[], startIndex?: number) => void;
@@ -85,6 +98,7 @@ export type PlaybackState = {
   moveTrack: (from: number, to: number) => void;
   clearQueue: () => void;
   setAutoRadio: (on: boolean) => void;
+  setQueueContinuation: (token?: string) => void;
 
   // Actions — transport
   toggle: () => void;
@@ -140,12 +154,59 @@ function fisherYates<T>(arr: readonly T[]): T[] {
   return result;
 }
 
+const MAX_PERSISTED_QUEUE_TRACKS = 300;
+
+function compactPersistedQueue(
+  queue: QueueTrack[],
+  index: number,
+): QueueTrack[] {
+  if (queue.length <= MAX_PERSISTED_QUEUE_TRACKS) return queue;
+  const safeIndex = Math.max(0, Math.min(index, queue.length - 1));
+  const before = Math.floor((MAX_PERSISTED_QUEUE_TRACKS - 1) / 2);
+  const start = Math.max(0, safeIndex - before);
+  return queue.slice(start, start + MAX_PERSISTED_QUEUE_TRACKS);
+}
+
+function persistedQueueIndex(queue: QueueTrack[], index: number): number {
+  if (queue.length <= MAX_PERSISTED_QUEUE_TRACKS) return index;
+  const safeIndex = Math.max(0, Math.min(index, queue.length - 1));
+  const before = Math.floor((MAX_PERSISTED_QUEUE_TRACKS - 1) / 2);
+  return safeIndex - Math.max(0, safeIndex - before);
+}
+
+/** Avoid serializing and writing the full queue on every position tick. */
+function createDebouncedStorage(delay = 1000): StateStorage {
+  if (typeof window === "undefined") return safeLocalStorage;
+  const pending = new Map<string, { value: string; timer: number }>();
+  return {
+    getItem: (name) => safeLocalStorage.getItem(name),
+    setItem: (name, value) => {
+      const existing = pending.get(name);
+      if (existing) window.clearTimeout(existing.timer);
+      const timer = window.setTimeout(() => {
+        const item = pending.get(name);
+        if (!item) return;
+        safeLocalStorage.setItem(name, item.value);
+        pending.delete(name);
+      }, delay);
+      pending.set(name, { value, timer });
+    },
+    removeItem: (name) => {
+      const existing = pending.get(name);
+      if (existing) window.clearTimeout(existing.timer);
+      pending.delete(name);
+      safeLocalStorage.removeItem(name);
+    },
+  };
+}
+
 const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
   queue: [],
   index: -1,
   shuffle: false,
   repeat: "off",
   autoRadio: false,
+  queueContinuation: undefined,
 
   status: "idle",
   error: undefined,
@@ -181,6 +242,7 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
       duration: mapped.duration ?? 0,
       playing: true,
       error: undefined,
+      queueContinuation: undefined,
     });
   },
 
@@ -202,6 +264,7 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
       duration: queue[i].duration ?? 0,
       playing: true,
       error: undefined,
+      queueContinuation: undefined,
     });
   },
 
@@ -213,9 +276,10 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
     }
     if (tracks.length === 0) return;
     // If the user clicked a non-playable item, find the nearest playable one.
-    const playableOffset = items
-      .slice(0, startIndex + 1)
-      .filter((i) => i.kind === "song" || i.kind === "video").length - 1;
+    const playableOffset =
+      items
+        .slice(0, startIndex + 1)
+        .filter((i) => i.kind === "song" || i.kind === "video").length - 1;
     get().setQueue(tracks, Math.max(0, playableOffset));
   },
 
@@ -314,10 +378,13 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
       playing: false,
       position: 0,
       duration: 0,
+      queueContinuation: undefined,
     });
   },
 
   setAutoRadio: (on) => set({ autoRadio: on }),
+
+  setQueueContinuation: (token) => set({ queueContinuation: token }),
 
   toggle: () => {
     const { queue, playing } = get();
@@ -462,12 +529,14 @@ export const usePlaybackStore = isFloatingPlayerWindow()
         // Volatile fields (position, status, streamUrl, error,
         // pendingSeek) and `playing` are reset on rehydrate so a fresh
         // launch never auto-blasts audio at you.
+        storage: createJSONStorage(() => createDebouncedStorage()),
         partialize: (s) => ({
-          queue: s.queue,
-          index: s.index,
+          queue: compactPersistedQueue(s.queue, s.index),
+          index: persistedQueueIndex(s.queue, s.index),
           shuffle: s.shuffle,
           repeat: s.repeat,
           autoRadio: s.autoRadio,
+          queueContinuation: s.queueContinuation,
           volume: s.volume,
           muted: s.muted,
         }),
@@ -552,9 +621,17 @@ export function initFloatingPlaybackBridge(): void {
     // mutated only the floater's mirror store — nothing actually played and
     // the queue silently diverged until the next broadcast overwrote it.
     playNow: (track, extras) =>
-      sendAction({ type: "playNow", track: track as unknown, extras: extras as unknown }),
+      sendAction({
+        type: "playNow",
+        track: track as unknown,
+        extras: extras as unknown,
+      }),
     playShelfItems: (items, startIndex) =>
-      sendAction({ type: "playShelfItems", items: items as unknown[], startIndex }),
+      sendAction({
+        type: "playShelfItems",
+        items: items as unknown[],
+        startIndex,
+      }),
     enqueueNext: (track) =>
       sendAction({ type: "enqueueNext", track: track as unknown }),
     enqueueEnd: (track) =>

@@ -7,16 +7,25 @@ import {
   DialogDescription,
   DialogHeader,
   DialogTitle,
+  frostedDialogOverlay,
+  frostedDialogPanel,
 } from "@/components/ui/dialog";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { checkForUpdates } from "@/lib/updater";
+import { IS_BETA_PLATFORM, IS_MAC } from "@/lib/platform";
 import { openWhatsNew } from "@/lib/store/whats-new";
+import { DiscordIcon, GithubIcon } from "@/components/shared/brand-icons";
 
 const REPO_URL = "https://github.com/NUber-dev/YTubic";
-const KOFI_URL = "https://ko-fi.com/nuberr";
+const DISCORD_URL = "https://discord.gg/v7JGAWWWj";
 
 const CREDITS: { name: string; role: string; url: string }[] = [
-  { name: "yt-dlp", role: "audio streaming", url: "https://github.com/yt-dlp/yt-dlp" },
+  {
+    name: "yt-dlp",
+    role: "audio streaming",
+    url: "https://github.com/yt-dlp/yt-dlp",
+  },
   { name: "LRCLIB", role: "synced lyrics", url: "https://lrclib.net" },
   { name: "Musixmatch", role: "lyrics", url: "https://www.musixmatch.com" },
   { name: "Genius", role: "lyrics", url: "https://genius.com" },
@@ -47,22 +56,32 @@ export function AboutDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-md">
+      <DialogContent
+        className={cn("max-w-md", frostedDialogPanel)}
+        overlayClassName={frostedDialogOverlay}
+      >
         <DialogHeader>
           <div className="flex items-center gap-3">
             <img src="/ytubic-icon.svg" alt="" className="size-12" />
             <div className="flex flex-col items-start">
               <DialogTitle className="text-lg">YTubic</DialogTitle>
-              <DialogDescription>
-                {version ? `Version ${version}` : " "}
-              </DialogDescription>
-              <button
-                type="button"
-                onClick={() => void openWhatsNew()}
-                className="mt-0.5 text-xs text-primary underline-offset-2 hover:underline"
-              >
-                What's new
-              </button>
+              {/* Version and the What's New link share one row so the
+                  header stays two lines tall next to the 48px icon. */}
+              <div className="flex items-center gap-2">
+                <DialogDescription>
+                  {version ? `Version ${version}` : " "}
+                  {version && IS_BETA_PLATFORM
+                    ? ` · beta for ${IS_MAC ? "macOS" : "Linux"}`
+                    : ""}
+                </DialogDescription>
+                <button
+                  type="button"
+                  onClick={() => void openWhatsNew()}
+                  className="text-xs text-primary underline-offset-2 hover:underline"
+                >
+                  What's new
+                </button>
+              </div>
             </div>
           </div>
         </DialogHeader>
@@ -72,6 +91,22 @@ export function AboutDialog({
           affiliated with, endorsed by, or sponsored by Google or YouTube.
           "YouTube" and "YouTube Music" are trademarks of Google LLC.
         </p>
+
+        {IS_BETA_PLATFORM && (
+          <p className="text-sm text-muted-foreground">
+            The {IS_MAC ? "macOS" : "Linux"} build is in beta. If something
+            breaks, please report it via the window menu (⋯ → Report an issue)
+            or on{" "}
+            <button
+              type="button"
+              onClick={link(`${REPO_URL}/issues`)}
+              className="underline underline-offset-2 hover:text-foreground"
+            >
+              GitHub
+            </button>
+            .
+          </p>
+        )}
 
         <div>
           <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
@@ -105,14 +140,17 @@ export function AboutDialog({
           .
         </p>
 
-        <div className="flex justify-end gap-2">
-          <Button variant="outline" onClick={link(KOFI_URL)}>
-            ☕ Support
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={link(DISCORD_URL)}>
+            <DiscordIcon />
+            Discord
           </Button>
           <Button variant="outline" onClick={link(REPO_URL)}>
+            <GithubIcon />
             GitHub
           </Button>
           <Button
+            className="ms-auto"
             onClick={() => {
               void checkForUpdates({ silent: false });
             }}

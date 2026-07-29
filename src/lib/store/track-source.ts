@@ -1,7 +1,8 @@
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { createJSONStorage, persist } from "zustand/middleware";
 import { emit } from "@tauri-apps/api/event";
 import { isFloatingPlayerWindow } from "@/lib/floating-player";
+import { dropLegacyLocalStorageKey, safeIdbStorage } from "./idb-storage";
 
 export type SourceKind = "song" | "video";
 
@@ -42,9 +43,8 @@ type State = {
 };
 
 // Soft cap on `byVideoId`. Each unique track contributes two keys (song
-// and video aliases), so 2000 keys ≈ 1000 tracks. localStorage has a 5–10
-// MB quota and this map is the only thing in `ytm-track-source`, but we'd
-// rather not let it grow without bound either way.
+// and video aliases), so 2000 keys ≈ 1000 tracks. It lives in IndexedDB,
+// outside WebKitGTK's tight localStorage quota, but is still bounded.
 const MAX_BY_VIDEO_ID_KEYS = 2000;
 const KEEP_ON_TRIM = 1500;
 
@@ -106,6 +106,7 @@ export const useTrackSourceStore = create<State>()(
     }),
     {
       name: "ytm-track-source",
+      storage: createJSONStorage(() => safeIdbStorage),
       // v2: drop all cached song<->video pairs once. The pre-gate resolver
       // (blind first-search-result) poisoned this cache with unrelated
       // videos (a 0:38 track cached against a 12:29 upload); pairs are
@@ -121,6 +122,8 @@ export const useTrackSourceStore = create<State>()(
     },
   ),
 );
+
+dropLegacyLocalStorageKey("ytm-track-source");
 
 /**
  * In the floating player window, redirect mutations to the main window
