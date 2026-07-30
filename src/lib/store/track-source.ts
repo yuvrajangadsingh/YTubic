@@ -107,14 +107,19 @@ export const useTrackSourceStore = create<State>()(
     {
       name: "ytm-track-source",
       storage: createJSONStorage(() => safeIdbStorage),
-      // v2: drop all cached song<->video pairs once. The pre-gate resolver
-      // (blind first-search-result) poisoned this cache with unrelated
-      // videos (a 0:38 track cached against a 12:29 upload); pairs are
-      // cheap to re-resolve and every new lookup is identity-gated now.
-      version: 2,
+      // Drop all cached song<->video pairs whenever the identity gate gets
+      // stricter — the toggle short-circuits on a cached pair and never
+      // re-resolves, so a tightened gate is invisible to anyone already
+      // holding a bad one. Pairs are cheap to re-resolve.
+      //   v2: the pre-gate resolver (blind first-search-result) cached a
+      //       0:38 track against a 12:29 upload.
+      //   v3: the gate itself had holes — an unnamed artist counted as
+      //       agreement and a candidate with no duration skipped the window
+      //       check, so a 0:38 track cached against a 6:56 upload.
+      version: 3,
       migrate: (persisted: unknown, version: number) => {
         const prev = (persisted ?? {}) as Partial<State>;
-        if (version < 2) {
+        if (version < 3) {
           return { byVideoId: {}, preferVideo: prev.preferVideo ?? false };
         }
         return prev as State;
