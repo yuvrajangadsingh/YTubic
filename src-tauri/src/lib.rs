@@ -3491,6 +3491,27 @@ fn runtime_icon(app: &tauri::AppHandle) -> tauri::image::Image<'static> {
         .to_owned()
 }
 
+/// The menu-bar icon. macOS extras are template images: a flat alpha mask
+/// that the system repaints in the menu bar's own foreground colour, so it
+/// turns white on a dark bar and black on a light one and stays legible when
+/// the wallpaper changes underneath. The full-colour app icon can't do that —
+/// it sat there as a red dot that ignored the system appearance. This is the
+/// same play glyph with the disc dropped, black on transparency.
+///
+/// Everywhere else keeps the app icon: Windows and Linux trays expect colour.
+fn tray_icon(app: &tauri::AppHandle) -> tauri::image::Image<'static> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        if let Ok(icon) =
+            tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))
+        {
+            return icon;
+        }
+    }
+    runtime_icon(app)
+}
+
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, "show", "Show YTubic", true, None::<&str>)?;
     let play_item = MenuItem::with_id(app, "play_pause", "Play / Pause", true, Some("Space"))?;
@@ -3507,7 +3528,9 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     )?;
 
     let _tray = TrayIconBuilder::with_id("main-tray")
-        .icon(runtime_icon(app))
+        .icon(tray_icon(app))
+        // No-op off macOS; there it's what makes the glyph track the menu bar.
+        .icon_as_template(cfg!(target_os = "macos"))
         .tooltip(if cfg!(debug_assertions) {
             "YTubic (dev)"
         } else {
