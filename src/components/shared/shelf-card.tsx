@@ -202,7 +202,13 @@ export function ShelfCard({ item, className }: Props) {
             item.round && "justify-center",
           )}
         >
-          <span className="truncate text-sm font-medium">{item.title}</span>
+          {/* min-w-0 is load-bearing: a flex item defaults to min-width:auto,
+              so without it the span refuses to shrink below its text and
+              `truncate` never clips. Long titles then ran straight across
+              the neighbouring cards instead of ellipsing. */}
+          <span className="min-w-0 truncate text-sm font-medium">
+            {item.title}
+          </span>
           {item.explicit ? (
             <span
               title="Explicit"
