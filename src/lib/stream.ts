@@ -67,6 +67,24 @@ export async function streamUrlFor(
   return `${base}/stream/${encodeURIComponent(videoId)}${qs ? `?${qs}` : ""}`;
 }
 
+/**
+ * Same stream, addressed so a Chromecast can actually fetch it. The normal
+ * base URL is loopback, which is fine for the webview and useless to a TV on
+ * the other side of the room — it has to pull the bytes itself. The Rust side
+ * brings a second listener up on the LAN only while a cast session is live,
+ * behind the same unguessable token, so this is the one place that asks for it.
+ *
+ * Deliberately not memoized like `getStreamBaseUrl`: the LAN listener comes and
+ * goes with the session, so a cached base would go stale on reconnect.
+ */
+export async function castUrlFor(videoId: string): Promise<string> {
+  const base = await invoke<string>("stream_lan_base_url");
+  const params = new URLSearchParams();
+  if (!isPremium()) params.set("ephemeral", "1");
+  const qs = params.toString();
+  return `${base}/stream/${encodeURIComponent(videoId)}${qs ? `?${qs}` : ""}`;
+}
+
 const prefetched = new Set<string>();
 
 /**

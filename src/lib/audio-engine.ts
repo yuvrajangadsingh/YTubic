@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { fetchRadio, fetchWatchQueueContinuation } from "@/lib/innertube/radio";
 import { prefetchStream, saveTrackMeta, streamUrlFor } from "@/lib/stream";
 import { usePlaybackStore, type QueueTrack } from "@/lib/store/playback";
+import { isCasting, useCastStore } from "@/lib/store/cast";
 import { usePremiumStore } from "@/lib/store/premium";
 import { useSettingsStore } from "@/lib/store/settings";
 import { openPremiumGate } from "@/lib/store/premium-gate";
@@ -253,14 +254,19 @@ export function useAudioEngine() {
     // the element's actual state back. Track changes pause the element
     // too, but by the time the queued pause event runs the status is
     // already "loading", so the ready-guard keeps auto-play intact.
+    // While casting these are noise: the element is deliberately paused and
+    // the receiver is what `playing` describes. Letting the local pause event
+    // through would immediately contradict every status that says playing.
     const onElPause = () => {
       const s = store();
+      if (isCasting()) return;
       if (s.status === "ready" && s.playing && !el.ended) {
         s.setPlaying(false);
       }
     };
     const onElPlay = () => {
       const s = store();
+      if (isCasting()) return;
       if (s.status === "ready" && !s.playing) {
         s.setPlaying(true);
       }
@@ -943,9 +949,19 @@ export function useAudioEngine() {
 
   // Play / pause follow store.
   const playing = usePlaybackStore((s) => s.playing);
+  const casting = useCastStore((s) => s.deviceId !== null);
   useEffect(() => {
     const el = audioRef.current;
     if (!el) return;
+    if (casting) {
+      // The receiver pulls the same stream for itself, so anything playing
+      // here is a second copy of the track a few hundred ms out of phase.
+      // Pause rather than mute: a muted element still holds the audio
+      // session, which would leave the system Now Playing entry pointing at
+      // a track this machine is not the one playing.
+      el.pause();
+      return;
+    }
     if (playing && !premiumOk) {
       // Resume attempts (play button, Space, SMTC play) on a gated track
       // never reach the resolve effect (its deps don't include
@@ -967,7 +983,7 @@ export function useAudioEngine() {
     } else {
       el.pause();
     }
-  }, [playing, premiumOk]);
+  }, [playing, premiumOk, casting]);
 
   // Volume / mute follow store.
   const volume = usePlaybackStore((s) => s.volume);

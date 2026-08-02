@@ -16,6 +16,8 @@ import {
   VideoIcon,
 } from "lucide-react";
 import { QueueBody, QueueToggleButton } from "@/components/layout/queue-panel";
+import { CastButton } from "@/components/layout/cast-button";
+import { useCastStore } from "@/lib/store/cast";
 import { FullscreenPlayer } from "@/components/layout/fullscreen-player";
 import {
   VideoQualityBadge,
@@ -707,6 +709,9 @@ export function PlayerBar({
   const [compactControls, setCompactControls] = useState(false);
   const playerRef = useRef<HTMLElement>(null);
   const streamKind = usePlaybackStore((s) => s.streamKind);
+  // Null unless a receiver owns playback, which is the signal the spinner
+  // below keys off — see the `loading` comment.
+  const castState = useCastStore((s) => (s.deviceId ? s.state : null));
   const videoBuffering = usePlaybackStore((s) => s.videoBuffering);
   const videoStartup = usePlaybackStore((s) => s.videoStartup);
   const iTunesCover = useLatchedCover(track, useITunesCover(track));
@@ -756,7 +761,13 @@ export function PlayerBar({
   // instant), which flips status to "loading" even while playing is
   // still false — without this guard, the freshly-launched player
   // shows a spinner instead of the Play icon.
-  const loading = status === "loading" && playing;
+  // Casting rewrites what "loading" means. The local element is parked on
+  // purpose and never leaves "loading", so the old test spun forever the
+  // whole time a receiver was playing. What the user is waiting on then is
+  // the receiver, so ask it instead.
+  const loading = castState
+    ? castState === "connecting" || castState === "buffering"
+    : status === "loading" && playing;
 
   // The right-side variant is fixed-positioned in the main app shell.
   // The floating-window variant fills its parent container (the
@@ -1030,6 +1041,7 @@ export function PlayerBar({
             onToggle={() => setQueueOpen((v) => !v)}
           />
           <VolumeControl compact={compactControls} />
+          <CastButton />
           {/* No expand in the floating window: a "full screen" view of a
               350px window isn't one, and the main window already offers
               the real thing. */}

@@ -5,9 +5,26 @@ import {
   type StateStorage,
 } from "zustand/middleware";
 import { emit } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import type { ShelfItem, Thumbnail } from "@/lib/innertube/types";
 import { isFloatingPlayerWindow } from "@/lib/floating-player";
+import { isCasting } from "@/lib/store/cast";
 import { safeLocalStorage } from "./safe-storage";
+
+/**
+ * Send a transport command to the receiver instead of the local element.
+ * Returns true when it was handled there, so callers can bail out.
+ *
+ * Casting inverts who owns playback state: the receiver decides, and its
+ * `cast-status` writes the result back here. So these deliberately do NOT
+ * touch local state — doing both would have the optimistic value and the
+ * status fighting each other every second.
+ */
+function castCommand(cmd: string, args?: Record<string, unknown>): boolean {
+  if (!isCasting()) return false;
+  void invoke(cmd, args).catch(() => {});
+  return true;
+}
 
 export type QueueTrack = {
   videoId: string;
@@ -91,6 +108,8 @@ export type PlaybackState = {
   playNow: (track: QueueTrack | ShelfItem, extras?: QueueTrack[]) => void;
   setQueue: (tracks: QueueTrack[], startIndex?: number) => void;
   playShelfItems: (items: ShelfItem[], startIndex: number) => void;
+  /** Shuffle-play an entire list: randomise it, then start at the top. */
+  shufflePlayShelfItems: (items: ShelfItem[]) => void;
   enqueueNext: (track: QueueTrack | ShelfItem) => void;
   enqueueEnd: (track: QueueTrack | ShelfItem) => void;
   appendToQueue: (tracks: (QueueTrack | ShelfItem)[]) => void;
@@ -283,6 +302,23 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
     get().setQueue(tracks, Math.max(0, playableOffset));
   },
 
+  shufflePlayShelfItems: (items) => {
+    const tracks: QueueTrack[] = [];
+    for (const it of items) {
+      const m = shelfItemToTrack(it);
+      if (m) tracks.push(m);
+    }
+    if (tracks.length === 0) return;
+    // Shuffle the whole list and start at the top of it. The obvious-looking
+    // alternative — queue in order, jump to a random index, turn shuffle on —
+    // silently loses the album: setShuffle only randomises what is AFTER the
+    // current track, and treats everything before it as already-played
+    // history. Starting at track 4 of 5 that way leaves exactly one song up
+    // next.
+    get().setQueue(fisherYates(tracks), 0);
+    set({ shuffle: true });
+  },
+
   enqueueNext: (track) => {
     const mapped = shelfItemToTrack(track);
     if (!mapped) return;
@@ -389,6 +425,10 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
   toggle: () => {
     const { queue, playing } = get();
     if (queue.length === 0) return;
+    // Casting makes this a remote: the receiver owns whether sound is
+    // happening, so drive it and let its next status set `playing` here.
+    // Setting it locally too would race the status back and forth.
+    if (castCommand(playing ? "cast_pause" : "cast_play")) return;
     set({ playing: !playing });
   },
 
@@ -489,12 +529,25 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
     }),
   setPosition: (position) => set({ position }),
   setDuration: (duration) => set({ duration }),
-  seek: (seconds) =>
-    set({ pendingSeek: Math.max(0, seconds), position: seconds }),
+  seek: (seconds) => {
+    const target = Math.max(0, seconds);
+    // Move the bar immediately either way: a scrub that waits a full poll
+    // for the receiver to confirm reads as a dropped input.
+    if (castCommand("cast_seek", { seconds: target })) {
+      set({ position: target });
+      return;
+    }
+    set({ pendingSeek: target, position: target });
+  },
   clearPendingSeek: () => set({ pendingSeek: undefined }),
 
-  setVolume: (volume) =>
-    set({ volume: Math.max(0, Math.min(1, volume)), muted: false }),
+  setVolume: (volume) => {
+    const level = Math.max(0, Math.min(1, volume));
+    // The slider should move the TV's volume, not this machine's silent
+    // element. Local state still tracks it so the control stays live.
+    castCommand("cast_set_volume", { level });
+    set({ volume: level, muted: false });
+  },
   toggleMute: () => set((s) => ({ muted: !s.muted })),
   setShuffle: (on) => {
     set((s) => {

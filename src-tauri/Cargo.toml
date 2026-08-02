@@ -75,6 +75,19 @@ discord-rich-presence = "0.2"
 # MD5 for Last.fm request signing (api_sig = md5 of sorted params + secret).
 # Tiny, single-purpose crate. See src/lastfm.rs.
 md5 = "0.7"
+# Casting to Google TV / Chromecast. `mdns-sd` browses _googlecast._tcp to find
+# receivers; `rust-cast` speaks the CASTv2 protobuf-over-TLS protocol on :8009.
+# The receiver fetches media from our own stream server over the LAN, so nothing
+# is transcoded — verified against a 4K Google TV Stick that a plain http:// LAN
+# url is accepted and opus/webm decodes natively. See src/cast.rs.
+mdns-sd = "0.20"
+# NB: the package is `rust_cast` with an underscore, not a hyphen.
+rust_cast = "0.21"
+# Not used directly for TLS — declared only so we can name a crypto provider
+# at startup. rustls arrives transitively with BOTH `ring` and `aws-lc-rs`
+# enabled (feature unification across reqwest and rust_cast), and in that state
+# it panics rather than choosing. See the install_default call in run().
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

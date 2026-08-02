@@ -26,6 +26,7 @@ use tower_http::services::ServeFile;
 
 mod now_playing;
 mod appid;
+mod cast;
 mod discord;
 mod lastfm;
 mod media;
@@ -2912,6 +2913,15 @@ struct StreamServerState {
     /// guesses the random port still can't form a valid URL — this closes
     /// the CSRF-spawn and DNS-rebinding-read vectors.
     token: Arc<Mutex<Option<String>>>,
+    /// The exact router the loopback listener is serving. Stashed so the
+    /// on-demand LAN listener can serve the same one on a second socket:
+    /// rebuilding it there would be a second copy of the route table free
+    /// to drift out of step with this one. Cloning a Router is cheap.
+    router: Arc<Mutex<Option<Router>>>,
+    /// The LAN listener, alive only while something is casting. `None` is
+    /// the normal state and means nothing off this machine can reach the
+    /// server at all.
+    lan: Arc<Mutex<Option<LanListener>>>,
 }
 
 #[tauri::command]
@@ -2922,6 +2932,139 @@ async fn get_stream_base_url(state: tauri::State<'_, StreamServerState>) -> Resu
         (Some(p), Some(t)) => Ok(format!("http://127.0.0.1:{p}/{t}")),
         _ => Err("stream server not ready".to_string()),
     }
+}
+
+/// A live `0.0.0.0` listener, kept only for as long as a receiver needs to
+/// pull media from us. Casting to a TV means the TV does the fetching, and
+/// loopback is invisible from anywhere but this machine. Binding wide for
+/// the whole session would put the media server on every network the laptop
+/// ever joins, so it goes up and comes back down with the cast instead.
+struct LanListener {
+    base_url: String,
+    /// Firing this makes axum stop accepting and drop the socket, which is
+    /// what actually frees the port again.
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// The address other machines on this network would reach us on: the source
+/// address the kernel picks for off-link traffic, i.e. the one belonging to
+/// whichever interface currently holds the default route. A UDP `connect` is
+/// nothing but a routing-table lookup, so no packet leaves the box, no name
+/// is resolved, and it answers instantly with no internet. It also beats
+/// walking the interface list, which needs a crate and still leaves us
+/// guessing which of the loopback/utun/bridge addresses a receiver could use.
+/// The probe target is documentation space (RFC 5737) on purpose: nobody
+/// routes it specially, so it always falls through to the default route.
+fn lan_ipv4() -> Result<Ipv4Addr, String> {
+    let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .map_err(|e| format!("no usable LAN address (socket: {e})"))?;
+    probe
+        .connect((Ipv4Addr::new(203, 0, 113, 1), 9))
+        .map_err(|e| format!("no usable LAN address (no route off this machine: {e})"))?;
+    let ip = match probe.local_addr() {
+        Ok(SocketAddr::V4(a)) => *a.ip(),
+        Ok(other) => return Err(format!("no usable LAN address (got {other})")),
+        Err(e) => return Err(format!("no usable LAN address ({e})")),
+    };
+    // Handing back one of these would produce a cast that connects and then
+    // silently never buffers: the receiver can't fetch from any of them.
+    if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_multicast() {
+        return Err(format!("no usable LAN address (got {ip})"));
+    }
+    Ok(ip)
+}
+
+/// Bring the LAN listener up if it isn't already and hand back its base URL.
+/// Same router and same token as the loopback listener, so a receiver's GET
+/// and the webview's GET land in identical handlers, and the unguessable
+/// prefix keeps gating them: what the LAN sees is a token wall, not an open
+/// file server. Idempotent, a second cast reuses the running listener.
+// NB: not `pub`. A `pub` #[tauri::command] at the crate root makes the macro
+// re-export its generated `__cmd__*` into the root macro namespace where the
+// macro already lives, which is a redefinition (E0255). Every command in this
+// file is private for that reason; the `pub` ones live in submodules.
+#[tauri::command]
+async fn stream_lan_base_url(
+    state: tauri::State<'_, StreamServerState>,
+) -> Result<String, String> {
+    let mut lan = state.lan.lock().await;
+    if let Some(running) = lan.as_ref() {
+        return Ok(running.base_url.clone());
+    }
+
+    let token = state
+        .token
+        .lock()
+        .await
+        .clone()
+        .ok_or("stream server not ready")?;
+    let app = state
+        .router
+        .lock()
+        .await
+        .clone()
+        .ok_or("stream server not ready")?;
+    // Resolve the address before binding so a machine with no route off it
+    // never opens the wide socket at all.
+    let ip = lan_ipv4()?;
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("lan bind failed: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("lan local_addr failed: {e}"))?
+        .port();
+
+    let (shutdown, signal) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let served = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let _ = signal.await;
+        });
+        if let Err(e) = served.await {
+            eprintln!("[stream-server] lan serve error: {e}");
+        }
+    });
+
+    let base_url = format!("http://{ip}:{port}/{token}");
+    eprintln!("[stream-server] lan listening on 0.0.0.0:{port}, advertising {ip}");
+    *lan = Some(LanListener {
+        base_url: base_url.clone(),
+        shutdown,
+        task,
+    });
+    Ok(base_url)
+}
+
+/// Take the LAN listener back down. Idempotent, because a disconnect can
+/// arrive from a session that never needed one (playback stayed local, or a
+/// connect failed) and that isn't an error.
+#[tauri::command]
+async fn stream_lan_stop(state: tauri::State<'_, StreamServerState>) -> Result<(), String> {
+    let listener = state.lan.lock().await.take();
+    let listener = match listener {
+        Some(l) => l,
+        None => return Ok(()),
+    };
+    let _ = listener.shutdown.send(());
+    // Graceful means axum drops the socket immediately (port free) but then
+    // waits out in-flight responses, and a receiver parked on an open media
+    // stream would keep that wait, and us, alive indefinitely. Give the
+    // response a moment to end on its own, then cut it. Detached so a
+    // disconnect returns to the UI at once.
+    let mut task = listener.task;
+    tokio::spawn(async move {
+        if tokio::time::timeout(Duration::from_secs(3), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    });
+    eprintln!("[stream-server] lan listener stopped");
+    Ok(())
 }
 
 /// Spawn a yt-dlp downloader that writes into the shared memory buffer
@@ -3383,6 +3526,7 @@ fn generate_stream_token() -> String {
 async fn start_stream_server(
     port_state: Arc<Mutex<Option<u16>>>,
     token_state: Arc<Mutex<Option<String>>>,
+    router_state: Arc<Mutex<Option<Router>>>,
     cache_dir: PathBuf,
     ephemeral_dir: PathBuf,
     cover_dir: PathBuf,
@@ -3440,6 +3584,10 @@ async fn start_stream_server(
     let app = Router::new()
         .nest(&format!("/{token}"), routes)
         .layer(CorsLayer::permissive());
+    // Publish the router so the on-demand LAN listener (stream_lan_base_url)
+    // can serve this very one, same routes and same token prefix, instead of
+    // assembling its own.
+    *router_state.lock().await = Some(app.clone());
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -3582,9 +3730,19 @@ pub fn run() {
     // Windows.
     appid::init();
 
+    // rustls 0.23 refuses to pick a crypto backend for you when more than one
+    // is compiled in, and panics the first time anything opens a TLS socket.
+    // Both are: `ring` and `aws-lc-rs` arrive under the same rustls via
+    // reqwest/tauri-plugin-http, and cargo unifies the features. Casting is
+    // what surfaced it (the CASTv2 socket is TLS), but the ambiguity is
+    // process-wide, so the choice belongs here at startup rather than in any
+    // one caller. Err just means something already installed one.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let state = StreamServerState::default();
     let port_handle = state.port.clone();
     let token_handle = state.token.clone();
+    let router_handle = state.router.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -3626,11 +3784,27 @@ pub fn run() {
         .manage(RefreshGuard::default())
         .manage(discord::spawn())
         .manage(lastfm::LastfmState::default())
+        // Idle until the first cast_connect: the session thread and its
+        // socket only exist once a receiver is picked, so a launch that
+        // never casts costs nothing.
+        .manage(cast::CastState::default())
         .invoke_handler(tauri::generate_handler![
             ensure_ytdlp,
             resolve_stream_ytdlp,
             resolve_hls_stream,
             get_stream_base_url,
+            stream_lan_base_url,
+            stream_lan_stop,
+            cast::cast_discover,
+            cast::cast_connect,
+            cast::cast_disconnect,
+            cast::cast_load,
+            cast::cast_play,
+            cast::cast_pause,
+            cast::cast_stop,
+            cast::cast_seek,
+            cast::cast_set_volume,
+            cast::cast_status,
             start_login,
             get_cookie_header,
             get_auth_context,
@@ -3710,6 +3884,7 @@ pub fn run() {
         .setup(move |app| {
             let port = port_handle.clone();
             let token = token_handle.clone();
+            let router = router_handle.clone();
             // User-chosen cache root (Settings → Storage) or the OS
             // default. Captured once and exposed as managed state so
             // every cache-path computation matches the directories the
@@ -3743,8 +3918,16 @@ pub fn run() {
                 // email-based dedup before the UI reads the list.
                 dedup_accounts_by_identity(&handle).await;
                 cleanup_login_artifacts(&handle).await;
-                start_stream_server(port, token, cache_dir, ephemeral_dir, cover_dir, ytdlp_bin)
-                    .await;
+                start_stream_server(
+                    port,
+                    token,
+                    router,
+                    cache_dir,
+                    ephemeral_dir,
+                    cover_dir,
+                    ytdlp_bin,
+                )
+                .await;
             });
             // Keep the active account's replayed cookie snapshot fresh.
             // Google leashes *extracted* cookies to ~2h; reloading the
