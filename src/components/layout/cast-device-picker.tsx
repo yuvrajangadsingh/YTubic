@@ -66,9 +66,13 @@ export function CastDevicePicker() {
             </span>
           </div>
         </div>
-        {sessionError ? (
+        {/* Both, because they fail differently and both were invisible here.
+            `error` is the receiver complaining; `lastError` is a command of
+            ours that never landed — a failed load left this panel looking
+            like a healthy session with nothing playing. */}
+        {sessionError || lastError ? (
           <p className="px-2 text-xs leading-relaxed text-destructive">
-            {sessionError}
+            {sessionError ?? lastError}
           </p>
         ) : null}
         <Button variant="outline" size="sm" onClick={() => void disconnect()}>

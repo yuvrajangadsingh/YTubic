@@ -52,6 +52,25 @@ export function getVideoSurfaceElement(): HTMLVideoElement | null {
   return companionVideoSingleton ?? mediaElSingleton;
 }
 
+/**
+ * The only way this module is allowed to start local playback.
+ *
+ * A cast session means the receiver is pulling the same stream for itself, so
+ * anything playing here is a second copy of the track a few hundred ms out of
+ * phase. Guarding the play/pause effect alone was not enough: there are six
+ * routes to `el.play()` in here (the video startup hold releasing, its
+ * timeout fallback, the resolve effect, the companion, retries) and every one
+ * of them bypassed it. Switching to video mode while casting released the
+ * hold, which called play() directly, and the track came out of the laptop
+ * and the TV at once.
+ *
+ * Always returns a promise so callers can keep chaining `.catch`.
+ */
+function playLocal(el: HTMLMediaElement | null | undefined): Promise<void> {
+  if (!el || isCasting()) return Promise.resolve();
+  return el.play();
+}
+
 export function useAudioEngine() {
   const audioRef = useRef<HTMLVideoElement | null>(null);
   // Guard against stale stream resolutions when the user skips mid-fetch.
@@ -129,8 +148,8 @@ export function useAudioEngine() {
     // still-true intent becomes actual playback. Both play() calls in
     // one task keeps the AV start close enough for the drift sync.
     if (st.playing) {
-      void el.play().catch(() => {});
-      if (comp) void comp.play().catch(() => {});
+      void playLocal(el).catch(() => {});
+      if (comp) void playLocal(comp).catch(() => {});
     }
   };
   /** Abandon the hold and continue audio-only (timeout / error / mode
@@ -150,7 +169,7 @@ export function useAudioEngine() {
       comp.removeAttribute("src");
       comp.load();
     }
-    if (el && st.playing) void el.play().catch(() => {});
+    if (el && st.playing) void playLocal(el).catch(() => {});
   };
 
   // Ensure a single media element exists. It's a <video> element, not
@@ -701,7 +720,7 @@ export function useAudioEngine() {
           return;
         }
         if (usePlaybackStore.getState().playing) {
-          void el.play().catch((e) => {
+          void playLocal(el).catch((e) => {
             // AbortError is what we get when a pending play() is
             // interrupted by a new load (e.g. user clicked the next
             // track before the current one started). It's harmless
@@ -765,7 +784,7 @@ export function useAudioEngine() {
       if (master.paused) {
         video.pause();
       } else if (video.src) {
-        void video.play().catch(() => {});
+        void playLocal(video).catch(() => {});
       }
     };
     const onLoaded = () => {
@@ -976,7 +995,7 @@ export function useAudioEngine() {
       // maybeStartHeld() acts on it at release. Playing now would leak
       // audio ahead of the frames.
       if (videoHoldRef.current) return;
-      void el.play().catch((e) => {
+      void playLocal(el).catch((e) => {
         if (e?.name === "AbortError") return;
         usePlaybackStore.getState().setStatus("error", e?.message ?? String(e));
       });
@@ -1058,7 +1077,7 @@ export function useAudioEngine() {
       el.src &&
       !videoHoldRef.current
     ) {
-      void el.play().catch((e) => {
+      void playLocal(el).catch((e) => {
         if (e?.name === "AbortError") return;
         usePlaybackStore.getState().setStatus("error", e?.message ?? String(e));
       });

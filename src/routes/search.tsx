@@ -804,11 +804,18 @@ function SearchField({
 
   const suggestions = useMemo(() => {
     const q = value.trim().toLowerCase();
-    if (!q) return history.slice(0, HISTORY_LIMIT);
+    if (!q) {
+      // Nothing typed: the page body is already listing the whole history
+      // right under this field, and the field autofocuses on mount, so
+      // offering it here too drew both lists at once with the dropdown
+      // overlapping the rows it was duplicating. Only worth showing when
+      // the page is busy with results instead of recents.
+      return urlQ.trim() ? history.slice(0, HISTORY_LIMIT) : [];
+    }
     return history
       .filter((h) => h.toLowerCase().includes(q) && h.toLowerCase() !== q)
       .slice(0, HISTORY_LIMIT);
-  }, [history, value]);
+  }, [history, value, urlQ]);
 
   useEffect(() => {
     setActiveIdx(-1);

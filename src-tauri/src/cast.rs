@@ -81,7 +81,17 @@ impl Default for CastStatus {
 const SERVICE_TYPE: &str = "_googlecast._tcp.local.";
 
 /// Browse until `timeout` elapses, publishing the list every time it grows.
-fn discover_blocking(app: &AppHandle, timeout: Duration) -> Result<Vec<CastDevice>, String> {
+/// `registry` is written as each receiver answers, NOT when the scan ends.
+/// The picker renders from the `cast-devices` events this emits, so a device
+/// is clickable the moment it appears; publishing it while `cast_connect`
+/// still cannot resolve the id is a race the user wins constantly, and it
+/// surfaces as "unknown cast device" on the first click and success on a
+/// later one once the scan has finished.
+fn discover_blocking(
+    app: &AppHandle,
+    registry: &Arc<SyncMutex<HashMap<String, CastDevice>>>,
+    timeout: Duration,
+) -> Result<Vec<CastDevice>, String> {
     let daemon = ServiceDaemon::new().map_err(|err| err.to_string())?;
     let events = daemon.browse(SERVICE_TYPE).map_err(|err| err.to_string())?;
 
@@ -115,6 +125,12 @@ fn discover_blocking(app: &AppHandle, timeout: Duration) -> Result<Vec<CastDevic
                 found[index] = device;
             }
             None => found.push(device),
+        }
+        // Resolvable before it is clickable, never the other way round.
+        if let Ok(mut registry) = registry.lock() {
+            for device in &found {
+                registry.insert(device.id.clone(), device.clone());
+            }
         }
         let _ = app.emit("cast-devices", &found);
     }
@@ -431,6 +447,10 @@ fn load(
         duration: (request.duration > 0.0).then_some(request.duration as f32),
     };
 
+    eprintln!(
+        "[cast] LOAD url={} ct={} transport={}",
+        media.content_id, media.content_type, session.transport_id
+    );
     let status = connection
         .media
         .load(
@@ -439,6 +459,15 @@ fn load(
             &media,
         )
         .map_err(|err| err.to_string())?;
+    eprintln!(
+        "[cast] LOAD accepted, {} entr(ies): {:?}",
+        status.entries.len(),
+        status
+            .entries
+            .iter()
+            .map(|e| (e.media_session_id, e.player_state, e.idle_reason))
+            .collect::<Vec<_>>()
+    );
 
     *launched = Some(Launched {
         media_session_id: status.entries.first().map(|entry| entry.media_session_id),
@@ -545,13 +574,16 @@ pub struct CastState {
     /// Latest status. Separate from `inner` because the session thread writes
     /// it from outside the async runtime, where the tokio mutex is unusable.
     status: Arc<SyncMutex<CastStatus>>,
+    /// Everything discovery has seen this run, so `cast_connect` can turn an id
+    /// from the UI back into an address. Sync-locked and outside `inner` for
+    /// the same reason `status` is: the mDNS browse runs on a blocking thread
+    /// and has to publish each device the instant it resolves, or the UI can
+    /// offer a device the backend cannot look up yet.
+    devices: Arc<SyncMutex<HashMap<String, CastDevice>>>,
 }
 
 #[derive(Default)]
 struct Inner {
-    /// Everything discovery has seen this run, so `cast_connect` can turn an id
-    /// from the UI back into an address.
-    devices: HashMap<String, CastDevice>,
     session: Option<mpsc::Sender<Cmd>>,
 }
 
@@ -612,16 +644,15 @@ pub async fn cast_discover(
 ) -> Result<Vec<CastDevice>, String> {
     let timeout = Duration::from_millis(timeout_ms.clamp(500, 30_000));
     let emitter = app.clone();
-    let found = tauri::async_runtime::spawn_blocking(move || discover_blocking(&emitter, timeout))
-        .await
-        .map_err(|err| err.to_string())??;
-
-    // Merge rather than replace: a device that skipped this round is still
+    // Merged, never replaced: a device that skipped this round is still
     // reachable, and an id the UI is already holding has to keep resolving.
-    let mut inner = state.inner.lock().await;
-    for device in &found {
-        inner.devices.insert(device.id.clone(), device.clone());
-    }
+    // discover_blocking writes into it as each receiver answers.
+    let registry = state.devices.clone();
+    let found = tauri::async_runtime::spawn_blocking(move || {
+        discover_blocking(&emitter, &registry, timeout)
+    })
+    .await
+    .map_err(|err| err.to_string())??;
     Ok(found)
 }
 
@@ -634,10 +665,9 @@ pub async fn cast_connect(
     device_id: String,
 ) -> Result<(), String> {
     let device = state
-        .inner
-        .lock()
-        .await
         .devices
+        .lock()
+        .map_err(|_| "cast device registry is poisoned".to_string())?
         .get(&device_id)
         .cloned()
         .ok_or_else(|| format!("unknown cast device: {device_id}"))?;
@@ -729,6 +759,7 @@ pub async fn cast_load(
     artwork_url: Option<String>,
     duration: f64,
 ) -> Result<(), String> {
+    eprintln!("[cast] cast_load called: {url} ({content_type})");
     let request = LoadRequest {
         url,
         content_type,
@@ -737,10 +768,14 @@ pub async fn cast_load(
         artwork_url,
         duration,
     };
-    dispatch(&app, &state, move |reply| {
+    let outcome = dispatch(&app, &state, move |reply| {
         Cmd::Load(Box::new(request), reply)
     })
-    .await
+    .await;
+    if let Err(err) = &outcome {
+        eprintln!("[cast] cast_load FAILED: {err}");
+    }
+    outcome
 }
 
 #[tauri::command]
