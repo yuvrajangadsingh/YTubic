@@ -1,8 +1,30 @@
 import { create, type StateCreator } from "zustand";
-import { persist } from "zustand/middleware";
+import {
+  createJSONStorage,
+  persist,
+  type StateStorage,
+} from "zustand/middleware";
 import { emit } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import type { ShelfItem, Thumbnail } from "@/lib/innertube/types";
 import { isFloatingPlayerWindow } from "@/lib/floating-player";
+import { isCasting } from "@/lib/store/cast";
+import { safeLocalStorage } from "./safe-storage";
+
+/**
+ * Send a transport command to the receiver instead of the local element.
+ * Returns true when it was handled there, so callers can bail out.
+ *
+ * Casting inverts who owns playback state: the receiver decides, and its
+ * `cast-status` writes the result back here. So these deliberately do NOT
+ * touch local state — doing both would have the optimistic value and the
+ * status fighting each other every second.
+ */
+function castCommand(cmd: string, args?: Record<string, unknown>): boolean {
+  if (!isCasting()) return false;
+  void invoke(cmd, args).catch(() => {});
+  return true;
+}
 
 export type QueueTrack = {
   videoId: string;
@@ -13,6 +35,18 @@ export type QueueTrack = {
   thumbnails: Thumbnail[];
   /** Original duration from browse responses, may be undefined until /player resolves. */
   duration?: number;
+  /**
+   * Whether this row is a plain song (audio-track version) or a music
+   * video, when known. Lets the Source toggle keep a video-native track
+   * on its own id instead of searching for a different clip.
+   */
+  kind?: "song" | "video";
+  /**
+   * videoId of the song<->video counterpart from InnerTube's /next
+   * pairing, when exposed. Used to seed the Source toggle with the real
+   * other version rather than a fuzzy search.
+   */
+  counterpartId?: string;
 };
 
 export type RepeatMode = "off" | "all" | "one";
@@ -31,6 +65,21 @@ export type PlaybackState = {
   error?: string;
   /** Resolved stream URL for the current track (set by AudioEngine). */
   streamUrl?: string;
+  /** Whether the current stream is the real video file (user switched
+   *  to the video source) or the audio-only download. The fullscreen
+   *  player uses this to swap the artwork for the live video surface. */
+  streamKind: "audio" | "video";
+  /** Native pixel height of the active video surface (companion or
+   *  muxed), for the quality badge. null while no frames are loaded. */
+  streamVideoHeight: number | null;
+  /** True while the companion video is stalled waiting for data (its
+   *  audio master keeps playing). Drives the buffering spinner. */
+  videoBuffering: boolean;
+  /** Video-mode startup phase. "waiting" = playback is HELD until the
+   *  video track is ready so audio and frames start together (loader
+   *  UI); "fallback" = the video never arrived (timeout/error) and
+   *  playback continued audio-only; "ready"/"idle" = nothing pending. */
+  videoStartup: "idle" | "waiting" | "ready" | "fallback";
 
   // Transport
   playing: boolean;
@@ -47,10 +96,20 @@ export type PlaybackState = {
   /** When true, auto-append radio tracks to the queue when the last one ends. */
   autoRadio: boolean;
 
+  /**
+   * Pending /next continuation for the current queue's source — set when
+   * the queue came from a server-side playlist shuffle whose remaining
+   * permutation is still on YTM's side. The audio engine drains it as
+   * playback nears the tail; any action that replaces the queue clears it.
+   */
+  queueContinuation?: string;
+
   // Actions — queue
   playNow: (track: QueueTrack | ShelfItem, extras?: QueueTrack[]) => void;
   setQueue: (tracks: QueueTrack[], startIndex?: number) => void;
   playShelfItems: (items: ShelfItem[], startIndex: number) => void;
+  /** Shuffle-play an entire list: randomise it, then start at the top. */
+  shufflePlayShelfItems: (items: ShelfItem[]) => void;
   enqueueNext: (track: QueueTrack | ShelfItem) => void;
   enqueueEnd: (track: QueueTrack | ShelfItem) => void;
   appendToQueue: (tracks: (QueueTrack | ShelfItem)[]) => void;
@@ -58,6 +117,7 @@ export type PlaybackState = {
   moveTrack: (from: number, to: number) => void;
   clearQueue: () => void;
   setAutoRadio: (on: boolean) => void;
+  setQueueContinuation: (token?: string) => void;
 
   // Actions — transport
   toggle: () => void;
@@ -69,6 +129,13 @@ export type PlaybackState = {
   // Actions — status (used by AudioEngine)
   setStatus: (status: LoadStatus, error?: string) => void;
   setStreamUrl: (url?: string) => void;
+  setStreamKind: (kind: "audio" | "video") => void;
+  setStreamVideoHeight: (height: number | null) => void;
+  setVideoBuffering: (v: boolean) => void;
+  setVideoStartup: (v: "idle" | "waiting" | "ready" | "fallback") => void;
+  /** Fill in a queue track's duration when it arrived without one
+   *  (home-card queues). Only writes missing durations. */
+  patchTrackDuration: (videoId: string, seconds: number) => void;
   setPosition: (position: number) => void;
   setDuration: (duration: number) => void;
   seek: (seconds: number) => void;
@@ -92,6 +159,8 @@ function shelfItemToTrack(item: ShelfItem | QueueTrack): QueueTrack | null {
     album: item.album,
     thumbnails: item.thumbnails,
     duration: item.duration,
+    kind: item.kind,
+    counterpartId: item.counterpartId,
   };
 }
 
@@ -104,16 +173,67 @@ function fisherYates<T>(arr: readonly T[]): T[] {
   return result;
 }
 
+const MAX_PERSISTED_QUEUE_TRACKS = 300;
+
+function compactPersistedQueue(
+  queue: QueueTrack[],
+  index: number,
+): QueueTrack[] {
+  if (queue.length <= MAX_PERSISTED_QUEUE_TRACKS) return queue;
+  const safeIndex = Math.max(0, Math.min(index, queue.length - 1));
+  const before = Math.floor((MAX_PERSISTED_QUEUE_TRACKS - 1) / 2);
+  const start = Math.max(0, safeIndex - before);
+  return queue.slice(start, start + MAX_PERSISTED_QUEUE_TRACKS);
+}
+
+function persistedQueueIndex(queue: QueueTrack[], index: number): number {
+  if (queue.length <= MAX_PERSISTED_QUEUE_TRACKS) return index;
+  const safeIndex = Math.max(0, Math.min(index, queue.length - 1));
+  const before = Math.floor((MAX_PERSISTED_QUEUE_TRACKS - 1) / 2);
+  return safeIndex - Math.max(0, safeIndex - before);
+}
+
+/** Avoid serializing and writing the full queue on every position tick. */
+function createDebouncedStorage(delay = 1000): StateStorage {
+  if (typeof window === "undefined") return safeLocalStorage;
+  const pending = new Map<string, { value: string; timer: number }>();
+  return {
+    getItem: (name) => safeLocalStorage.getItem(name),
+    setItem: (name, value) => {
+      const existing = pending.get(name);
+      if (existing) window.clearTimeout(existing.timer);
+      const timer = window.setTimeout(() => {
+        const item = pending.get(name);
+        if (!item) return;
+        safeLocalStorage.setItem(name, item.value);
+        pending.delete(name);
+      }, delay);
+      pending.set(name, { value, timer });
+    },
+    removeItem: (name) => {
+      const existing = pending.get(name);
+      if (existing) window.clearTimeout(existing.timer);
+      pending.delete(name);
+      safeLocalStorage.removeItem(name);
+    },
+  };
+}
+
 const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
   queue: [],
   index: -1,
   shuffle: false,
   repeat: "off",
   autoRadio: false,
+  queueContinuation: undefined,
 
   status: "idle",
   error: undefined,
   streamUrl: undefined,
+  streamKind: "audio",
+  streamVideoHeight: null,
+  videoBuffering: false,
+  videoStartup: "idle",
 
   playing: false,
   volume: 0.8,
@@ -141,6 +261,7 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
       duration: mapped.duration ?? 0,
       playing: true,
       error: undefined,
+      queueContinuation: undefined,
     });
   },
 
@@ -162,6 +283,7 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
       duration: queue[i].duration ?? 0,
       playing: true,
       error: undefined,
+      queueContinuation: undefined,
     });
   },
 
@@ -173,10 +295,28 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
     }
     if (tracks.length === 0) return;
     // If the user clicked a non-playable item, find the nearest playable one.
-    const playableOffset = items
-      .slice(0, startIndex + 1)
-      .filter((i) => i.kind === "song" || i.kind === "video").length - 1;
+    const playableOffset =
+      items
+        .slice(0, startIndex + 1)
+        .filter((i) => i.kind === "song" || i.kind === "video").length - 1;
     get().setQueue(tracks, Math.max(0, playableOffset));
+  },
+
+  shufflePlayShelfItems: (items) => {
+    const tracks: QueueTrack[] = [];
+    for (const it of items) {
+      const m = shelfItemToTrack(it);
+      if (m) tracks.push(m);
+    }
+    if (tracks.length === 0) return;
+    // Shuffle the whole list and start at the top of it. The obvious-looking
+    // alternative — queue in order, jump to a random index, turn shuffle on —
+    // silently loses the album: setShuffle only randomises what is AFTER the
+    // current track, and treats everything before it as already-played
+    // history. Starting at track 4 of 5 that way leaves exactly one song up
+    // next.
+    get().setQueue(fisherYates(tracks), 0);
+    set({ shuffle: true });
   },
 
   enqueueNext: (track) => {
@@ -274,14 +414,21 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
       playing: false,
       position: 0,
       duration: 0,
+      queueContinuation: undefined,
     });
   },
 
   setAutoRadio: (on) => set({ autoRadio: on }),
 
+  setQueueContinuation: (token) => set({ queueContinuation: token }),
+
   toggle: () => {
     const { queue, playing } = get();
     if (queue.length === 0) return;
+    // Casting makes this a remote: the receiver owns whether sound is
+    // happening, so drive it and let its next status set `playing` here.
+    // Setting it locally too would race the status back and forth.
+    if (castCommand(playing ? "cast_pause" : "cast_play")) return;
     set({ playing: !playing });
   },
 
@@ -365,14 +512,42 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
 
   setStatus: (status, error) => set({ status, error }),
   setStreamUrl: (streamUrl) => set({ streamUrl }),
+  setStreamKind: (streamKind) => set({ streamKind }),
+  setStreamVideoHeight: (streamVideoHeight) => set({ streamVideoHeight }),
+  setVideoBuffering: (videoBuffering) => set({ videoBuffering }),
+  setVideoStartup: (videoStartup) => set({ videoStartup }),
+  patchTrackDuration: (videoId, seconds) =>
+    set((s) => {
+      if (!(seconds > 0)) return s;
+      let changed = false;
+      const queue = s.queue.map((t) => {
+        if (t.videoId !== videoId || t.duration) return t;
+        changed = true;
+        return { ...t, duration: seconds };
+      });
+      return changed ? { queue } : s;
+    }),
   setPosition: (position) => set({ position }),
   setDuration: (duration) => set({ duration }),
-  seek: (seconds) =>
-    set({ pendingSeek: Math.max(0, seconds), position: seconds }),
+  seek: (seconds) => {
+    const target = Math.max(0, seconds);
+    // Move the bar immediately either way: a scrub that waits a full poll
+    // for the receiver to confirm reads as a dropped input.
+    if (castCommand("cast_seek", { seconds: target })) {
+      set({ position: target });
+      return;
+    }
+    set({ pendingSeek: target, position: target });
+  },
   clearPendingSeek: () => set({ pendingSeek: undefined }),
 
-  setVolume: (volume) =>
-    set({ volume: Math.max(0, Math.min(1, volume)), muted: false }),
+  setVolume: (volume) => {
+    const level = Math.max(0, Math.min(1, volume));
+    // The slider should move the TV's volume, not this machine's silent
+    // element. Local state still tracks it so the control stays live.
+    castCommand("cast_set_volume", { level });
+    set({ volume: level, muted: false });
+  },
   toggleMute: () => set((s) => ({ muted: !s.muted })),
   setShuffle: (on) => {
     set((s) => {
@@ -407,12 +582,14 @@ export const usePlaybackStore = isFloatingPlayerWindow()
         // Volatile fields (position, status, streamUrl, error,
         // pendingSeek) and `playing` are reset on rehydrate so a fresh
         // launch never auto-blasts audio at you.
+        storage: createJSONStorage(() => createDebouncedStorage()),
         partialize: (s) => ({
-          queue: s.queue,
-          index: s.index,
+          queue: compactPersistedQueue(s.queue, s.index),
+          index: persistedQueueIndex(s.queue, s.index),
           shuffle: s.shuffle,
           repeat: s.repeat,
           autoRadio: s.autoRadio,
+          queueContinuation: s.queueContinuation,
           volume: s.volume,
           muted: s.muted,
         }),
@@ -497,9 +674,17 @@ export function initFloatingPlaybackBridge(): void {
     // mutated only the floater's mirror store — nothing actually played and
     // the queue silently diverged until the next broadcast overwrote it.
     playNow: (track, extras) =>
-      sendAction({ type: "playNow", track: track as unknown, extras: extras as unknown }),
+      sendAction({
+        type: "playNow",
+        track: track as unknown,
+        extras: extras as unknown,
+      }),
     playShelfItems: (items, startIndex) =>
-      sendAction({ type: "playShelfItems", items: items as unknown[], startIndex }),
+      sendAction({
+        type: "playShelfItems",
+        items: items as unknown[],
+        startIndex,
+      }),
     enqueueNext: (track) =>
       sendAction({ type: "enqueueNext", track: track as unknown }),
     enqueueEnd: (track) =>

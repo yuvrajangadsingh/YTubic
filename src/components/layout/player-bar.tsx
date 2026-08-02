@@ -11,16 +11,25 @@ import {
   Volume2Icon,
   VolumeXIcon,
   Loader2Icon,
+  Maximize2Icon,
   MusicIcon,
   VideoIcon,
 } from "lucide-react";
 import { QueueBody, QueueToggleButton } from "@/components/layout/queue-panel";
+import { CastButton } from "@/components/layout/cast-button";
+import { useCastStore } from "@/lib/store/cast";
+import { FullscreenPlayer } from "@/components/layout/fullscreen-player";
+import {
+  VideoQualityBadge,
+  VideoSurface,
+} from "@/components/shared/video-surface";
 import {
   LyricsBody,
   LyricsSourceButton,
   useLyricsView,
 } from "@/components/layout/lyrics-view";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { AnimatePresence, motion } from "motion/react";
 import { toast } from "sonner";
 import { useShallow } from "zustand/react/shallow";
@@ -32,11 +41,11 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Slider } from "@/components/ui/slider";
-import { Thumbnail } from "@/components/shared/thumbnail";
+import { Thumbnail, thumbnailUrlsBySize } from "@/components/shared/thumbnail";
 import { LikeDislikeButtons } from "@/components/shared/like-buttons";
 import { ArtistLinks } from "@/components/shared/artist-links";
 import { PlayerMoreMenu } from "@/components/layout/player-more-menu";
-import { cn } from "@/lib/utils";
+import { cn, artistLineFromSubtitle } from "@/lib/utils";
 import { usePlayerCoverDrag } from "@/lib/player-drag";
 import { usePlaybackStore, currentTrack } from "@/lib/store/playback";
 import {
@@ -59,13 +68,18 @@ export function useITunesCover(track: QueueTrack | undefined): string | null {
   const [url, setUrl] = useState<string | null>(null);
   const artistKey = track?.artists?.map((a) => a.name).join(", ") ?? "";
   const titleKey = track?.title ?? "";
+  const albumKey = track?.album ?? "";
 
   useEffect(() => {
     setUrl(null);
     if (!artistKey || !titleKey) return;
     let cancelled = false;
     (async () => {
-      const itunes = await lookupITunesCover(artistKey, titleKey);
+      const itunes = await lookupITunesCover(
+        artistKey,
+        titleKey,
+        albumKey || undefined,
+      );
       if (cancelled || !itunes) return;
       const cached = await cacheCoverToDisk(itunes);
       if (cancelled) return;
@@ -74,9 +88,183 @@ export function useITunesCover(track: QueueTrack | undefined): string | null {
     return () => {
       cancelled = true;
     };
-  }, [artistKey, titleKey]);
+  }, [artistKey, titleKey, albumKey]);
 
   return url;
+}
+
+/**
+ * Gate the iTunes cover upgrade to the first moments of a track. The
+ * YT thumbnail and the iTunes cover are sometimes entirely different
+ * artworks (Russ "3:15" — yellow digits vs the beige violin), so a
+ * late-arriving upgrade visibly REPLACED the art (and backdrop and
+ * accent with it) mid-track. If the lookup resolves fast (memory/disk
+ * cache — every repeat play), it applies from the first paint; if it
+ * misses the window, this play keeps the YT art and the upgrade wins
+ * from the next play onward. Art never changes mid-track.
+ */
+const COVER_LATCH_WINDOW_MS = 450;
+
+export function useLatchedCover(
+  track: QueueTrack | undefined,
+  cover: string | null,
+): string | null {
+  const [latched, setLatched] = useState<string | null>(null);
+  const deadlineRef = useRef(0);
+  useEffect(() => {
+    deadlineRef.current = performance.now() + COVER_LATCH_WINDOW_MS;
+    setLatched(null);
+  }, [track?.videoId]);
+  useEffect(() => {
+    if (!cover) return;
+    if (performance.now() <= deadlineRef.current) setLatched(cover);
+  }, [cover]);
+  return latched;
+}
+
+/**
+ * Vibrant accent hex pulled from the cover art by a Rust command (a webview
+ * canvas read taints on the CORS-less art CDNs, so it's done server-side).
+ * Returns null until it resolves, so callers keep the brand default until
+ * then. Shared by the compact player and the fullscreen view so the accent
+ * matches across both. Pass the YouTube thumbnail rather than the cached
+ * iTunes cover: it's downscaled server-side anyway, and it's always
+ * reachable, so the accent never falls back to red just because the local
+ * cover lagged behind.
+ */
+// Mirrors the Rust ACCENT_FALLBACK. Used when the accent fetch itself fails
+// (network/host reject) so the UI shows a neutral grey rather than snapping
+// back to brand red — red is reserved for tracks with no artwork at all.
+const ACCENT_NEUTRAL = "#71717A";
+
+/**
+ * Near-greyscale or extreme-lightness accents — white, grey, or black
+ * album art — tint the seek fill and play button into the same grey as
+ * the track behind them, which reads as a broken bar (Gulaab). Apple
+ * Music renders such covers with plain white controls; do the same.
+ */
+function legibleAccent(hex: string): string {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return hex;
+  const n = parseInt(m[1], 16);
+  let r = (n >> 16) & 255;
+  let g = (n >> 8) & 255;
+  let b = n & 255;
+  const rl = r / 255;
+  const gl = g / 255;
+  const bl = b / 255;
+  const max = Math.max(rl, gl, bl);
+  const min = Math.min(rl, gl, bl);
+  const l = (max + min) / 2;
+  const d = max - min;
+  const s = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1) || 1);
+  if (s < 0.22 || l > 0.82) return "#ffffff";
+  // The backdrop is the SAME art the accent came from, so a dark accent
+  // can never contrast with it (red fill on red cover). Lift dark
+  // accents in HSL — lightness up, saturation floored — so the fill
+  // reads on top of the art while staying inside its color family.
+  // (A plain blend toward white desaturated instead: Starboy's dark
+  // red turned pink, matching nothing on the cover.)
+  const lum = 0.2126 * rl + 0.7152 * gl + 0.0722 * bl;
+  if (lum < 0.5) {
+    let h = 0;
+    if (d !== 0) {
+      if (max === rl) h = ((gl - bl) / d + (gl < bl ? 6 : 0)) / 6;
+      else if (max === gl) h = ((bl - rl) / d + 2) / 6;
+      else h = ((rl - gl) / d + 4) / 6;
+    }
+    const s2 = Math.max(s, 0.65);
+    const l2 = 0.58;
+    const q = l2 < 0.5 ? l2 * (1 + s2) : l2 + s2 - l2 * s2;
+    const p2 = 2 * l2 - q;
+    const channel = (t: number) => {
+      if (t < 0) t += 1;
+      if (t > 1) t -= 1;
+      if (t < 1 / 6) return p2 + (q - p2) * 6 * t;
+      if (t < 1 / 2) return q;
+      if (t < 2 / 3) return p2 + (q - p2) * (2 / 3 - t) * 6;
+      return p2;
+    };
+    r = Math.round(channel(h + 1 / 3) * 255);
+    g = Math.round(channel(h) * 255);
+    b = Math.round(channel(h - 1 / 3) * 255);
+    return `#${((r << 16) | (g << 8) | b).toString(16).padStart(6, "0")}`;
+  }
+  return hex;
+}
+
+/** Black or white for icons sitting ON the accent fill. A plain
+ *  luminance threshold is enough here — accents are either vivid
+ *  (white icon) or the white clamp above (black icon). */
+function accentForeground(hex: string): string {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return "#ffffff";
+  const n = parseInt(m[1], 16);
+  const lum =
+    (0.2126 * ((n >> 16) & 255) +
+      0.7152 * ((n >> 8) & 255) +
+      0.0722 * (n & 255)) /
+    255;
+  return lum > 0.6 ? "#18181b" : "#ffffff";
+}
+
+export function useAccentColor(
+  urls: ReadonlyArray<string | null | undefined>,
+): string | null {
+  // Key on the actual candidate set (a stable string), not the array
+  // identity, which changes every render.
+  const key = urls.filter((u): u is string => Boolean(u)).join("\n");
+  const [accent, setAccent] = useState<string | null>(null);
+  useEffect(() => {
+    const candidates = key.split("\n").filter(Boolean);
+    if (candidates.length === 0) {
+      setAccent(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      // Walk the candidates (iTunes cover first, then thumbnails largest→
+      // smallest) and take the first the Rust side can actually fetch. The
+      // single largest thumbnail sometimes 404s; without this the accent
+      // just fell back to red instead of trying the next size.
+      for (const url of candidates) {
+        try {
+          const hex = await invoke<string>("dominant_accent_color", { url });
+          if (!cancelled) setAccent(legibleAccent(hex));
+          return;
+        } catch {
+          /* try the next candidate */
+        }
+      }
+      if (!cancelled) setAccent(ACCENT_NEUTRAL);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [key]);
+  return accent;
+}
+
+/**
+ * Remap the brand tokens to an extracted accent for a subtree: the seek
+ * fill (`bg-primary`), play button (`bg-brand`), and active shuffle/repeat
+ * icons (`text-brand`) all follow. Returns undefined (no override) until
+ * the accent resolves, so the brand default shows meanwhile.
+ */
+export function accentStyleFor(accent: string | null): CSSProperties | undefined {
+  return accent
+    ? ({
+        "--player-accent": accent,
+        // Icon color for controls filled with the accent (play button):
+        // near-black on light accents (the white-clamped ones above),
+        // white on everything else. Consumers use
+        // `text-[var(--player-accent-fg,white)]` so the brand default
+        // keeps its white icon before the accent resolves.
+        "--player-accent-fg": accentForeground(accent),
+        "--brand": "var(--player-accent)",
+        "--primary": "var(--player-accent)",
+      } as CSSProperties)
+    : undefined;
 }
 
 export function formatTime(seconds: number): string {
@@ -110,38 +298,81 @@ export function SourceToggle({ track }: { track: QueueTrack }) {
   const record = useTrackSourceStore((s) => s.byVideoId[track.videoId]);
   const setSelected = useTrackSourceStore((s) => s.setSelected);
   const setAlternate = useTrackSourceStore((s) => s.setAlternate);
+  const preferVideo = useTrackSourceStore((s) => s.preferVideo);
+  const setPreferVideo = useTrackSourceStore((s) => s.setPreferVideo);
   const [busy, setBusy] = useState<SourceKind | null>(null);
 
   const selected: SourceKind = record?.selected ?? "song";
 
-  const switchTo = async (target: SourceKind) => {
+  const switchTo = async (target: SourceKind, opts?: { auto?: boolean }) => {
     if (busy || target === selected) return;
+    // A manual flip also sets the sticky global mode, so "watch videos"
+    // carries to the next track instead of resetting to song every time.
+    if (!opts?.auto) setPreferVideo(target === "video");
     const cachedAlt = target === "video" ? record?.video : record?.song;
     if (cachedAlt) {
       setSelected(track.videoId, target);
       return;
     }
+    // A video-native track already IS the video: its own stream carries
+    // the audio too, so song mode plays its own id's audio and video mode
+    // its own mp4. Never blind-search for a different clip, which used to
+    // return an unrelated video. Genuine song<->video counterparts are
+    // seeded from InnerTube data and taken by the cachedAlt path above.
+    if (track.kind === "video") {
+      setAlternate(track.videoId, target, track.videoId);
+      setSelected(track.videoId, target);
+      return;
+    }
     setBusy(target);
     try {
-      const artistsLine = track.artists?.map((a) => a.name).join(" ") ?? "";
-      const query = `${track.title} ${artistsLine}`.trim();
-      const altId = await findAlternateVideoId(query, track.videoId, target);
+      const altId = await findAlternateVideoId(track, target);
       if (!altId) {
-        toast.error(
-          target === "video"
-            ? "No video version found"
-            : "No song version found",
-        );
+        if (!opts?.auto) {
+          toast.error(
+            target === "video"
+              ? "No video version found"
+              : "No song version found",
+          );
+        }
         return;
       }
       setAlternate(track.videoId, target, altId);
       setSelected(track.videoId, target);
     } catch (e) {
-      toast.error(`Couldn't switch source: ${(e as Error).message}`);
+      if (!opts?.auto) {
+        toast.error(`Couldn't switch source: ${(e as Error).message}`);
+      }
     } finally {
       setBusy(null);
     }
   };
+
+  // Sticky mode: when the global preference is video and this track has
+  // no explicit per-track choice, flip it automatically (resolving the
+  // counterpart when needed). An explicit song choice on THIS track
+  // wins over the global mode; tracks with no video version just stay
+  // songs, silently.
+  const autoTriedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!preferVideo) return;
+    if (record?.chosen) return;
+    if (autoTriedRef.current === track.videoId) return;
+    autoTriedRef.current = track.videoId;
+    // Video-native tracks get `selected: "video"` SEEDED without the
+    // `chosen` flag, and the engine only streams video for chosen
+    // records. Skipping them here left the toggle lit with audio-only
+    // playback. No counterpart hunt needed: flipping chosen is enough.
+    if (selected === "video" || track.kind === "video") {
+      setAlternate(track.videoId, "video", record?.video ?? track.videoId);
+      setSelected(track.videoId, "video");
+      return;
+    }
+    void switchTo("video", { auto: true });
+    // switchTo identity changes every render; keying on the track and
+    // the mode is what actually matters here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [track.videoId, preferVideo, selected, record?.chosen]);
 
   return (
     <div className="flex items-center rounded-md border bg-muted/40 p-0.5">
@@ -261,6 +492,7 @@ export function ProgressSlider({
         max={Math.max(duration, 1)}
         step={1}
         disabled={disabled}
+        thumbless
         onValueChange={([v]) => setScrub(v)}
         onValueCommit={([v]) => {
           seek(v);
@@ -274,8 +506,13 @@ export function ProgressSlider({
 
 export function VolumeControl({
   direction = "horizontal",
+  compact = false,
 }: {
-  direction?: "horizontal" | "vertical";
+  /** "horizontal"/"vertical" are hover-popover variants for the
+   *  compact bars; "inline" renders a persistent icon+slider row
+   *  (the Apple Music fullscreen volume). */
+  direction?: "horizontal" | "vertical" | "inline";
+  compact?: boolean;
 }) {
   const { volume, muted } = usePlaybackStore(
     useShallow((s) => ({ volume: s.volume, muted: s.muted })),
@@ -304,7 +541,41 @@ export function VolumeControl({
   const popupClass =
     direction === "vertical"
       ? "absolute bottom-full left-1/2 z-10 flex -translate-x-1/2 flex-col items-center gap-1 px-3 pb-2 transition-opacity duration-150"
-      : "absolute left-full top-1/2 z-10 flex -translate-y-1/2 items-center gap-0 py-3 pl-1 transition-opacity duration-150";
+      : // Horizontal opens UPWARD, centered on the icon: the bottom
+        // strip has controls immediately to the right, and a
+        // right-expanding pill crashed into the source toggle.
+        "absolute bottom-full left-1/2 z-10 flex -translate-x-1/2 items-center px-2 pb-2 transition-opacity duration-150";
+
+  if (direction === "inline") {
+    return (
+      <div
+        className="flex w-full items-center gap-2.5"
+        onWheel={(e) => {
+          const delta = e.deltaY < 0 ? 0.05 : -0.05;
+          const next = Math.max(0, Math.min(1, volume + delta));
+          setVolume(next);
+        }}
+      >
+        <button
+          type="button"
+          aria-label={muted ? "Unmute" : "Mute"}
+          onClick={toggleMute}
+          className="text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <Icon className="size-4" />
+        </button>
+        <Slider
+          value={[pct]}
+          max={100}
+          step={1}
+          className="[&_[data-slot=slider-track]]:bg-white/20"
+          aria-label="Volume"
+          onValueChange={([v]) => setVolume(v / 100)}
+        />
+        <Volume2Icon aria-hidden className="size-4 text-muted-foreground" />
+      </div>
+    );
+  }
 
   return (
     <div
@@ -369,19 +640,27 @@ export function VolumeControl({
             />
           </div>
         ) : (
-          <>
+          <div className="flex items-center gap-2 rounded-full border border-hairline bg-surface-active/70 px-3 py-1.5 shadow backdrop-blur-md">
             <Slider
               value={[pct]}
               max={100}
               step={1}
-              className="w-16 [&_[data-slot=slider-track]]:bg-white/20"
+              className={cn(
+                compact ? "w-9" : "w-16",
+                "[&_[data-slot=slider-track]]:bg-white/20",
+              )}
               aria-label="Volume"
               onValueChange={([v]) => setVolume(v / 100)}
             />
-            <span className="w-7 text-right text-xs font-medium tabular-nums text-foreground">
+            <span
+              className={cn(
+                compact ? "w-6" : "w-7",
+                "ml-2 text-left text-xs font-medium tabular-nums text-foreground",
+              )}
+            >
               {pct}
             </span>
-          </>
+          </div>
         )}
       </div>
     </div>
@@ -389,6 +668,8 @@ export function VolumeControl({
 }
 
 export type PlayerBarVariant = "right" | "floating";
+
+const COMPACT_PLAYER_CONTROLS_WIDTH = 336;
 
 export function PlayerBar({
   variant = "right",
@@ -424,8 +705,42 @@ export function PlayerBar({
 
   const [scrub, setScrub] = useState<number | null>(null);
   const [queueOpen, setQueueOpen] = useState(false);
-  const iTunesCover = useITunesCover(track);
+  const [fullscreen, setFullscreen] = useState(false);
+  const [compactControls, setCompactControls] = useState(false);
+  const playerRef = useRef<HTMLElement>(null);
+  const streamKind = usePlaybackStore((s) => s.streamKind);
+  // Null unless a receiver owns playback, which is the signal the spinner
+  // below keys off — see the `loading` comment.
+  const castState = useCastStore((s) => (s.deviceId ? s.state : null));
+  const videoBuffering = usePlaybackStore((s) => s.videoBuffering);
+  const videoStartup = usePlaybackStore((s) => s.videoStartup);
+  const iTunesCover = useLatchedCover(track, useITunesCover(track));
+  // Accent for the whole player surface, pulled from the cover art (same
+  // source the fullscreen view uses) so the seek fill, play button, and
+  // active toggles match the art here too instead of staying brand red.
+  const accent = useAccentColor([
+    iTunesCover,
+    ...thumbnailUrlsBySize(track?.thumbnails ?? []),
+  ]);
+  const accentStyle = accentStyleFor(accent);
   const lyricsState = useLyricsView(track);
+
+  // At compact widths the horizontal volume popup runs into the
+  // Song/Video switch. Shorten it while keeping the same interaction.
+  // ResizeObserver watches the actual card width, including live
+  // CSS-variable resizing, without tying every pointer move to React.
+  useEffect(() => {
+    const player = playerRef.current;
+    if (!player) return;
+    const update = (width: number) =>
+      setCompactControls(width < COMPACT_PLAYER_CONTROLS_WIDTH);
+    update(player.getBoundingClientRect().width);
+    const observer = new ResizeObserver(([entry]) => {
+      update(entry.contentRect.width);
+    });
+    observer.observe(player);
+    return () => observer.disconnect();
+  }, []);
   // The cover doubles as a drag handle for layout switching. In the
   // floating window the OS title bar already owns drag, so we don't
   // attach our own handler there.
@@ -434,13 +749,25 @@ export function PlayerBar({
   });
 
   const hasTrack = !!track;
+  // The <audio> element reports its own duration late (and sometimes as
+  // Infinity) for the progressive yt-dlp stream, so `duration` sits at 0
+  // for the first seconds of a track. Fall back to the browse metadata
+  // duration so the seek bar scales correctly and the total time isn't
+  // stuck at 0:00 with a stray played-fill dot pinned at the far left.
+  const knownDuration = duration > 0 ? duration : (track?.duration ?? 0);
   // Only treat "loading" as user-facing when the user has actually
   // requested playback. The audio engine eagerly resolves the stream
   // URL for the queued track on mount (so the first click on Play is
   // instant), which flips status to "loading" even while playing is
   // still false — without this guard, the freshly-launched player
   // shows a spinner instead of the Play icon.
-  const loading = status === "loading" && playing;
+  // Casting rewrites what "loading" means. The local element is parked on
+  // purpose and never leaves "loading", so the old test spun forever the
+  // whole time a receiver was playing. What the user is waiting on then is
+  // the receiver, so ask it instead.
+  const loading = castState
+    ? castState === "connecting" || castState === "buffering"
+    : status === "loading" && playing;
 
   // The right-side variant is fixed-positioned in the main app shell.
   // The floating-window variant fills its parent container (the
@@ -448,7 +775,7 @@ export function PlayerBar({
   // window's own layout.
   const wrapperClass =
     variant === "right"
-      ? "fixed bottom-2 right-2 top-(--titlebar-h) z-10 flex w-[22rem] flex-col rounded-[10px] border border-sidebar-border bg-surface"
+      ? "fixed bottom-2 right-2 top-(--titlebar-h) z-10 flex w-(--player-width) flex-col rounded-[10px] border border-sidebar-border bg-surface"
       : "absolute inset-0 flex flex-col bg-surface";
 
   return (
@@ -462,7 +789,7 @@ export function PlayerBar({
     // 300ms, which makes the next tooltip pop up instantly — annoying
     // when the buttons are densely packed).
     <TooltipProvider delayDuration={800} skipDelayDuration={0}>
-    <aside className={wrapperClass}>
+    <aside ref={playerRef} className={wrapperClass} style={accentStyle}>
       {/* Queue overlay vs. cover-and-lyrics body. AnimatePresence
           crossfades the two when the user toggles the queue button.
           Both branches fill the card above the bottom action row
@@ -508,28 +835,66 @@ export function PlayerBar({
           </div>
         ) : null}
 
-        {/* `max-w-[20rem]` caps the cover at 320px so it can't grow
-            arbitrarily tall in the floating variant when the user
-            resizes the window wider — that would push the Play/Pause
-            button below the visible area. The right-card variant has
-            an effective inner width of 320 anyway (22rem - p-4*2), so
-            the cap is a no-op there. */}
+        {/* The right-card cover follows the resizable card width. Only
+            the floating variant stays capped at 320px so making that
+            window wider cannot push the controls below the viewport. */}
         <div
           onPointerDown={onCoverPointerDown}
           className={cn(
-            "mx-auto w-full max-w-[20rem] touch-none select-none",
+            "mx-auto w-full touch-none select-none",
+            variant === "floating" && "max-w-[20rem]",
             variant !== "floating" && "cursor-grab active:cursor-grabbing",
           )}
         >
-          {track ? (
-            <Thumbnail
-              thumbnails={track.thumbnails}
-              alt={track.title}
-              className="aspect-square w-full rounded-md border border-hairline pointer-events-none"
-              targetSize={1024}
-              highRes
-              overrideHighRes={iTunesCover}
-            />
+          {/* When the user picked the video version, the engine element
+              carries real frames: show them here instead of the art.
+              Gated to the docked variant because the floating window is
+              a separate WKWebView and cannot adopt this document's
+              element, and to !fullscreen so the stage keeps ownership
+              while it's up (we re-adopt when it closes). The square
+              outer box stays so metadata and lyrics below don't jump
+              when a track flips between art and video. */}
+          {track && streamKind === "video" && variant === "right" && !fullscreen ? (
+            <div className="pointer-events-none flex aspect-square w-full items-center justify-center">
+              {/* Inner box matches the video rect exactly so the badge
+                  anchors to the video's own corner, not the square
+                  letterbox. The outer wrapper is pointer-events-none
+                  (the cover doubles as a drag handle); the badge
+                  re-enables its own pointer events. */}
+              <div className="relative aspect-video w-full">
+                <VideoSurface className="size-full overflow-hidden rounded-md border border-hairline bg-black" />
+                {videoBuffering ? (
+                  <div className="absolute inset-0 flex items-center justify-center rounded-md bg-black/25">
+                    <Loader2Icon className="size-6 animate-spin text-white/85" />
+                  </div>
+                ) : null}
+                <div className="absolute bottom-2 right-2">
+                  <VideoQualityBadge className="opacity-70 hover:opacity-100" />
+                </div>
+              </div>
+            </div>
+          ) : track ? (
+            <div className="pointer-events-none relative">
+              <Thumbnail
+                thumbnails={track.thumbnails}
+                alt={track.title}
+                className="aspect-square w-full rounded-md border border-hairline pointer-events-none"
+                targetSize={1024}
+                highRes
+                overrideHighRes={iTunesCover}
+              />
+              {/* Playback is held until the video is ready (loader in
+                  the middle of the art, YouTube style). "waiting" only;
+                  a fallback start must not leave a stuck loader. */}
+              {videoStartup === "waiting" ? (
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <div className="flex items-center gap-1.5 rounded-full border border-hairline bg-black/55 px-3 py-1.5 text-xs font-medium text-white/85 backdrop-blur-md">
+                    <Loader2Icon className="size-3.5 animate-spin" />
+                    loading video
+                  </div>
+                </div>
+              ) : null}
+            </div>
           ) : (
             <div className="aspect-square w-full rounded-md border border-hairline bg-muted" />
           )}
@@ -544,7 +909,10 @@ export function PlayerBar({
             {track ? (
               <ArtistLinks
                 artists={track.artists}
-                fallback={track.subtitle ?? ""}
+                fallback={
+                  artistLineFromSubtitle(track.subtitle) ||
+                  (track.subtitle ?? "")
+                }
                 className="truncate text-sm text-muted-foreground"
               />
             ) : (
@@ -562,15 +930,15 @@ export function PlayerBar({
         <div className="mt-2 flex flex-col gap-2.5">
           <ProgressSlider
             position={position}
-            duration={duration}
+            duration={knownDuration}
             scrub={scrub}
             setScrub={setScrub}
             seek={seek}
-            disabled={!hasTrack || duration <= 0}
+            disabled={!hasTrack || knownDuration <= 0}
           />
           <div className="flex justify-between text-xs tabular-nums text-muted-foreground">
             <span>{formatTime(scrub ?? position)}</span>
-            <span>{formatTime(duration)}</span>
+            <span>{formatTime(knownDuration)}</span>
           </div>
         </div>
 
@@ -600,7 +968,7 @@ export function PlayerBar({
             aria-label={playing ? "Pause" : "Play"}
             onClick={toggle}
             disabled={!hasTrack}
-            className="size-12 rounded-full bg-brand text-white hover:bg-brand/90"
+            className="size-12 rounded-full bg-brand text-[var(--player-accent-fg,white)] hover:bg-brand/90"
           >
             {loading ? (
               <Loader2Icon className="animate-spin" />
@@ -639,10 +1007,22 @@ export function PlayerBar({
 
             {/* Lyrics flow — fills the rest of the cover-branch flex
                 column. Lives inside the same motion.div as the cover
-                so the whole non-queue body crossfades as one unit. */}
-            <div className="flex min-h-0 flex-1 flex-col px-3">
-              <LyricsBody state={lyricsState} />
-            </div>
+                so the whole non-queue body crossfades as one unit.
+                When the lookup resolves with nothing, the space shows
+                the queue instead of sitting empty under a lone
+                "No lyrics found." — same QueueBody the queue toggle
+                uses, minus its close button. */}
+            {lyricsState.hasTrack &&
+            !lyricsState.isLoading &&
+            !lyricsState.active ? (
+              <div className="flex min-h-0 flex-1 flex-col">
+                <QueueBody />
+              </div>
+            ) : (
+              <div className="flex min-h-0 flex-1 flex-col px-3">
+                <LyricsBody state={lyricsState} />
+              </div>
+            )}
           </motion.div>
         )}
       </AnimatePresence>
@@ -660,7 +1040,27 @@ export function PlayerBar({
             open={queueOpen}
             onToggle={() => setQueueOpen((v) => !v)}
           />
-          <VolumeControl />
+          <VolumeControl compact={compactControls} />
+          <CastButton />
+          {/* No expand in the floating window: a "full screen" view of a
+              350px window isn't one, and the main window already offers
+              the real thing. */}
+          {variant !== "floating" ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Full screen"
+                  disabled={!hasTrack}
+                  onClick={() => setFullscreen(true)}
+                >
+                  <Maximize2Icon />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Full screen</TooltipContent>
+            </Tooltip>
+          ) : null}
         </div>
         <div className="flex items-center gap-1">
           {track && <SourceToggle track={track} />}
@@ -668,6 +1068,9 @@ export function PlayerBar({
         </div>
       </div>
     </aside>
+    {fullscreen ? (
+      <FullscreenPlayer onClose={() => setFullscreen(false)} />
+    ) : null}
     </TooltipProvider>
   );
 }

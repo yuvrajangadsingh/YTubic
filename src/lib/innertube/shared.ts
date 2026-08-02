@@ -1,6 +1,6 @@
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { invoke } from "@tauri-apps/api/core";
-import type { ShelfItem, Thumbnail } from "./types";
+import type { ShelfItem, ShelfMore, Thumbnail } from "./types";
 
 export type YtNode = Record<string, any>;
 
@@ -239,7 +239,11 @@ export async function innertubePost(
   endpoint: string,
   body: Record<string, unknown>,
 ): Promise<YtNode> {
-  const url = `https://music.youtube.com/youtubei/v1/${endpoint}?prettyPrint=false`;
+  // `endpoint` may already carry query params (reload continuations are
+  // passed as `browse?ctoken=…` — the server ignores them in the body).
+  const url = `https://music.youtube.com/youtubei/v1/${endpoint}${
+    endpoint.includes("?") ? "&" : "?"
+  }prettyPrint=false`;
   const auth = await authHeaders();
   const visitor = loadVisitorData();
   const visitorHeader: Record<string, string> = visitor
@@ -289,6 +293,17 @@ export function rawNext(body: Record<string, unknown>): Promise<YtNode> {
  */
 export function rawBrowseContinuation(token: string): Promise<YtNode> {
   return innertubePost("browse", { continuation: token });
+}
+
+/**
+ * Follow a RELOAD continuation (`reloadContinuationData`) — the kind the
+ * playlist Suggestions shelf uses for its refresh action. Unlike next-
+ * continuations these are sent as query params, matching the web client
+ * (`?ctoken=…&continuation=…&type=next`); in the body they're ignored.
+ */
+export function rawBrowseReloadContinuation(token: string): Promise<YtNode> {
+  const t = encodeURIComponent(token);
+  return innertubePost(`browse?ctoken=${t}&continuation=${t}&type=next`, {});
 }
 
 /**
@@ -367,8 +382,19 @@ export function mapPlaylistPanelVideo(raw: YtNode): ShelfItem | null {
   const thumbnails = readThumbnails(raw.thumbnail);
   const explicit = readExplicit(raw);
 
+  // MUSIC_VIDEO_TYPE_ATV is the plain audio-track version (a "song");
+  // OMV / UGC / OFFICIAL_SOURCE and friends are music videos. Absent the
+  // field, treat the row as a song (the historical default).
+  const musicVideoType = raw.navigationEndpoint?.watchEndpoint
+    ?.watchEndpointMusicSupportedConfigs?.watchEndpointMusicConfig
+    ?.musicVideoType as string | undefined;
+  const kind: ShelfItem["kind"] =
+    musicVideoType && musicVideoType !== "MUSIC_VIDEO_TYPE_ATV"
+      ? "video"
+      : "song";
+
   return {
-    kind: "song",
+    kind,
     id: videoId,
     title,
     subtitle: artists.map((a) => a.name).join(", ") || undefined,
@@ -799,6 +825,7 @@ export function mapResponsiveListItem(raw: YtNode): ShelfItem | null {
       explicit: explicit || undefined,
       playCount,
       dateAdded,
+      setVideoId: raw.playlistItemData?.playlistSetVideoId,
     };
   }
 
@@ -915,13 +942,43 @@ function mapCardShelfFeatured(card: YtNode): ShelfItem | null {
 }
 
 /**
+ * Pull the "More" browse endpoint off a shelf. YTM attaches it in one of
+ * three places depending on the renderer: the carousel header's
+ * `moreContentButton`, the shelf's `bottomEndpoint` (musicShelfRenderer),
+ * or a navigationEndpoint on the title run itself.
+ */
+function readShelfMore(music: YtNode): ShelfMore | undefined {
+  const header = music.header?.musicCarouselShelfBasicHeaderRenderer;
+  const nav =
+    header?.moreContentButton?.buttonRenderer?.navigationEndpoint ??
+    music.bottomEndpoint ??
+    header?.title?.runs?.[0]?.navigationEndpoint ??
+    music.title?.runs?.[0]?.navigationEndpoint;
+  const browse = nav?.browseEndpoint;
+  const browseId: string | undefined = browse?.browseId;
+  if (!browseId) return undefined;
+  return {
+    browseId,
+    params: browse.params,
+    pageType:
+      browse.browseEndpointContextSupportedConfigs
+        ?.browseEndpointContextMusicConfig?.pageType,
+  };
+}
+
+/**
  * Convert a shelf wrapper (carousel or shelf) into our Shelf DTO by mapping
  * every child renderer it contains.
  */
 export function mapShelfWrapper(
   wrapper: YtNode,
   index: number,
-): { title: string; items: ShelfItem[]; display: "list" | "card" | "grid" } {
+): {
+  title: string;
+  items: ShelfItem[];
+  display: "list" | "card" | "grid";
+  more?: ShelfMore;
+} {
   const card = wrapper.musicCardShelfRenderer;
   const music =
     wrapper.musicCarouselShelfRenderer ?? wrapper.musicShelfRenderer ?? card;
@@ -933,6 +990,7 @@ export function mapShelfWrapper(
         music.header?.musicCarouselShelfBasicHeaderRenderer?.title ??
           music.title,
       );
+  const more = card ? undefined : readShelfMore(music);
   const rawItems: YtNode[] = music.contents ?? [];
 
   const items: ShelfItem[] = [];
@@ -974,5 +1032,5 @@ export function mapShelfWrapper(
         ? "list"
         : "card";
 
-  return { title: title || `Section ${index + 1}`, items, display };
+  return { title: title || `Section ${index + 1}`, items, display, more };
 }

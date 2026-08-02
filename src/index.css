@@ -10,7 +10,7 @@
   --titlebar-h: 36px;
 
   /* YouTube brand red */
-  --brand: #FA1F3E;
+  --brand: #fa1f3e;
   --brand-foreground: oklch(0.985 0 0);
 
   --background: oklch(1 0 0);
@@ -150,13 +150,24 @@
   body,
   #root {
     @apply h-full bg-background text-foreground;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
-      Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+    font-family:
+      -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+      Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
     overscroll-behavior: none;
     -webkit-font-smoothing: antialiased;
   }
   body {
     @apply overflow-hidden;
+  }
+
+  /* Trackpad diagonal scrolls rubber-band inner panes sideways in
+     WKWebView even with overflow-x hidden — the elastic bounce is its
+     own mechanism. Pin the x axis on every app scroller. */
+  .app-scroll,
+  .lyrics-no-scrollbar,
+  .lyrics-plain {
+    overscroll-behavior-x: none;
+    overflow-x: clip;
   }
 
   /* Push the floating shadcn sidebar below the custom title bar so the
@@ -168,10 +179,27 @@
     height: calc(100svh - var(--titlebar-h)) !important;
   }
 
+  /* Width follows the pointer directly while resizing. The regular
+     transitions remain enabled for expand/collapse button actions. */
+  body.layout-resizing [data-slot="sidebar-gap"],
+  body.layout-resizing [data-slot="sidebar-container"] {
+    transition: none !important;
+  }
+
   /* Thin, subtle scrollbars (used in main content area and carousels). */
-  .shelf-scroll,
   .app-scroll {
     scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  .shelf-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  .shelf-hover-scrollbar .shelf-scroll {
+    scrollbar-color: transparent transparent;
+  }
+  .shelf-hover-scrollbar:hover .shelf-scroll,
+  .shelf-hover-scrollbar:focus-within .shelf-scroll {
     scrollbar-color: var(--border) transparent;
   }
   .shelf-scroll::-webkit-scrollbar,
@@ -183,12 +211,25 @@
   .app-scroll::-webkit-scrollbar-track {
     background: transparent;
   }
-  .shelf-scroll::-webkit-scrollbar-thumb,
   .app-scroll::-webkit-scrollbar-thumb {
     background: var(--border);
     border-radius: 9999px;
   }
-  .shelf-scroll::-webkit-scrollbar-thumb:hover,
+  .shelf-scroll::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 9999px;
+    transition: background-color 150ms ease;
+  }
+  .shelf-hover-scrollbar .shelf-scroll::-webkit-scrollbar-thumb {
+    background: transparent;
+  }
+  .shelf-hover-scrollbar:hover .shelf-scroll::-webkit-scrollbar-thumb,
+  .shelf-hover-scrollbar:focus-within .shelf-scroll::-webkit-scrollbar-thumb {
+    background: var(--border);
+  }
+  .shelf-hover-scrollbar:hover .shelf-scroll::-webkit-scrollbar-thumb:hover,
+  .shelf-hover-scrollbar:focus-within
+    .shelf-scroll::-webkit-scrollbar-thumb:hover,
   .app-scroll::-webkit-scrollbar-thumb:hover {
     background: var(--muted-foreground);
   }
@@ -221,6 +262,10 @@
       black calc(100% - 56px),
       rgba(0, 0, 0, var(--fade-r)) 100%
     );
+    /* Keep the mask on its own compositor layer. WebKitGTK otherwise
+       re-rasterizes every masked shelf during vertical scrolling. */
+    transform: translateZ(0);
+    contain: paint;
   }
 
   /* Vertical sibling of `shelf-edge-fade` for the sidebar playlist
@@ -268,23 +313,40 @@
     display: none;
   }
 
-  /* Top/bottom fade for the lyrics column. Applied only once the
-     karaoke has progressed past the first line — before that we want
-     the first line crisp at the top of the column. */
+  /* Top/bottom fade for the lyrics column. The bottom ramp is long so
+     upcoming lines dissolve well before the container edge instead of
+     cutting off against whatever sits below the pane. The full mask is
+     applied only once the karaoke has progressed past the first line —
+     before that we want the first line crisp at the top of the column,
+     so the pre-start state uses the bottom-only variant. */
   .lyrics-mask {
     mask-image: linear-gradient(
       to bottom,
       transparent 0%,
       black 14%,
-      black 86%,
-      transparent 100%
+      black 68%,
+      transparent 97%
     );
     -webkit-mask-image: linear-gradient(
       to bottom,
       transparent 0%,
       black 14%,
-      black 86%,
-      transparent 100%
+      black 68%,
+      transparent 97%
+    );
+  }
+  .lyrics-mask-bottom {
+    mask-image: linear-gradient(
+      to bottom,
+      black 0%,
+      black 68%,
+      transparent 97%
+    );
+    -webkit-mask-image: linear-gradient(
+      to bottom,
+      black 0%,
+      black 68%,
+      transparent 97%
     );
   }
 
@@ -318,6 +380,22 @@
   .bg-cover-noise {
     background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='4' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
     opacity: 0.05;
+  }
+
+  /* Attention pulse on the newest version chip in the What's New
+     timeline. Uses box-shadow (not outline) so it layers under the
+     chip's solid outline that punches a gap in the timeline rail. */
+  @keyframes whats-new-pulse {
+    0% {
+      box-shadow: 0 0 0 0 color-mix(in oklab, var(--primary) 50%, transparent);
+    }
+    70%,
+    100% {
+      box-shadow: 0 0 0 9px transparent;
+    }
+  }
+  .whats-new-pulse {
+    animation: whats-new-pulse 2.6s ease-out infinite;
   }
 
   /* Top-of-column blur strip. Strongest at the top of the overlay,

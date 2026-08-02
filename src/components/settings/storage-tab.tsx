@@ -699,6 +699,13 @@ function CacheRow({
           alt=""
           loading="lazy"
           className="size-full rounded-sm bg-muted object-cover"
+          referrerPolicy="no-referrer"
+          onLoad={(e) => {
+            const img = e.currentTarget;
+            if (img.naturalWidth <= 120 && img.naturalHeight <= 90) {
+              img.style.visibility = "hidden";
+            }
+          }}
           onError={(e) => {
             (e.target as HTMLImageElement).style.visibility = "hidden";
           }}

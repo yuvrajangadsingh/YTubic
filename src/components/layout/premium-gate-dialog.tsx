@@ -14,9 +14,23 @@ import {
 import { Button } from "@/components/ui/button";
 import { usePremiumGateDialog } from "@/lib/store/premium-gate";
 import { usePremiumStore } from "@/lib/store/premium";
+import { usePlaybackStore } from "@/lib/store/playback";
 
 const PREMIUM_URL = "https://music.youtube.com/music_premium";
 const YTM_URL = "https://music.youtube.com";
+
+/**
+ * Where "Listen in browser" should land. A Free user got here by clicking
+ * a specific song, so dropping them on the YT Music home page loses the
+ * one thing they asked for and makes them search for it again. Deep-link
+ * to the track instead, so the free path is: click, gate, one more click,
+ * that song playing (with ads) in the browser.
+ */
+function listenInBrowserUrl(videoId: string | undefined): string {
+  return videoId
+    ? `https://music.youtube.com/watch?v=${encodeURIComponent(videoId)}`
+    : YTM_URL;
+}
 
 /**
  * Shown when a signed-out / Free user tries to start playback (the
@@ -33,6 +47,9 @@ export function PremiumGateDialog() {
   const setOpen = usePremiumGateDialog((s) => s.setOpen);
   const status = usePremiumStore((s) => s.status);
   const premiumOk = status === "premium";
+  // The track that triggered the gate — the engine parks it in the queue
+  // before opening this dialog, so the current index still points at it.
+  const blockedTrack = usePlaybackStore((s) => s.queue[s.index]);
 
   // Same key as usePremiumStatusSync, so it's served from the query
   // cache with no extra invoke round-trip in the common case.
@@ -87,8 +104,13 @@ export function PremiumGateDialog() {
               </p>
             </div>
             <div className="flex justify-end gap-2">
-              <Button variant="outline" onClick={() => void openUrl(YTM_URL)}>
-                Listen in browser
+              <Button
+                variant="outline"
+                onClick={() =>
+                  void openUrl(listenInBrowserUrl(blockedTrack?.videoId))
+                }
+              >
+                {blockedTrack ? "Play this in browser" : "Listen in browser"}
               </Button>
               {signedOut ? (
                 <Button

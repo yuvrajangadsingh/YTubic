@@ -24,7 +24,9 @@ use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeFile;
 
+mod now_playing;
 mod appid;
+mod cast;
 mod discord;
 mod lastfm;
 mod media;
@@ -33,14 +35,16 @@ mod ytdlp;
 fn sanitize_video_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() < 32
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Platform-native symmetric "encrypt with current user's credentials"
 /// primitive. On Windows we use DPAPI (CryptProtectData) — the blob is
-/// only decryptable by the same Windows user on the same machine. On
-/// other platforms we currently fall back to plaintext (FIXME: hook
-/// into macOS Keychain / libsecret when we ship beyond Windows).
+/// only decryptable by the same Windows user on the same machine. Linux and
+/// macOS use AES-256-GCM and keep only the random data key in the native
+/// credential store (Secret Service or Keychain).
 ///
 /// A fixed `ENTROPY` byte string is mixed in so a *different* app
 /// running as the same user can't trivially pass our blob to
@@ -57,10 +61,8 @@ mod secure_store {
     #[cfg(windows)]
     pub fn encrypt(plain: &[u8]) -> Result<Vec<u8>, String> {
         use std::ptr;
-        use windows_sys::Win32::Security::Cryptography::{
-            CryptProtectData, CRYPT_INTEGER_BLOB,
-        };
         use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
         unsafe {
             let in_blob = CRYPT_INTEGER_BLOB {
                 cbData: plain.len() as u32,
@@ -84,8 +86,7 @@ mod secure_store {
                 return Err("CryptProtectData failed".into());
             }
             let data =
-                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize)
-                    .to_vec();
+                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
             LocalFree(out_blob.pbData as _);
             Ok(data)
         }
@@ -94,10 +95,8 @@ mod secure_store {
     #[cfg(windows)]
     pub fn decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
         use std::ptr;
-        use windows_sys::Win32::Security::Cryptography::{
-            CryptUnprotectData, CRYPT_INTEGER_BLOB,
-        };
         use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
         unsafe {
             let in_blob = CRYPT_INTEGER_BLOB {
                 cbData: encrypted.len() as u32,
@@ -121,21 +120,160 @@ mod secure_store {
                 return Err("CryptUnprotectData failed".into());
             }
             let data =
-                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize)
-                    .to_vec();
+                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
             LocalFree(out_blob.pbData as _);
             Ok(data)
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const KEYRING_MAGIC: &[u8; 5] = b"YTBC1";
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const KEYRING_NONCE_LEN: usize = 12;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const KEYRING_KEY_LEN: usize = 32;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const KEYRING_SERVICE: &str = "com.github.ivasy.ytubic";
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const KEYRING_USER: &str = "cookie-encryption-key-v1";
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn keyring_encryption_key() -> Result<[u8; KEYRING_KEY_LEN], String> {
+        use keyring::{Entry, Error};
+        use rand::RngCore;
+
+        let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER)
+            .map_err(|error| format!("system credential store is unavailable: {error}"))?;
+
+        match entry.get_secret() {
+            Ok(secret) => secret.try_into().map_err(|secret: Vec<u8>| {
+                format!(
+                    "system credential store returned an invalid YTubic key ({} bytes)",
+                    secret.len()
+                )
+            }),
+            Err(Error::NoEntry) => {
+                let mut key = [0_u8; KEYRING_KEY_LEN];
+                rand::rngs::OsRng.fill_bytes(&mut key);
+                entry.set_secret(&key).map_err(|error| {
+                    format!("failed to save key in system credential store: {error}")
+                })?;
+                Ok(key)
+            }
+            Err(error) => Err(format!(
+                "failed to read key from system credential store: {error}"
+            )),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn keyring_encrypt_with_key(
+        plain: &[u8],
+        key: &[u8; KEYRING_KEY_LEN],
+        nonce: &[u8; KEYRING_NONCE_LEN],
+    ) -> Result<Vec<u8>, String> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Nonce};
+
+        let cipher = Aes256Gcm::new_from_slice(key)
+            .map_err(|_| "failed to initialize cookie encryption".to_string())?;
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(nonce), plain)
+            .map_err(|_| "failed to encrypt cookie jar".to_string())?;
+
+        let mut framed = Vec::with_capacity(KEYRING_MAGIC.len() + nonce.len() + ciphertext.len());
+        framed.extend_from_slice(KEYRING_MAGIC);
+        framed.extend_from_slice(nonce);
+        framed.extend_from_slice(&ciphertext);
+        Ok(framed)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn keyring_decrypt_with_key(
+        encrypted: &[u8],
+        key: &[u8; KEYRING_KEY_LEN],
+    ) -> Result<Vec<u8>, String> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Nonce};
+
+        if !encrypted.starts_with(KEYRING_MAGIC) {
+            // Earlier builds on this platform wrote plaintext jars. Accept
+            // one so the next successful persistence pass can migrate it.
+            return Ok(encrypted.to_vec());
+        }
+
+        let payload = &encrypted[KEYRING_MAGIC.len()..];
+        if payload.len() <= KEYRING_NONCE_LEN {
+            return Err("encrypted cookie jar is truncated".to_string());
+        }
+        let (nonce, ciphertext) = payload.split_at(KEYRING_NONCE_LEN);
+        let cipher = Aes256Gcm::new_from_slice(key)
+            .map_err(|_| "failed to initialize cookie decryption".to_string())?;
+        cipher
+            .decrypt(Nonce::from_slice(nonce), ciphertext)
+            .map_err(|_| "failed to decrypt cookie jar".to_string())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn encrypt(plain: &[u8]) -> Result<Vec<u8>, String> {
+        use rand::RngCore;
+
+        let key = keyring_encryption_key()?;
+        let mut nonce = [0_u8; KEYRING_NONCE_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        keyring_encrypt_with_key(plain, &key, &nonce)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
+        if !encrypted.starts_with(KEYRING_MAGIC) {
+            return Ok(encrypted.to_vec());
+        }
+        let key = keyring_encryption_key()?;
+        keyring_decrypt_with_key(encrypted, &key)
+    }
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     pub fn encrypt(plain: &[u8]) -> Result<Vec<u8>, String> {
         Ok(plain.to_vec())
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     pub fn decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
         Ok(encrypted.to_vec())
+    }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    mod keyring_tests {
+        use super::*;
+
+        const KEY: [u8; KEYRING_KEY_LEN] = [7; KEYRING_KEY_LEN];
+        const NONCE: [u8; KEYRING_NONCE_LEN] = [3; KEYRING_NONCE_LEN];
+
+        #[test]
+        fn encrypted_cookie_jar_round_trips() {
+            let encrypted = keyring_encrypt_with_key(b"SID=secret", &KEY, &NONCE).unwrap();
+            assert!(encrypted.starts_with(KEYRING_MAGIC));
+            assert_eq!(
+                keyring_decrypt_with_key(&encrypted, &KEY).unwrap(),
+                b"SID=secret"
+            );
+        }
+
+        #[test]
+        fn tampered_cookie_jar_is_rejected() {
+            let mut encrypted = keyring_encrypt_with_key(b"SID=secret", &KEY, &NONCE).unwrap();
+            *encrypted.last_mut().unwrap() ^= 1;
+            assert!(keyring_decrypt_with_key(&encrypted, &KEY).is_err());
+        }
+
+        #[test]
+        fn plaintext_cookie_jar_is_accepted_for_migration() {
+            assert_eq!(
+                keyring_decrypt_with_key(b"SID=legacy", &KEY).unwrap(),
+                b"SID=legacy"
+            );
+        }
     }
 }
 
@@ -228,11 +366,17 @@ fn account_webview_dir(app: &tauri::AppHandle, id: &str) -> PathBuf {
     accounts_dir(app).join(id).join("webview")
 }
 
-/// Chrome UA the login and refresh WebViews both present to Google. Kept
+/// Browser UA the login and refresh WebViews both present to Google. Kept
 /// identical so the session Google issues to the login window is the
-/// same one the refresh window later renews.
+/// same one the refresh window later renews. The claimed browser must match
+/// the actual webview engine: WebView2 presents Chrome, while WKWebView must
+/// present Safari or Google rejects the sign-in as an insecure browser.
+#[cfg(not(target_os = "macos"))]
 const YT_LOGIN_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+#[cfg(target_os = "macos")]
+const YT_LOGIN_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
+     (KHTML, like Gecko) Version/17.6 Safari/605.1.15";
 
 /// WebView2 browser args shared by the login window and the session-keeper.
 /// Both open the same per-account profile directory, and WebView2 requires
@@ -403,7 +547,11 @@ fn cookies_to_netscape(cookies: &[cookie::Cookie<'static>]) -> String {
         let dom_out = format!(".{bare}");
         let include_sub = "TRUE";
         let path_str = c.path().unwrap_or("/");
-        let secure = if c.secure().unwrap_or(false) { "TRUE" } else { "FALSE" };
+        let secure = if c.secure().unwrap_or(false) {
+            "TRUE"
+        } else {
+            "FALSE"
+        };
         let expiry = match c.expires() {
             Some(cookie::Expiration::DateTime(dt)) => dt.unix_timestamp(),
             _ => 0,
@@ -534,8 +682,12 @@ fn merge_set_cookies_into_jar(
                     domain: format!(".{bare}"),
                     include_sub: "TRUE".to_string(),
                     path: c.path().unwrap_or("/").to_string(),
-                    secure: if c.secure().unwrap_or(false) { "TRUE" } else { "FALSE" }
-                        .to_string(),
+                    secure: if c.secure().unwrap_or(false) {
+                        "TRUE"
+                    } else {
+                        "FALSE"
+                    }
+                    .to_string(),
                     expiry,
                     name: c.name().to_string(),
                     value: c.value().to_string(),
@@ -619,8 +771,7 @@ async fn dedup_accounts_by_identity(app: &tauri::AppHandle) {
     }
 
     // removed id -> keeper id, so `active` can follow its keeper.
-    let mut remap: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut remap: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     // (source id, keeper id) jars to copy before deleting the source.
     let mut fresh_copies: Vec<(String, String)> = Vec::new();
 
@@ -787,7 +938,17 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
         .min_inner_size(420.0, 560.0)
         .center()
         .data_directory(webview_data.clone())
-        .user_agent(YT_LOGIN_UA)
+        .user_agent(
+            // Windows UA fools Google under WebView2, but on macOS the engine
+            // is WKWebView: a Safari UA matches the real engine fingerprint,
+            // which consumer-account risk checks care about.
+            if cfg!(target_os = "macos") {
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
+                 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+            } else {
+                YT_LOGIN_UA
+            },
+        )
         // Must match the session-keeper's args (shared profile folder).
         .additional_browser_args(YT_WEBVIEW_ARGS)
         // Surface the current origin in the title so the user can spot
@@ -853,19 +1014,13 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
                 if !nudged_to_yt {
                     let has_google_auth = cookies.iter().any(|c| {
                         let name = c.name();
-                        (name == "SAPISID"
-                            || name == "SID"
-                            || name == "__Secure-1PSID")
+                        (name == "SAPISID" || name == "SID" || name == "__Secure-1PSID")
                             && c.domain()
-                                .map(|d| {
-                                    d.trim_start_matches('.').ends_with("google.com")
-                                })
+                                .map(|d| d.trim_start_matches('.').ends_with("google.com"))
                                 .unwrap_or(false)
                     });
                     if has_google_auth {
-                        if let Ok(url) =
-                            "https://music.youtube.com/".parse::<tauri::Url>()
-                        {
+                        if let Ok(url) = "https://music.youtube.com/".parse::<tauri::Url>() {
                             match win.navigate(url) {
                                 Ok(()) => eprintln!(
                                     "[login] google-auth detected without YT cookies; redirected webview to music.youtube.com"
@@ -906,25 +1061,22 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
                 let _ = tokio::fs::create_dir_all(dir).await;
             }
             let plain = cookies_to_netscape(&cookies).into_bytes();
-            let encrypted = match tokio::task::spawn_blocking(move || {
-                secure_store::encrypt(&plain)
-            })
-            .await
-            {
-                Ok(Ok(e)) => e,
-                Ok(Err(e)) => {
-                    eprintln!("[login] encrypt cookies: {e}");
-                    let _ = win.close();
-                    let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
-                    return;
-                }
-                Err(e) => {
-                    eprintln!("[login] encrypt join: {e}");
-                    let _ = win.close();
-                    let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
-                    return;
-                }
-            };
+            let encrypted =
+                match tokio::task::spawn_blocking(move || secure_store::encrypt(&plain)).await {
+                    Ok(Ok(e)) => e,
+                    Ok(Err(e)) => {
+                        eprintln!("[login] encrypt cookies: {e}");
+                        let _ = win.close();
+                        let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("[login] encrypt join: {e}");
+                        let _ = win.close();
+                        let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
+                        return;
+                    }
+                };
             if let Err(e) = tokio::fs::write(&cookies_path, &encrypted).await {
                 eprintln!("[login] write account cookies: {e}");
                 let _ = win.close();
@@ -947,10 +1099,13 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
                 // frontend at least flips out of the spinning state.
                 eprintln!("[login] write index: {e}");
                 let _ = app_poll.emit("login-cancelled", ());
-                let _ = tokio::fs::remove_dir_all(&account_cookies_path(&app_poll, &new_id)
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_default()).await;
+                let _ = tokio::fs::remove_dir_all(
+                    &account_cookies_path(&app_poll, &new_id)
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_default(),
+                )
+                .await;
                 let _ = win.close();
                 let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
                 return;
@@ -1142,8 +1297,7 @@ async fn read_cookie_header(app: &tauri::AppHandle, host: &str) -> String {
         }
         let domain = fields[0].trim_start_matches('.');
         let include_sub = fields[1] == "TRUE";
-        let matches = host == domain
-            || (include_sub && host.ends_with(&format!(".{domain}")));
+        let matches = host == domain || (include_sub && host.ends_with(&format!(".{domain}")));
         if !matches {
             continue;
         }
@@ -1153,10 +1307,7 @@ async fn read_cookie_header(app: &tauri::AppHandle, host: &str) -> String {
 }
 
 #[tauri::command]
-async fn get_cookie_header(
-    app: tauri::AppHandle,
-    host: String,
-) -> Result<String, String> {
+async fn get_cookie_header(app: tauri::AppHandle, host: String) -> Result<String, String> {
     Ok(read_cookie_header(&app, &host).await)
 }
 
@@ -1186,10 +1337,7 @@ struct CloseBehavior {
 }
 
 #[tauri::command]
-fn set_close_behavior(
-    state: tauri::State<'_, CloseBehavior>,
-    quit_on_close: bool,
-) {
+fn set_close_behavior(state: tauri::State<'_, CloseBehavior>, quit_on_close: bool) {
     state.quit_on_close.store(quit_on_close, Ordering::Relaxed);
 }
 
@@ -1223,11 +1371,7 @@ fn autostart_is_enabled(app: tauri::AppHandle) -> Result<bool, String> {
 /// looking at the app (main window hidden to tray, or another app in
 /// the foreground).
 #[tauri::command]
-fn notify_track(
-    app: tauri::AppHandle,
-    title: String,
-    body: String,
-) -> Result<(), String> {
+fn notify_track(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
     use tauri_plugin_notification::NotificationExt;
     let any_focused = app
         .webview_windows()
@@ -1279,10 +1423,7 @@ async fn open_player_window(
         let _ = existing.unminimize();
         let _ = existing.set_focus();
         if let (Some(cx), Some(cy)) = (x, y) {
-            let _ = existing.set_position(tauri::LogicalPosition::new(
-                cx - 180.0,
-                cy - 18.0,
-            ));
+            let _ = existing.set_position(tauri::LogicalPosition::new(cx - 180.0, cy - 18.0));
         }
         return Ok(());
     }
@@ -1323,10 +1464,7 @@ async fn open_player_window(
         // horizontally on cursor with the 36px-tall title bar just
         // below puts the user's release point on top of the new card,
         // which feels like the window snapped to where they dropped.
-        let _ = win.set_position(tauri::LogicalPosition::new(
-            cx - 180.0,
-            cy - 18.0,
-        ));
+        let _ = win.set_position(tauri::LogicalPosition::new(cx - 180.0, cy - 18.0));
     }
     Ok(())
 }
@@ -1492,8 +1630,7 @@ async fn update_account_meta(
     let dup_pos = incoming.as_ref().and_then(|key| {
         idx.accounts.iter().position(|a| {
             a.id != id
-                && meta_identity(&a.email, a.photo_url.as_deref()).as_deref()
-                    == Some(key.as_str())
+                && meta_identity(&a.email, a.photo_url.as_deref()).as_deref() == Some(key.as_str())
         })
     });
 
@@ -1541,7 +1678,10 @@ async fn update_account_meta(
             let _ = tokio::fs::remove_dir_all(&other_webview).await;
             let mut moved = false;
             for _ in 0..5u8 {
-                if tokio::fs::rename(&this_webview, &other_webview).await.is_ok() {
+                if tokio::fs::rename(&this_webview, &other_webview)
+                    .await
+                    .is_ok()
+                {
                     moved = true;
                     break;
                 }
@@ -1666,10 +1806,7 @@ struct AuthContext {
 }
 
 #[tauri::command]
-async fn get_auth_context(
-    app: tauri::AppHandle,
-    host: String,
-) -> Result<AuthContext, String> {
+async fn get_auth_context(app: tauri::AppHandle, host: String) -> Result<AuthContext, String> {
     let cookie = read_cookie_header(&app, &host).await;
     let page_id = if cookie.is_empty() {
         None
@@ -1826,10 +1963,7 @@ fn get_cache_dir(app: tauri::AppHandle) -> CacheDirInfo {
 /// that the folder exists and is writable before saving; the change
 /// takes effect on the next launch.
 #[tauri::command]
-async fn set_cache_dir(
-    app: tauri::AppHandle,
-    path: Option<String>,
-) -> Result<(), String> {
+async fn set_cache_dir(app: tauri::AppHandle, path: Option<String>) -> Result<(), String> {
     use tauri_plugin_store::StoreExt;
     let store = app
         .store(SETTINGS_STORE_FILE)
@@ -1855,7 +1989,9 @@ async fn set_cache_dir(
             store.set(CACHE_DIR_KEY, serde_json::Value::String(raw));
         }
     }
-    store.save().map_err(|e| format!("save settings store: {e}"))?;
+    store
+        .save()
+        .map_err(|e| format!("save settings store: {e}"))?;
     Ok(())
 }
 
@@ -1865,14 +2001,12 @@ async fn set_cache_dir(
 #[tauri::command]
 async fn pick_cache_folder(app: tauri::AppHandle) -> Option<String> {
     use tauri_plugin_dialog::DialogExt;
-    tauri::async_runtime::spawn_blocking(move || {
-        app.dialog().file().blocking_pick_folder()
-    })
-    .await
-    .ok()
-    .flatten()
-    .and_then(|f| f.into_path().ok())
-    .map(|p| p.display().to_string())
+    tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_folder())
+        .await
+        .ok()
+        .flatten()
+        .and_then(|f| f.into_path().ok())
+        .map(|p| p.display().to_string())
 }
 
 #[derive(serde::Serialize)]
@@ -1943,7 +2077,9 @@ async fn list_cache(app: tauri::AppHandle) -> Result<Vec<CacheEntry>, String> {
         if !sanitize_video_id(video_id) {
             continue;
         }
-        let Ok(meta) = e.metadata().await else { continue };
+        let Ok(meta) = e.metadata().await else {
+            continue;
+        };
         let modified_secs = meta
             .modified()
             .ok()
@@ -1985,9 +2121,17 @@ async fn delete_cache_entries(
         let mut out = std::collections::HashSet::new();
         while let Ok(Some(e)) = rd.next_entry().await {
             if let Some(name) = e.file_name().to_str() {
+                // A track cached only as video (`<id>.video.mp4`) still
+                // has to be swept, so enumerate every variant.
+                // `.vonly{h}.{mp4,part}` variants are matched by
+                // splitting on the marker instead of enumerating every
+                // height suffix.
                 let id = name
-                    .strip_suffix(".webm")
+                    .strip_suffix(".video.mp4")
+                    .or_else(|| name.strip_suffix(".webm"))
                     .or_else(|| name.strip_suffix(".meta.json"))
+                    .or_else(|| name.strip_suffix(".video.part"))
+                    .or_else(|| name.split(".vonly").next().filter(|_| name.contains(".vonly")))
                     .or_else(|| name.strip_suffix(".part"));
                 if let Some(id) = id {
                     if sanitize_video_id(id) {
@@ -2005,13 +2149,26 @@ async fn delete_cache_entries(
     };
 
     for id in targets {
-        let path = dir.join(format!("{id}.webm"));
-        if let Ok(meta) = tokio::fs::metadata(&path).await {
-            freed += meta.len();
+        // Both stream variants for the id, plus stray .part files from
+        // crashed downloads.
+        for h in VONLY_HEIGHTS {
+            let (part_name, final_name) = stream_file_names(&id, StreamVariant::VideoOnly(h));
+            let path = dir.join(final_name);
+            if let Ok(meta) = tokio::fs::metadata(&path).await {
+                freed += meta.len();
+            }
+            let _ = tokio::fs::remove_file(&path).await;
+            let _ = tokio::fs::remove_file(dir.join(part_name)).await;
         }
-        let _ = tokio::fs::remove_file(&path).await;
-        // Stray .part file from a crashed download, if any.
-        let _ = tokio::fs::remove_file(dir.join(format!("{id}.part"))).await;
+        for variant in [StreamVariant::Audio, StreamVariant::Muxed] {
+            let (part_name, final_name) = stream_file_names(&id, variant);
+            let path = dir.join(final_name);
+            if let Ok(meta) = tokio::fs::metadata(&path).await {
+                freed += meta.len();
+            }
+            let _ = tokio::fs::remove_file(&path).await;
+            let _ = tokio::fs::remove_file(dir.join(part_name)).await;
+        }
         // Metadata sidecar, if one was written.
         let _ = tokio::fs::remove_file(dir.join(format!("{id}.meta.json"))).await;
     }
@@ -2064,6 +2221,55 @@ async fn ensure_ytdlp(app: tauri::AppHandle) {
     ytdlp::ensure(app).await;
 }
 
+/// yt-dlp format selectors for the audio-only stream.
+///
+/// macOS renders playback in WKWebView, which only decodes a narrow set
+/// of codecs. Prefer AAC-in-mp4 (m4a) first, then Opus/webm, and as a
+/// last resort a progressive muxed mp4 (`b[ext=mp4][acodec!=none]`, i.e.
+/// itag 18 h264+aac) so a video-only upload with no audio-only format
+/// still has its audio play instead of erroring — same as real YT Music.
+/// Other platforms keep their original webm-first selection unchanged;
+/// WebView2 / WebKitGTK decode Opus fine and the extra ladder isn't
+/// needed there.
+#[cfg(target_os = "macos")]
+const AUDIO_FORMAT: &str = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=webm]/bestaudio/b[ext=mp4][acodec!=none]";
+#[cfg(not(target_os = "macos"))]
+const AUDIO_FORMAT: &str = "bestaudio[ext=webm]/bestaudio";
+
+/// yt-dlp format selectors for the music-video stream. Progressive
+/// (muxed) only: we pipe yt-dlp's stdout straight through, and merging
+/// separate video+audio tracks would need ffmpeg, which we don't ship —
+/// so no `bestvideo+bestaudio`, and no bare `best` (that can resolve to
+/// an adaptive video-only file). On macOS the selection is pinned to
+/// h264-in-mp4 (`vcodec^=avc1`) with itag 18 as the floor, which is what
+/// WKWebView can actually decode. Other platforms get a webm progressive
+/// last resort on top of that.
+#[cfg(target_os = "macos")]
+const VIDEO_FORMAT: &str = "b[ext=mp4][vcodec^=avc1][acodec!=none]/18";
+
+/// Video-only DASH selector for the companion surface. h264-in-mp4
+/// only (WKWebView decode), capped at the user's chosen height. The
+/// bare `bv[vcodec^=avc1]` tail keeps a video with nothing under the
+/// cap playable at whatever it has.
+fn vonly_format(height: u32) -> String {
+    if height > 1080 {
+        // YouTube has no h264 above 1080p; 1440p/4K are VP9 (or AV1).
+        // Modern WKWebView decodes VP9-in-WebM, and the frontend falls
+        // back to artwork if this machine's decoder refuses. The avc1
+        // rungs keep a non-VP9 video playable at 1080p.
+        format!(
+            "bv[ext=webm][vcodec^=vp9][height<={height}]/bv[ext=mp4][vcodec^=avc1][height<=1080]/bv[ext=mp4][vcodec^=avc1]/bv[vcodec^=avc1]"
+        )
+    } else {
+        format!(
+            "bv[ext=mp4][vcodec^=avc1][height<={height}]/bv[ext=mp4][vcodec^=avc1]/bv[vcodec^=avc1]"
+        )
+    }
+}
+#[cfg(not(target_os = "macos"))]
+const VIDEO_FORMAT: &str =
+    "b[ext=mp4][vcodec^=avc1][acodec!=none]/18/b[ext=webm][acodec!=none]";
+
 /// Run yt-dlp to resolve a videoId into metadata JSON.
 #[tauri::command]
 fn resolve_stream_ytdlp(app: tauri::AppHandle, video_id: String) -> Result<String, String> {
@@ -2075,16 +2281,58 @@ fn resolve_stream_ytdlp(app: tauri::AppHandle, video_id: String) -> Result<Strin
     command.args([
         "-j",
         "-f",
-        "bestaudio",
+        AUDIO_FORMAT,
         "--no-playlist",
         "--no-warnings",
         "--extractor-args",
-        "youtube:player_client=tv,android_vr",
+        "youtube:player_client=android_vr,ios",
         &url,
     ]);
     // Windows: a console-less GUI process spawning the console-subsystem
     // yt-dlp.exe with default flags makes Windows flash a console window
     // on every resolve. CREATE_NO_WINDOW suppresses it.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let output = command.output().map_err(|e| format!("spawn yt-dlp: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "yt-dlp exit {}: {}",
+            output.status,
+            stderr.chars().take(400).collect::<String>()
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|e| format!("stdout not utf8: {e}"))
+}
+
+/// Resolve the HLS variant URL for a music video. WKWebView plays HLS
+/// natively (AVFoundation), which is the only way past the 360p
+/// progressive ceiling without shipping ffmpeg: YouTube's iOS client
+/// exposes per-quality m3u8 variants up to 1080p, and
+/// `best[protocol^=m3u8]` picks the top one. The URL goes straight to
+/// the media element (googlevideo allows anonymous playback from the
+/// resolving IP); no proxying, no disk cache. Callers fall back to the
+/// progressive proxy stream when this errors (id has no HLS).
+#[tauri::command]
+fn resolve_hls_stream(app: tauri::AppHandle, video_id: String) -> Result<String, String> {
+    if !sanitize_video_id(&video_id) {
+        return Err(format!("invalid videoId: {video_id}"));
+    }
+    let url = format!("https://www.youtube.com/watch?v={video_id}");
+    let mut command = std::process::Command::new(ytdlp::program(&ytdlp::managed_path(&app)));
+    command.args([
+        "-g",
+        "-f",
+        "best[protocol^=m3u8]",
+        "--no-playlist",
+        "--no-warnings",
+        "--extractor-args",
+        "youtube:player_client=ios",
+        &url,
+    ]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -2101,7 +2349,13 @@ fn resolve_stream_ytdlp(app: tauri::AppHandle, video_id: String) -> Result<Strin
             stderr.chars().take(400).collect::<String>()
         ));
     }
-    String::from_utf8(output.stdout).map_err(|e| format!("stdout not utf8: {e}"))
+    let stdout = String::from_utf8(output.stdout).map_err(|e| format!("stdout not utf8: {e}"))?;
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("http") && l.contains("m3u8"))
+        .ok_or_else(|| "no hls url in yt-dlp output".to_string())?;
+    Ok(line.to_string())
 }
 
 /// Lifecycle of a single track's yt-dlp download. yt-dlp writes
@@ -2141,10 +2395,9 @@ struct StreamServer {
     ytdlp_bin: PathBuf,
 }
 
-/// Read the `ephemeral` query flag from a stream/prefetch request.
-/// True when `?ephemeral=1` (or `=true`) appears — used to route the
-/// download to `ephemeral_dir` instead of the persistent cache.
-fn is_ephemeral(req: &Request) -> bool {
+/// Read a boolean query flag (`?name=1` / `?name=true`) off a stream/
+/// prefetch request.
+fn query_flag(req: &Request, name: &str) -> bool {
     let Some(query) = req.uri().query() else {
         return false;
     };
@@ -2152,8 +2405,84 @@ fn is_ephemeral(req: &Request) -> bool {
         let mut it = kv.splitn(2, '=');
         let key = it.next().unwrap_or("");
         let val = it.next().unwrap_or("");
-        key == "ephemeral" && (val == "1" || val == "true")
+        key == name && (val == "1" || val == "true")
     })
+}
+
+/// `?ephemeral=1` routes the download to `ephemeral_dir` instead of the
+/// persistent cache.
+fn is_ephemeral(req: &Request) -> bool {
+    query_flag(req, "ephemeral")
+}
+
+/// `?video=1` asks for the music-video stream (progressive h264/mp4)
+/// instead of the audio-only one. Cached side by side with the audio
+/// variant under a distinct filename.
+fn is_video(req: &Request) -> bool {
+    query_flag(req, "video")
+}
+
+/// Which of the three cached stream variants a request refers to.
+/// `Muxed` is the progressive 360p file (WKWebView-decodable audio+
+/// video in one container, the historical `?video=1`), `VideoOnly` is
+/// the high-res DASH video track used as a muted companion surface
+/// while the audio variant stays the playback master (YouTube stopped
+/// serving progressive files above 360p, and merging tracks would need
+/// ffmpeg, which we don't ship).
+#[derive(Clone, Copy, PartialEq)]
+enum StreamVariant {
+    Audio,
+    Muxed,
+    /// Payload = height cap for the DASH pick (1080/720/480/360),
+    /// which is also part of the cache filename so each quality is
+    /// cached independently.
+    VideoOnly(u32),
+}
+
+/// Allowed vonly caps. Anything else in `?h=` falls back to 1080 so a
+/// hand-crafted query can't turn into an unbounded cache-name space.
+const VONLY_HEIGHTS: [u32; 6] = [2160, 1440, 1080, 720, 480, 360];
+
+fn vonly_height(req: &Request) -> u32 {
+    let h = req
+        .uri()
+        .query()
+        .and_then(|q| {
+            q.split('&').find_map(|kv| {
+                let mut it = kv.splitn(2, '=');
+                (it.next() == Some("h")).then(|| it.next().unwrap_or(""))?.parse::<u32>().ok()
+            })
+        })
+        .unwrap_or(1080);
+    if VONLY_HEIGHTS.contains(&h) { h } else { 1080 }
+}
+
+fn stream_variant(req: &Request) -> StreamVariant {
+    if query_flag(req, "vonly") {
+        StreamVariant::VideoOnly(vonly_height(req))
+    } else if is_video(req) {
+        StreamVariant::Muxed
+    } else {
+        StreamVariant::Audio
+    }
+}
+
+/// On-disk names for one videoId's cached stream + its in-flight part
+/// file. Audio keeps the historical `.webm` name (regardless of actual
+/// container — see `sniff_stream_mime`); the video variant lives next
+/// to it so the same id can have both cached.
+fn stream_file_names(video_id: &str, variant: StreamVariant) -> (String, String) {
+    match variant {
+        StreamVariant::Muxed => (
+            format!("{video_id}.video.part"),
+            format!("{video_id}.video.mp4"),
+        ),
+        StreamVariant::VideoOnly(h) => (
+            format!("{video_id}.vonly{h}.part"),
+            format!("{video_id}.vonly{h}.mp4"),
+        ),
+        StreamVariant::Audio => (format!("{video_id}.part"), format!("{video_id}.webm")),
+    }
 }
 
 /// Hash a URL into a stable hex filename. Uses Rust's stdlib
@@ -2196,7 +2525,8 @@ async fn cache_cover(
     };
     let token = {
         let t = state.token.lock().await;
-        t.clone().ok_or_else(|| "stream server not ready".to_string())?
+        t.clone()
+            .ok_or_else(|| "stream server not ready".to_string())?
     };
 
     // SSRF guard: cover URLs come from remote metadata (iTunes/mzstatic +
@@ -2245,10 +2575,7 @@ async fn cache_cover(
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("read body: {e}"))?;
+        let bytes = resp.bytes().await.map_err(|e| format!("read body: {e}"))?;
         // Write to a .part file then atomically rename so a concurrent
         // reader never sees a half-written file.
         let part = path.with_extension(format!(
@@ -2287,7 +2614,9 @@ async fn cover_cache_stats(app: tauri::AppHandle) -> Result<CoverCacheStats, Str
         Err(e) => return Err(format!("read_dir: {e}")),
     };
     while let Ok(Some(e)) = rd.next_entry().await {
-        let Ok(meta) = e.metadata().await else { continue };
+        let Ok(meta) = e.metadata().await else {
+            continue;
+        };
         if !meta.is_file() {
             continue;
         }
@@ -2310,7 +2639,9 @@ async fn clear_cover_cache(app: tauri::AppHandle) -> Result<u64, String> {
         Err(e) => return Err(format!("read_dir: {e}")),
     };
     while let Ok(Some(e)) = rd.next_entry().await {
-        let Ok(meta) = e.metadata().await else { continue };
+        let Ok(meta) = e.metadata().await else {
+            continue;
+        };
         if !meta.is_file() {
             continue;
         }
@@ -2318,6 +2649,259 @@ async fn clear_cover_cache(app: tauri::AppHandle) -> Result<u64, String> {
         let _ = tokio::fs::remove_file(e.path()).await;
     }
     Ok(freed)
+}
+
+const ALLOWED_IMAGE_HOST_SUFFIXES: &[&str] = &[
+    "mzstatic.com",
+    "ytimg.com",
+    "ggpht.com",
+    "googleusercontent.com",
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImageUrlKind {
+    /// An allowlisted remote CDN over https.
+    Remote,
+    /// The app's own cover server on loopback (http://127.0.0.1:<port>/...).
+    Loopback,
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// SSRF gate: an image URL is fetchable only if it's the app's own loopback
+/// cover server, or https on one of the known art CDNs. Everything else is
+/// rejected so a crafted metadata field can't point the server-side fetch at
+/// an internal service.
+fn classify_image_url(url: &reqwest::Url) -> Result<ImageUrlKind, String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "image url missing host".to_string())?;
+    if is_loopback_host(host) {
+        return match url.scheme() {
+            "http" | "https" => Ok(ImageUrlKind::Loopback),
+            scheme => Err(format!("blocked loopback scheme: {scheme}")),
+        };
+    }
+    if url.scheme() != "https" {
+        return Err(format!("blocked scheme: {}", url.scheme()));
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let host_ok = ALLOWED_IMAGE_HOST_SUFFIXES
+        .iter()
+        .any(|s| host == *s || host.ends_with(&format!(".{s}")));
+    if host_ok {
+        Ok(ImageUrlKind::Remote)
+    } else {
+        Err(format!("blocked image host: {host}"))
+    }
+}
+
+/// Follow redirects, but only to a target of the SAME kind as the start —
+/// a remote CDN may only 3xx to another allowlisted CDN, and a loopback URL
+/// may only 3xx to loopback. This keeps the old `redirect::none()` SSRF
+/// guarantee (a CDN can't bounce us into an internal host) while still
+/// following the routine 3xx that Google/YT image URLs hand out.
+fn image_redirect_policy(initial: ImageUrlKind) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 8 {
+            return attempt.error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "too many image redirects",
+            ));
+        }
+        match classify_image_url(attempt.url()) {
+            Ok(kind) if kind == initial => attempt.follow(),
+            Ok(_) => attempt.error(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "blocked cross-context image redirect",
+            )),
+            Err(e) => {
+                attempt.error(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
+            }
+        }
+    })
+}
+
+fn image_referer(url: &reqwest::Url) -> Option<&'static str> {
+    let host = url.host_str()?;
+    if is_loopback_host(host) {
+        return None;
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "mzstatic.com" || host.ends_with(".mzstatic.com") {
+        Some("https://music.apple.com/")
+    } else {
+        Some("https://music.youtube.com/")
+    }
+}
+
+/// Fetch image bytes for cover/accent use. Accepts the app's own loopback
+/// cover server and the allowlisted art CDNs (see `classify_image_url`),
+/// follows same-kind redirects, and sends browser-like headers so a CDN
+/// that 403s a bare client (hotlink protection) still returns the image.
+async fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("bad url: {e}"))?;
+    let kind = classify_image_url(&parsed)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(image_redirect_policy(kind))
+        .build()
+        .map_err(|e| format!("client: {e}"))?;
+    let mut req = client
+        .get(parsed.clone())
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
+             (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        )
+        .header(
+            reqwest::header::ACCEPT,
+            "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        );
+    if let Some(referer) = image_referer(&parsed) {
+        req = req.header(reqwest::header::REFERER, referer);
+    }
+    let resp = req.send().await.map_err(|e| format!("fetch: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    Ok(resp
+        .bytes()
+        .await
+        .map_err(|e| format!("read body: {e}"))?
+        .to_vec())
+}
+
+/// Fallback accent when the art is near-monochrome or otherwise doesn't
+/// yield a legible color: the app's YouTube-red brand color.
+// Neutral fallback for near-monochrome art (black-and-white covers, dark
+// photos) where `accent_from_bytes` finds no vibrant hue. A muted grey
+// reads as a deliberate neutral accent; the old brand red looked like a
+// bug against a desaturated cover.
+const ACCENT_FALLBACK: &str = "#71717A";
+
+fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f64, f64, f64) {
+    let (r, g, b) = (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    if d.abs() < f64::EPSILON {
+        return (0.0, 0.0, l);
+    }
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
+    let h = if (max - r).abs() < f64::EPSILON {
+        (g - b) / d + if g < b { 6.0 } else { 0.0 }
+    } else if (max - g).abs() < f64::EPSILON {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    } * 60.0;
+    (h, s, l)
+}
+
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
+    if s.abs() < f64::EPSILON {
+        let v = (l * 255.0).round() as u8;
+        return (v, v, v);
+    }
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+    let hk = h / 360.0;
+    let tc = |mut t: f64| {
+        if t < 0.0 {
+            t += 1.0;
+        }
+        if t > 1.0 {
+            t -= 1.0;
+        }
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 1.0 / 2.0 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    (
+        (tc(hk + 1.0 / 3.0) * 255.0).round() as u8,
+        (tc(hk) * 255.0).round() as u8,
+        (tc(hk - 1.0 / 3.0) * 255.0).round() as u8,
+    )
+}
+
+/// Downscale the art and pick a vibrant dominant color. Pixels outside a
+/// legible lightness band or below a saturation floor are dropped so the
+/// accent reads as white-on-color over the dark ambient backdrop; the
+/// survivors are bucketed by hue and the saturation-weighted average of
+/// the heaviest bucket wins. Returns `None` for near-monochrome art so
+/// the caller can fall back to the brand red.
+fn accent_from_bytes(bytes: &[u8]) -> Option<String> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let small = img.thumbnail(64, 64).to_rgb8();
+    let mut sum = [[0f64; 3]; 12];
+    let mut weight = [0f64; 12];
+    for p in small.pixels() {
+        let (h, s, l) = rgb_to_hsl(p[0], p[1], p[2]);
+        if !(0.20..=0.75).contains(&l) || s < 0.35 {
+            continue;
+        }
+        let bucket = ((h / 30.0).floor() as usize) % 12;
+        sum[bucket][0] += p[0] as f64 * s;
+        sum[bucket][1] += p[1] as f64 * s;
+        sum[bucket][2] += p[2] as f64 * s;
+        weight[bucket] += s;
+    }
+    let best = weight
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)?;
+    if weight[best] <= 0.0 {
+        return None;
+    }
+    let r = (sum[best][0] / weight[best]).round() as u8;
+    let g = (sum[best][1] / weight[best]).round() as u8;
+    let b = (sum[best][2] / weight[best]).round() as u8;
+    // Force the winner into the legible band: floor the saturation so a
+    // muted average still shows as a color, and clamp lightness so it's
+    // neither lost on black nor washed out under white text.
+    let (h, s, l) = rgb_to_hsl(r, g, b);
+    let (rr, gg, bb) = hsl_to_rgb(h, s.max(0.5), l.clamp(0.45, 0.70));
+    Some(format!("#{rr:02X}{gg:02X}{bb:02X}"))
+}
+
+/// Album-art accent color for the fullscreen player. Fetches the art and
+/// computes a vibrant dominant color off-thread. Always resolves (falls
+/// back to brand red) so the frontend can set it unconditionally.
+#[tauri::command]
+async fn dominant_accent_color(url: String) -> Result<String, String> {
+    let bytes = fetch_image_bytes(&url).await?;
+    let color = tokio::task::spawn_blocking(move || accent_from_bytes(&bytes))
+        .await
+        .map_err(|e| format!("join: {e}"))?;
+    Ok(color.unwrap_or_else(|| ACCENT_FALLBACK.to_string()))
+}
+
+/// Push the current track into the macOS system Now Playing panel
+/// (title / artist / album / times / play state). A no-op off macOS
+/// (see `now_playing`).
+#[tauri::command]
+fn set_now_playing(info: now_playing::NowPlayingInfo) {
+    now_playing::apply(&info);
 }
 
 #[derive(Default)]
@@ -2329,12 +2913,19 @@ struct StreamServerState {
     /// guesses the random port still can't form a valid URL — this closes
     /// the CSRF-spawn and DNS-rebinding-read vectors.
     token: Arc<Mutex<Option<String>>>,
+    /// The exact router the loopback listener is serving. Stashed so the
+    /// on-demand LAN listener can serve the same one on a second socket:
+    /// rebuilding it there would be a second copy of the route table free
+    /// to drift out of step with this one. Cloning a Router is cheap.
+    router: Arc<Mutex<Option<Router>>>,
+    /// The LAN listener, alive only while something is casting. `None` is
+    /// the normal state and means nothing off this machine can reach the
+    /// server at all.
+    lan: Arc<Mutex<Option<LanListener>>>,
 }
 
 #[tauri::command]
-async fn get_stream_base_url(
-    state: tauri::State<'_, StreamServerState>,
-) -> Result<String, String> {
+async fn get_stream_base_url(state: tauri::State<'_, StreamServerState>) -> Result<String, String> {
     let port = *state.port.lock().await;
     let token = state.token.lock().await.clone();
     match (port, token) {
@@ -2343,16 +2934,152 @@ async fn get_stream_base_url(
     }
 }
 
+/// A live `0.0.0.0` listener, kept only for as long as a receiver needs to
+/// pull media from us. Casting to a TV means the TV does the fetching, and
+/// loopback is invisible from anywhere but this machine. Binding wide for
+/// the whole session would put the media server on every network the laptop
+/// ever joins, so it goes up and comes back down with the cast instead.
+struct LanListener {
+    base_url: String,
+    /// Firing this makes axum stop accepting and drop the socket, which is
+    /// what actually frees the port again.
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// The address other machines on this network would reach us on: the source
+/// address the kernel picks for off-link traffic, i.e. the one belonging to
+/// whichever interface currently holds the default route. A UDP `connect` is
+/// nothing but a routing-table lookup, so no packet leaves the box, no name
+/// is resolved, and it answers instantly with no internet. It also beats
+/// walking the interface list, which needs a crate and still leaves us
+/// guessing which of the loopback/utun/bridge addresses a receiver could use.
+/// The probe target is documentation space (RFC 5737) on purpose: nobody
+/// routes it specially, so it always falls through to the default route.
+fn lan_ipv4() -> Result<Ipv4Addr, String> {
+    let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .map_err(|e| format!("no usable LAN address (socket: {e})"))?;
+    probe
+        .connect((Ipv4Addr::new(203, 0, 113, 1), 9))
+        .map_err(|e| format!("no usable LAN address (no route off this machine: {e})"))?;
+    let ip = match probe.local_addr() {
+        Ok(SocketAddr::V4(a)) => *a.ip(),
+        Ok(other) => return Err(format!("no usable LAN address (got {other})")),
+        Err(e) => return Err(format!("no usable LAN address ({e})")),
+    };
+    // Handing back one of these would produce a cast that connects and then
+    // silently never buffers: the receiver can't fetch from any of them.
+    if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_multicast() {
+        return Err(format!("no usable LAN address (got {ip})"));
+    }
+    Ok(ip)
+}
+
+/// Bring the LAN listener up if it isn't already and hand back its base URL.
+/// Same router and same token as the loopback listener, so a receiver's GET
+/// and the webview's GET land in identical handlers, and the unguessable
+/// prefix keeps gating them: what the LAN sees is a token wall, not an open
+/// file server. Idempotent, a second cast reuses the running listener.
+// NB: not `pub`. A `pub` #[tauri::command] at the crate root makes the macro
+// re-export its generated `__cmd__*` into the root macro namespace where the
+// macro already lives, which is a redefinition (E0255). Every command in this
+// file is private for that reason; the `pub` ones live in submodules.
+#[tauri::command]
+async fn stream_lan_base_url(
+    state: tauri::State<'_, StreamServerState>,
+) -> Result<String, String> {
+    let mut lan = state.lan.lock().await;
+    if let Some(running) = lan.as_ref() {
+        return Ok(running.base_url.clone());
+    }
+
+    let token = state
+        .token
+        .lock()
+        .await
+        .clone()
+        .ok_or("stream server not ready")?;
+    let app = state
+        .router
+        .lock()
+        .await
+        .clone()
+        .ok_or("stream server not ready")?;
+    // Resolve the address before binding so a machine with no route off it
+    // never opens the wide socket at all.
+    let ip = lan_ipv4()?;
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("lan bind failed: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("lan local_addr failed: {e}"))?
+        .port();
+
+    let (shutdown, signal) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let served = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let _ = signal.await;
+        });
+        if let Err(e) = served.await {
+            eprintln!("[stream-server] lan serve error: {e}");
+        }
+    });
+
+    let base_url = format!("http://{ip}:{port}/{token}");
+    eprintln!("[stream-server] lan listening on 0.0.0.0:{port}, advertising {ip}");
+    *lan = Some(LanListener {
+        base_url: base_url.clone(),
+        shutdown,
+        task,
+    });
+    Ok(base_url)
+}
+
+/// Take the LAN listener back down. Idempotent, because a disconnect can
+/// arrive from a session that never needed one (playback stayed local, or a
+/// connect failed) and that isn't an error.
+#[tauri::command]
+async fn stream_lan_stop(state: tauri::State<'_, StreamServerState>) -> Result<(), String> {
+    let listener = state.lan.lock().await.take();
+    let listener = match listener {
+        Some(l) => l,
+        None => return Ok(()),
+    };
+    let _ = listener.shutdown.send(());
+    // Graceful means axum drops the socket immediately (port free) but then
+    // waits out in-flight responses, and a receiver parked on an open media
+    // stream would keep that wait, and us, alive indefinitely. Give the
+    // response a moment to end on its own, then cut it. Detached so a
+    // disconnect returns to the UI at once.
+    let mut task = listener.task;
+    tokio::spawn(async move {
+        if tokio::time::timeout(Duration::from_secs(3), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    });
+    eprintln!("[stream-server] lan listener stopped");
+    Ok(())
+}
+
 /// Spawn a yt-dlp downloader that writes into the shared memory buffer
-/// AND to a `<videoId>.part` file on disk. On successful exit, renames
-/// .part → .webm. Updates `state.complete` + pings `notify` on every
-/// new chunk.
+/// AND to a part file on disk (names per `stream_file_names`). On
+/// successful exit, renames the part file to its final name. Updates
+/// `state.complete` + pings `notify` on every new chunk.
 ///
-/// `target_dir` selects which on-disk pool to write to (persistent or
-/// ephemeral). `map_key` is the prefixed key in `srv.downloads` so a
-/// single videoId can be in-flight independently for both pools.
+/// `video` picks the music-video stream (progressive h264/mp4) over the
+/// audio-only one. `target_dir` selects which on-disk pool to write to
+/// (persistent or ephemeral). `map_key` is the prefixed key in
+/// `srv.downloads` so a single videoId can be in-flight independently
+/// for every pool/variant combination.
 fn spawn_downloader(
     video_id: String,
+    variant: StreamVariant,
     target_dir: PathBuf,
     map_key: String,
     srv: StreamServer,
@@ -2361,15 +3088,20 @@ fn spawn_downloader(
     let downloads = srv.downloads.clone();
     tokio::spawn(async move {
         let url = format!("https://www.youtube.com/watch?v={video_id}");
-        let part_path = target_dir.join(format!("{video_id}.part"));
-        let final_path = target_dir.join(format!("{video_id}.webm"));
+        let (part_name, final_name) = stream_file_names(&video_id, variant);
+        let part_path = target_dir.join(part_name);
+        let final_path = target_dir.join(final_name);
         let _ = tokio::fs::create_dir_all(&target_dir).await;
         let _ = tokio::fs::remove_file(&part_path).await; // clean stale
 
         let mut cmd = TokioCommand::new(ytdlp::program(&srv.ytdlp_bin));
         cmd.args([
             "-f",
-            "bestaudio[ext=webm]/bestaudio",
+            &match variant {
+                StreamVariant::Muxed => VIDEO_FORMAT.to_string(),
+                StreamVariant::VideoOnly(h) => vonly_format(h),
+                StreamVariant::Audio => AUDIO_FORMAT.to_string(),
+            },
             "--no-playlist",
             "--no-warnings",
             "--no-part",
@@ -2388,7 +3120,7 @@ fn spawn_downloader(
             "--socket-timeout",
             "15",
             "--extractor-args",
-            "youtube:player_client=tv,android_vr",
+            "youtube:player_client=android_vr,ios",
             "-o",
             "-",
         ]);
@@ -2397,11 +3129,7 @@ fn spawn_downloader(
         // (see resolve_stream_ytdlp for rationale).
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        let mut child = match cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-        {
+        let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn() {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("[stream] spawn {video_id}: {e}");
@@ -2511,20 +3239,23 @@ fn spawn_downloader(
 }
 
 /// Read the first 16 bytes of a completed track file and map the
-/// container magic to the right `audio/*` mime. Every track is saved
-/// with a `.webm` extension regardless of what yt-dlp actually
-/// produced, so we can't trust the extension.
-async fn sniff_audio_mime(path: &std::path::Path) -> &'static str {
+/// container magic to the right mime. Audio tracks are saved with a
+/// `.webm` extension regardless of what yt-dlp actually produced, so we
+/// can't trust the extension; the `video` flag only switches the
+/// top-level type, the container still comes from the magic bytes.
+async fn sniff_stream_mime(path: &std::path::Path, video: bool) -> &'static str {
     let mut buf = [0u8; 16];
     if let Ok(mut f) = tokio::fs::File::open(path).await {
         let _ = f.read(&mut buf).await;
     }
     if &buf[4..8] == b"ftyp" {
-        "audio/mp4"
+        if video { "video/mp4" } else { "audio/mp4" }
     } else if &buf[..4] == &[0x1A, 0x45, 0xDF, 0xA3] {
-        "audio/webm"
+        if video { "video/webm" } else { "audio/webm" }
     } else if &buf[..3] == b"ID3" {
         "audio/mpeg"
+    } else if video {
+        "video/mp4"
     } else {
         "audio/webm"
     }
@@ -2542,17 +3273,25 @@ async fn stream_handler(
     }
 
     let ephemeral = is_ephemeral(&req);
+    let variant = stream_variant(&req);
     let target_dir = if ephemeral {
         srv.ephemeral_dir.clone()
     } else {
         srv.cache_dir.clone()
     };
-    let map_key = if ephemeral {
-        format!("e:{video_id}")
-    } else {
-        format!("p:{video_id}")
-    };
-    let final_path = target_dir.join(format!("{video_id}.webm"));
+    // Independent in-flight pools: {persistent, ephemeral} ×
+    // {audio, muxed video, video-only}; the same id may legitimately
+    // be downloading in more than one of them.
+    let map_key = format!(
+        "{}{}:{video_id}",
+        if ephemeral { "e" } else { "p" },
+        match variant {
+            StreamVariant::Muxed => "v".to_string(),
+            StreamVariant::VideoOnly(h) => format!("vo{h}"),
+            StreamVariant::Audio => String::new(),
+        },
+    );
+    let final_path = target_dir.join(stream_file_names(&video_id, variant).1);
 
     // If the full file isn't on disk yet, start (or attach to) the
     // download and block until it completes. Attempting to progressively
@@ -2582,7 +3321,12 @@ async fn stream_handler(
         .unwrap_or("")
         .to_string();
     eprintln!(
-        "[stream] GET /stream/{video_id} range={range_hdr:?} cached={} ephemeral={ephemeral}",
+        "[stream] GET /stream/{video_id} range={range_hdr:?} cached={} ephemeral={ephemeral} variant={}",
+        match variant {
+            StreamVariant::Muxed => "muxed".to_string(),
+            StreamVariant::VideoOnly(h) => format!("vonly{h}"),
+            StreamVariant::Audio => "audio".to_string(),
+        },
         final_path.exists()
     );
 
@@ -2600,6 +3344,7 @@ async fn stream_handler(
                 drop(map);
                 spawn_downloader(
                     video_id.clone(),
+                    variant,
                     target_dir.clone(),
                     map_key.clone(),
                     srv.clone(),
@@ -2616,8 +3361,7 @@ async fn stream_handler(
         while !state.complete.load(Ordering::Acquire) {
             if tokio::time::Instant::now() >= deadline {
                 eprintln!("[stream] {video_id}: TIMEOUT after 120s");
-                return (StatusCode::GATEWAY_TIMEOUT, "download timeout")
-                    .into_response();
+                return (StatusCode::GATEWAY_TIMEOUT, "download timeout").into_response();
             }
             let notified = state.notify.notified();
             tokio::pin!(notified);
@@ -2642,14 +3386,13 @@ async fn stream_handler(
     // to m4a when a video has no webm audio — serving that as
     // `video/webm` (what tower-http guesses from the extension) makes
     // Chromium refuse to decode.
-    let sniffed_ct = sniff_audio_mime(&final_path).await;
+    let sniffed_ct = sniff_stream_mime(&final_path, variant != StreamVariant::Audio).await;
     let mut resp = ServeFile::new(&final_path)
         .oneshot(req)
         .await
         .map(|r| r.into_response())
         .unwrap_or_else(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("serve: {e}"))
-                .into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("serve: {e}")).into_response()
         });
     if resp.status().is_success() || resp.status() == StatusCode::PARTIAL_CONTENT {
         resp.headers_mut().insert(
@@ -2699,8 +3442,7 @@ async fn cover_serve_handler(
         .await
         .map(|r| r.into_response())
         .unwrap_or_else(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("serve: {e}"))
-                .into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("serve: {e}")).into_response()
         });
     if resp.status().is_success() {
         // Filename is content-addressed (hash of the source URL), so
@@ -2726,17 +3468,22 @@ async fn prefetch_handler(
         return StatusCode::BAD_REQUEST;
     }
     let ephemeral = is_ephemeral(&req);
+    let variant = stream_variant(&req);
     let target_dir = if ephemeral {
         srv.ephemeral_dir.clone()
     } else {
         srv.cache_dir.clone()
     };
-    let map_key = if ephemeral {
-        format!("e:{video_id}")
-    } else {
-        format!("p:{video_id}")
-    };
-    let final_path = target_dir.join(format!("{video_id}.webm"));
+    let map_key = format!(
+        "{}{}:{video_id}",
+        if ephemeral { "e" } else { "p" },
+        match variant {
+            StreamVariant::Muxed => "v".to_string(),
+            StreamVariant::VideoOnly(h) => format!("vo{h}"),
+            StreamVariant::Audio => String::new(),
+        },
+    );
+    let final_path = target_dir.join(stream_file_names(&video_id, variant).1);
     if final_path.exists() {
         return StatusCode::OK;
     }
@@ -2756,7 +3503,7 @@ async fn prefetch_handler(
         map.insert(map_key.clone(), state.clone());
         state
     };
-    spawn_downloader(video_id, target_dir, map_key, srv.clone(), state);
+    spawn_downloader(video_id, variant, target_dir, map_key, srv.clone(), state);
     StatusCode::ACCEPTED
 }
 
@@ -2779,6 +3526,7 @@ fn generate_stream_token() -> String {
 async fn start_stream_server(
     port_state: Arc<Mutex<Option<u16>>>,
     token_state: Arc<Mutex<Option<String>>>,
+    router_state: Arc<Mutex<Option<Router>>>,
     cache_dir: PathBuf,
     ephemeral_dir: PathBuf,
     cover_dir: PathBuf,
@@ -2836,6 +3584,10 @@ async fn start_stream_server(
     let app = Router::new()
         .nest(&format!("/{token}"), routes)
         .layer(CorsLayer::permissive());
+    // Publish the router so the on-demand LAN listener (stream_lan_base_url)
+    // can serve this very one, same routes and same token prefix, instead of
+    // assembling its own.
+    *router_state.lock().await = Some(app.clone());
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -2877,9 +3629,7 @@ fn show_main_window(app: &tauri::AppHandle) {
 fn runtime_icon(app: &tauri::AppHandle) -> tauri::image::Image<'static> {
     #[cfg(debug_assertions)]
     {
-        if let Ok(icon) =
-            tauri::image::Image::from_bytes(include_bytes!("../icons/icon-dev.png"))
-        {
+        if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!("../icons/icon-dev.png")) {
             return icon;
         }
     }
@@ -2887,6 +3637,27 @@ fn runtime_icon(app: &tauri::AppHandle) -> tauri::image::Image<'static> {
         .cloned()
         .expect("bundled window icon missing")
         .to_owned()
+}
+
+/// The menu-bar icon. macOS extras are template images: a flat alpha mask
+/// that the system repaints in the menu bar's own foreground colour, so it
+/// turns white on a dark bar and black on a light one and stays legible when
+/// the wallpaper changes underneath. The full-colour app icon can't do that —
+/// it sat there as a red dot that ignored the system appearance. This is the
+/// same play glyph with the disc dropped, black on transparency.
+///
+/// Everywhere else keeps the app icon: Windows and Linux trays expect colour.
+fn tray_icon(app: &tauri::AppHandle) -> tauri::image::Image<'static> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        if let Ok(icon) =
+            tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))
+        {
+            return icon;
+        }
+    }
+    runtime_icon(app)
 }
 
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
@@ -2899,18 +3670,24 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 
     let menu = Menu::with_items(
         app,
-        &[&show_item, &sep, &play_item, &prev_item, &next_item, &sep, &quit_item],
+        &[
+            &show_item, &sep, &play_item, &prev_item, &next_item, &sep, &quit_item,
+        ],
     )?;
 
     let _tray = TrayIconBuilder::with_id("main-tray")
-        .icon(runtime_icon(app))
+        .icon(tray_icon(app))
+        // No-op off macOS; there it's what makes the glyph track the menu bar.
+        .icon_as_template(cfg!(target_os = "macos"))
         .tooltip(if cfg!(debug_assertions) {
             "YTubic (dev)"
         } else {
             "YTubic"
         })
         .menu(&menu)
-        .show_menu_on_left_click(false)
+        // macOS menu-bar extras conventionally open on left-click. Windows
+        // and Linux keep left-click reserved for restoring the main window.
+        .show_menu_on_left_click(cfg!(target_os = "macos"))
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => show_main_window(app),
             "play_pause" => {
@@ -2928,6 +3705,9 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
+            if cfg!(target_os = "macos") {
+                return;
+            }
             // Left-click the icon = show the window.
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
@@ -2950,9 +3730,19 @@ pub fn run() {
     // Windows.
     appid::init();
 
+    // rustls 0.23 refuses to pick a crypto backend for you when more than one
+    // is compiled in, and panics the first time anything opens a TLS socket.
+    // Both are: `ring` and `aws-lc-rs` arrive under the same rustls via
+    // reqwest/tauri-plugin-http, and cargo unifies the features. Casting is
+    // what surfaced it (the CASTv2 socket is TLS), but the ambiguity is
+    // process-wide, so the choice belongs here at startup rather than in any
+    // one caller. Err just means something already installed one.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let state = StreamServerState::default();
     let port_handle = state.port.clone();
     let token_handle = state.token.clone();
+    let router_handle = state.router.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -2994,10 +3784,27 @@ pub fn run() {
         .manage(RefreshGuard::default())
         .manage(discord::spawn())
         .manage(lastfm::LastfmState::default())
+        // Idle until the first cast_connect: the session thread and its
+        // socket only exist once a receiver is picked, so a launch that
+        // never casts costs nothing.
+        .manage(cast::CastState::default())
         .invoke_handler(tauri::generate_handler![
             ensure_ytdlp,
             resolve_stream_ytdlp,
+            resolve_hls_stream,
             get_stream_base_url,
+            stream_lan_base_url,
+            stream_lan_stop,
+            cast::cast_discover,
+            cast::cast_connect,
+            cast::cast_disconnect,
+            cast::cast_load,
+            cast::cast_play,
+            cast::cast_pause,
+            cast::cast_stop,
+            cast::cast_seek,
+            cast::cast_set_volume,
+            cast::cast_status,
             start_login,
             get_cookie_header,
             get_auth_context,
@@ -3017,6 +3824,7 @@ pub fn run() {
             cache_cover,
             cover_cache_stats,
             clear_cover_cache,
+            dominant_accent_color,
             quit_app,
             set_close_behavior,
             autostart_set,
@@ -3028,6 +3836,7 @@ pub fn run() {
             focus_main_window,
             open_player_window,
             close_player_window,
+            set_now_playing,
             media::media_update,
             media::media_clear,
             discord::discord_update,
@@ -3075,13 +3884,14 @@ pub fn run() {
         .setup(move |app| {
             let port = port_handle.clone();
             let token = token_handle.clone();
+            let router = router_handle.clone();
             // User-chosen cache root (Settings → Storage) or the OS
             // default. Captured once and exposed as managed state so
             // every cache-path computation matches the directories the
             // stream server is about to bind — a preference change made
             // later only applies after relaunch.
-            let cache_root = stored_cache_root(app.handle())
-                .unwrap_or_else(|| default_cache_root(app.handle()));
+            let cache_root =
+                stored_cache_root(app.handle()).unwrap_or_else(|| default_cache_root(app.handle()));
             app.manage(ActiveCacheRoot(cache_root.clone()));
             // Retry any scrobbles stranded offline on the previous run. Spawns
             // its own task; a no-op when Last.fm isn't configured or the queue
@@ -3091,6 +3901,12 @@ pub fn run() {
             let ephemeral_dir = cache_root.join("stream-ephemeral");
             let cover_dir = cache_root.join("covers");
             let handle = app.handle().clone();
+            // macOS Now Playing is owned by the WEBVIEW's media session
+            // (navigator.mediaSession in audio-engine.ts). Registering the
+            // native MPNowPlayingInfoCenter/MPRemoteCommandCenter bridge
+            // alongside it put TWO rows in the system widget (a blank
+            // "YTubic" twin above the real track) and double-fired
+            // transport presses, so now_playing::init is no longer called.
             eprintln!("[stream-server] cache dir: {cache_dir:?}");
             eprintln!("[stream-server] ephemeral dir: {ephemeral_dir:?}");
             eprintln!("[stream-server] cover dir: {cover_dir:?}");
@@ -3102,8 +3918,16 @@ pub fn run() {
                 // email-based dedup before the UI reads the list.
                 dedup_accounts_by_identity(&handle).await;
                 cleanup_login_artifacts(&handle).await;
-                start_stream_server(port, token, cache_dir, ephemeral_dir, cover_dir, ytdlp_bin)
-                    .await;
+                start_stream_server(
+                    port,
+                    token,
+                    router,
+                    cache_dir,
+                    ephemeral_dir,
+                    cover_dir,
+                    ytdlp_bin,
+                )
+                .await;
             });
             // Keep the active account's replayed cookie snapshot fresh.
             // Google leashes *extracted* cookies to ~2h; reloading the
@@ -3132,13 +3956,32 @@ pub fn run() {
                     tokio::time::sleep(Duration::from_secs(20 * 60)).await;
                 }
             });
-            // OS media controls (the Windows SMTC tile in Quick Settings / the
-            // volume flyout, plus the hardware media keys). setup() runs on the
-            // main thread, which souvlaki requires and where the main window's
-            // HWND is available.
+            // Native media controls: the SMTC tile on Windows (Quick Settings /
+            // volume flyout) and MPRIS on Linux, plus the hardware media keys.
+            // setup() runs on the main thread, which souvlaki requires and where
+            // the main window's HWND is available.
+            // macOS is deliberately excluded: it has its own
+            // MPRemoteCommandCenter bridge (now_playing.rs), and letting both
+            // register would fight over the system Now Playing entry.
+            // media_update/media_clear no-op when init never ran (CONTROLS
+            // stays None).
+            #[cfg(any(windows, target_os = "linux"))]
             media::init(app.handle());
             if let Err(e) = build_tray(app.handle()) {
                 eprintln!("[tray] build failed: {e}");
+            }
+
+            // WebKitGTK disables smooth (kinetic) scrolling by default, so
+            // wheel scrolling otherwise jumps in coarse steps on Linux.
+            #[cfg(target_os = "linux")]
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.with_webview(|webview| {
+                    use webkit2gtk::{SettingsExt, WebViewExt};
+                    let wv = webview.inner();
+                    if let Some(settings) = WebViewExt::settings(&wv) {
+                        settings.set_enable_smooth_scrolling(true);
+                    }
+                });
             }
             // Debug builds swap the taskbar/window icon to the orange
             // dev variant (see runtime_icon) so a dev instance is
@@ -3149,8 +3992,17 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, _event| {
+            // The native red button follows our close-to-menu-bar setting and
+            // may hide the only window. A later Dock click emits Reopen; show
+            // the window again so the running app never appears unresponsive.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = _event {
+                show_main_window(_app);
+            }
+        });
 }
 
 #[cfg(test)]
@@ -3190,11 +4042,7 @@ mod tests {
             };
 
             assert_eq!(
-                status(
-                    "/deadbeefdeadbeefdeadbeefdeadbeef/ping",
-                    app.clone()
-                )
-                .await,
+                status("/deadbeefdeadbeefdeadbeefdeadbeef/ping", app.clone()).await,
                 StatusCode::OK,
                 "correct token reaches the handler"
             );
@@ -3232,14 +4080,18 @@ mod tests {
         assert!(changed && dirty);
         assert!(out.contains("SIDCC\tnew-sidcc"));
         assert!(!out.contains("old-sidcc"));
-        assert!(out.contains("SAPISID\told-sapisid"), "untouched cookie survives");
+        assert!(
+            out.contains("SAPISID\told-sapisid"),
+            "untouched cookie survives"
+        );
     }
 
     #[test]
     fn merge_inserts_new_cookie_with_domain() {
-        let lines =
-            vec!["LOGIN_INFO=abc; Domain=.youtube.com; Path=/; Secure; HttpOnly; Max-Age=63072000"
-                .to_string()];
+        let lines = vec![
+            "LOGIN_INFO=abc; Domain=.youtube.com; Path=/; Secure; HttpOnly; Max-Age=63072000"
+                .to_string(),
+        ];
         let (out, changed, _) = merge_set_cookies_into_jar(&jar(), &lines, HOST, NOW);
         assert!(changed);
         assert!(out.contains(".youtube.com\tTRUE\t/\tTRUE\t1763072000\tLOGIN_INFO\tabc"));

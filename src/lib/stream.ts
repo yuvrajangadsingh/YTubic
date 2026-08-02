@@ -1,3 +1,4 @@
+import { artistLineFromSubtitle } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
 import { isPremium } from "@/lib/store/premium";
 import type { QueueTrack } from "@/lib/store/playback";
@@ -39,13 +40,49 @@ export function getStreamBaseUrl(): Promise<string> {
   return baseUrlPromise;
 }
 
-function ephemeralSuffix(): string {
-  return isPremium() ? "" : "?ephemeral=1";
+export async function streamUrlFor(
+  videoId: string,
+  opts?: {
+    /** Ask the server for the progressive music-video file (`?video=1`)
+     *  instead of the audio-only download. 360p ceiling; kept as the
+     *  companion fallback. */
+    video?: boolean;
+    /** Ask for the high-res video-only DASH track (`?vonly=1`), played
+     *  muted beside the audio master by the companion surface. */
+    vonly?: boolean;
+    /** Height cap for the vonly track (1080/720/480/360). Server
+     *  defaults to 1080 when omitted. */
+    vonlyHeight?: number;
+  },
+): Promise<string> {
+  const base = await getStreamBaseUrl();
+  const params = new URLSearchParams();
+  if (!isPremium()) params.set("ephemeral", "1");
+  if (opts?.vonly) {
+    params.set("vonly", "1");
+    if (opts.vonlyHeight) params.set("h", String(opts.vonlyHeight));
+  }
+  else if (opts?.video) params.set("video", "1");
+  const qs = params.toString();
+  return `${base}/stream/${encodeURIComponent(videoId)}${qs ? `?${qs}` : ""}`;
 }
 
-export async function streamUrlFor(videoId: string): Promise<string> {
-  const base = await getStreamBaseUrl();
-  return `${base}/stream/${encodeURIComponent(videoId)}${ephemeralSuffix()}`;
+/**
+ * Same stream, addressed so a Chromecast can actually fetch it. The normal
+ * base URL is loopback, which is fine for the webview and useless to a TV on
+ * the other side of the room — it has to pull the bytes itself. The Rust side
+ * brings a second listener up on the LAN only while a cast session is live,
+ * behind the same unguessable token, so this is the one place that asks for it.
+ *
+ * Deliberately not memoized like `getStreamBaseUrl`: the LAN listener comes and
+ * goes with the session, so a cached base would go stale on reconnect.
+ */
+export async function castUrlFor(videoId: string): Promise<string> {
+  const base = await invoke<string>("stream_lan_base_url");
+  const params = new URLSearchParams();
+  if (!isPremium()) params.set("ephemeral", "1");
+  const qs = params.toString();
+  return `${base}/stream/${encodeURIComponent(videoId)}${qs ? `?${qs}` : ""}`;
 }
 
 const prefetched = new Set<string>();
@@ -102,7 +139,9 @@ export async function saveTrackMeta(
   if (metaWritten.has(videoId)) return;
   metaWritten.add(videoId);
   const artist =
-    track.artists?.map((a) => a.name).join(", ") || track.subtitle || null;
+    track.artists?.map((a) => a.name).join(", ") ||
+    artistLineFromSubtitle(track.subtitle) ||
+    null;
   try {
     await invoke("set_cache_meta", { videoId, title: track.title, artist });
   } catch {

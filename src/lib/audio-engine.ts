@@ -1,37 +1,94 @@
-import { useEffect, useRef, useState } from "react";
+import { artistLineFromSubtitle } from "@/lib/utils";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { fetchRadio } from "@/lib/innertube/radio";
+import { fetchRadio, fetchWatchQueueContinuation } from "@/lib/innertube/radio";
 import { prefetchStream, saveTrackMeta, streamUrlFor } from "@/lib/stream";
 import { usePlaybackStore, type QueueTrack } from "@/lib/store/playback";
+import { isCasting, useCastStore } from "@/lib/store/cast";
 import { usePremiumStore } from "@/lib/store/premium";
 import { useSettingsStore } from "@/lib/store/settings";
 import { openPremiumGate } from "@/lib/store/premium-gate";
 import {
   resolveStreamId,
   useTrackSourceStore,
+  wantsVideoStream,
 } from "@/lib/store/track-source";
+import { findCleanAudioAlternate } from "@/lib/innertube/alternate-source";
+import { fetchPanelDuration } from "@/lib/innertube/radio";
 import { pickThumbnail } from "@/components/shared/thumbnail";
+import { useLyricsSources } from "@/lib/lyrics/sources";
+import { correctedDuration, shouldSkipOutro } from "@/lib/outro";
 
 /**
- * AudioEngine binds the playback store to a singleton HTMLAudioElement
- * and drives the OS media controls (Windows SMTC) from Rust via souvlaki (see
- * the media effects below and src-tauri/src/media.rs) rather than the webview's
- * own media session — that one runs in the WebView2 child process and shows up
- * as "Unknown app" in the Windows Now Playing tile.
+ * AudioEngine binds the playback store to a singleton HTMLAudioElement and
+ * drives native media controls from Rust via souvlaki (SMTC, MPRIS, and macOS
+ * Now Playing; see src-tauri/src/media.rs). The webview media session stays
+ * disabled on Windows because it belongs to WebView2 and appears as an
+ * "Unknown app" duplicate.
  *
  * Mount this hook once, near the root. It owns the <audio> element's lifecycle.
  */
+// The engine's singleton element, exposed so the fullscreen player can
+// adopt it as a visible surface when the current stream is a video file.
+let mediaElSingleton: HTMLVideoElement | null = null;
+export function getMediaElement(): HTMLVideoElement | null {
+  return mediaElSingleton;
+}
+
+// Muted companion element that carries the high-res VIDEO-ONLY stream
+// while the singleton above stays the audio master. YouTube stopped
+// serving progressive (muxed) files above 360p and we don't ship
+// ffmpeg to merge tracks, so "video mode" plays the audio variant for
+// sound and drift-syncs these frames to it. Created on first use,
+// torn down (src dropped) whenever the current track isn't in video
+// mode.
+let companionVideoSingleton: HTMLVideoElement | null = null;
+/** The element a VideoSurface should adopt: the companion when video
+ *  mode is active, else the master (which still carries frames for the
+ *  legacy muxed fallback). */
+export function getVideoSurfaceElement(): HTMLVideoElement | null {
+  return companionVideoSingleton ?? mediaElSingleton;
+}
+
 export function useAudioEngine() {
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioRef = useRef<HTMLVideoElement | null>(null);
   // Guard against stale stream resolutions when the user skips mid-fetch.
   const resolveTokenRef = useRef(0);
+  // Position continuity across same-track reloads (song<->video source
+  // flips, error retries): the resolve effect re-runs and drops the src,
+  // so the playhead would reset to 0. When the LOGICAL track (videoId +
+  // queue index) is unchanged between runs, the position is captured
+  // here and re-applied once the new stream's metadata is in. Track
+  // changes and same-id duplicates at another queue index don't carry.
+  const prevResolveKeyRef = useRef<{
+    videoId?: string;
+    index: number;
+    premiumOk: boolean;
+  } | null>(null);
+  const carrySeekRef = useRef<{ token: number; seconds: number } | null>(null);
   // Counts how many tracks have failed in a row without a successful
   // play in between. Reset to 0 on `playing`. Used to short-circuit
   // auto-skip after a few consecutive failures so we don't burn through
   // the whole queue if e.g. the network is dead.
   const consecutiveErrorsRef = useRef(0);
+  // videoIds we've already run an audio-hunt for, so the same track doesn't
+  // re-trigger a search on every re-render or seek.
+  const huntedRef = useRef<Set<string>>(new Set());
+  // Long-outro auto-advance bookkeeping: the last sung line's timestamp
+  // for the current track, the videoId we already advanced past (never
+  // twice), and the videoId whose outro the user deliberately seeked
+  // into (respect that — they want to hear it).
+  const lastVocalRef = useRef<number | null>(null);
+  // Raw element-reported duration (pre-correction) so the end guard can
+  // recognise the doubled-header case even after the store was clamped.
+  const rawElDurationRef = useRef(0);
+  // corrected-end advance latch; re-armed when the playhead returns
+  // before the corrected end (see onTimeUpdate)
+  const endGuardFiredRef = useRef<boolean>(false);
+  const outroSkippedRef = useRef<string | null>(null);
+  const outroSuppressedRef = useRef<string | null>(null);
   // Remembers the `videoId:index` we've already auto-retried once, so a
   // track that keeps failing falls through to the normal error/skip path
   // instead of looping. Cleared on a successful `playing`.
@@ -41,18 +98,81 @@ export function useAudioEngine() {
   // stream URL after a transient failure (e.g. a googlevideo 403).
   const [retryNonce, setRetryNonce] = useState(0);
 
-  // Ensure a single <audio> element exists.
+  // Video-mode startup hold: audio and frames start TOGETHER (YouTube
+  // semantics) instead of audio leading by however long the vonly
+  // download takes. Generation-keyed by the resolve token so duplicate
+  // ids, retries, and stale listeners can't release someone else's
+  // hold. Every route to el.play() must respect it.
+  const videoHoldRef = useRef<{
+    token: number;
+    audioReady: boolean;
+    videoReady: boolean;
+    timer: number;
+    // Carried playhead for a same-track reload: the companion must be
+    // seeked here and ready HERE (not at 0) before the held start
+    // releases, or the audio leads while the video buffers its target.
+    targetSeconds?: number;
+  } | null>(null);
+  const maybeStartHeld = () => {
+    const el = audioRef.current;
+    const h = videoHoldRef.current;
+    if (!el || !h || !h.audioReady || !h.videoReady) return;
+    window.clearTimeout(h.timer);
+    videoHoldRef.current = null;
+    const st = usePlaybackStore.getState();
+    st.setVideoStartup("ready");
+    const comp = companionVideoSingleton;
+    if (comp && Number.isFinite(el.currentTime)) {
+      comp.currentTime = el.currentTime;
+    }
+    // `playing` is the user's intent recorded during the hold; only a
+    // still-true intent becomes actual playback. Both play() calls in
+    // one task keeps the AV start close enough for the drift sync.
+    if (st.playing) {
+      void el.play().catch(() => {});
+      if (comp) void comp.play().catch(() => {});
+    }
+  };
+  /** Abandon the hold and continue audio-only (timeout / error / mode
+   *  off). Detaches the companion so a late loadeddata can't resurrect
+   *  the video mid-song at the wrong time. */
+  const fallbackHeld = (startup: "fallback" | "idle") => {
+    const el = audioRef.current;
+    const h = videoHoldRef.current;
+    if (!h) return;
+    window.clearTimeout(h.timer);
+    videoHoldRef.current = null;
+    const st = usePlaybackStore.getState();
+    st.setVideoStartup(startup);
+    st.setStreamKind("audio");
+    const comp = companionVideoSingleton;
+    if (comp) {
+      comp.removeAttribute("src");
+      comp.load();
+    }
+    if (el && st.playing) void el.play().catch(() => {});
+  };
+
+  // Ensure a single media element exists. It's a <video> element, not
+  // new Audio(): for audio-only streams the two behave identically, but
+  // when the user switches a track to its video source the same element
+  // carries the picture and the fullscreen player adopts it as a live
+  // surface (getMediaElement above).
   useEffect(() => {
     if (audioRef.current) return;
-    const el = new Audio();
+    const el = document.createElement("video");
     el.preload = "auto";
+    el.playsInline = true;
     // Note: do NOT set crossOrigin — googlevideo.com doesn't return CORS
     // headers, and setting it makes the media fail to load in the webview.
     audioRef.current = el;
+    mediaElSingleton = el;
     return () => {
       el.pause();
       el.src = "";
+      el.remove();
       audioRef.current = null;
+      mediaElSingleton = null;
     };
   }, []);
 
@@ -64,14 +184,92 @@ export function useAudioEngine() {
 
     const onTimeUpdate = () => {
       store().setPosition(el.currentTime);
+      // End-guard for the double-length m4a header bug: correctedDuration
+      // shows the LISTED length while the element claims ~2x (phantom
+      // silent second half). Displaying the truth isn't enough — playback
+      // must also END at the truth, or the clock runs past the bar into
+      // silence. The latch re-arms whenever the playhead is back before
+      // the corrected end (repeat-one seeks to 0, manual seeks back,
+      // fresh sources), so replays of the SAME src advance correctly too.
+      const cur = store();
+      const raw = rawElDurationRef.current;
+      const doubled =
+        cur.duration > 0 &&
+        raw > 0 &&
+        raw / cur.duration > 1.8 &&
+        raw / cur.duration < 2.2;
+      if (doubled && el.currentTime < cur.duration - 1) {
+        endGuardFiredRef.current = false;
+      }
+      if (
+        doubled &&
+        el.currentTime >= cur.duration - 0.05 &&
+        !endGuardFiredRef.current
+      ) {
+        endGuardFiredRef.current = true;
+        // Rewind the element first: at the end of the queue (repeat off)
+        // next() only stops — without this the element would sit parked
+        // in the phantom zone and a later Play would resume silence.
+        el.pause();
+        el.currentTime = 0;
+        cur.next();
+      }
     };
     const onDurationChange = () => {
       if (Number.isFinite(el.duration) && el.duration > 0) {
-        store().setDuration(el.duration);
+        rawElDurationRef.current = el.duration;
+        const cur = store();
+        const meta =
+          cur.index >= 0 ? cur.queue[cur.index]?.duration : undefined;
+        cur.setDuration(correctedDuration(meta, el.duration));
+      } else if (el.duration === Infinity) {
+        // Streaming containers (progressively served webm) report
+        // Infinity until fully buffered, which left the bar showing the
+        // LISTED length while the real file ran longer, so the bar pinned
+        // at full with audio still playing. The seekable range end is
+        // the truth the server actually has; it grows monotonically to
+        // the real length as the download completes.
+        syncSeekableDuration();
       }
     };
+    const syncSeekableDuration = () => {
+      if (el.duration !== Infinity || el.seekable.length === 0) return;
+      const end = el.seekable.end(el.seekable.length - 1);
+      if (!Number.isFinite(end) || end <= 0) return;
+      const cur = store();
+      if (end > cur.duration + 0.5) {
+        rawElDurationRef.current = end;
+        const meta =
+          cur.index >= 0 ? cur.queue[cur.index]?.duration : undefined;
+        cur.setDuration(correctedDuration(meta, end));
+      }
+    };
+    const onProgress = () => syncSeekableDuration();
     const onEnded = () => {
       store().next();
+    };
+    // External pause/play — the system Now Playing widget or WebKit's
+    // built-in media session can pause the element directly, bypassing
+    // the store, which left the UI showing a stale playing state. Sync
+    // the element's actual state back. Track changes pause the element
+    // too, but by the time the queued pause event runs the status is
+    // already "loading", so the ready-guard keeps auto-play intact.
+    // While casting these are noise: the element is deliberately paused and
+    // the receiver is what `playing` describes. Letting the local pause event
+    // through would immediately contradict every status that says playing.
+    const onElPause = () => {
+      const s = store();
+      if (isCasting()) return;
+      if (s.status === "ready" && s.playing && !el.ended) {
+        s.setPlaying(false);
+      }
+    };
+    const onElPlay = () => {
+      const s = store();
+      if (isCasting()) return;
+      if (s.status === "ready" && !s.playing) {
+        s.setPlaying(true);
+      }
     };
     const onError = () => {
       const mediaErr = el.error;
@@ -86,6 +284,32 @@ export function useAudioEngine() {
             mediaErr.message ? `: ${mediaErr.message}` : ""
           }`
         : "Unknown audio error";
+
+      // A music-video stream the webview can't decode (MEDIA_ERR_DECODE /
+      // MEDIA_ERR_SRC_NOT_SUPPORTED) shouldn't surface a raw error banner
+      // or skip the track. While the video source is the selected one,
+      // drop it back to audio and let the resolve effect retry with the
+      // song stream, which every track has. The selected-source check
+      // keeps this from looping: once we're on audio a repeat failure
+      // falls through to the normal error path below.
+      const errored = store();
+      const cur =
+        errored.index >= 0 ? errored.queue[errored.index] : undefined;
+      if (cur && (mediaErr?.code === 3 || mediaErr?.code === 4)) {
+        const ts = useTrackSourceStore.getState();
+        const selected = ts.byVideoId[cur.videoId]?.selected ?? "song";
+        if (selected === "video") {
+          if (import.meta.env.DEV) {
+            console.warn(
+              "[audio] video stream failed to decode, falling back to audio:",
+              cur.videoId,
+            );
+          }
+          ts.setSelected(cur.videoId, "song");
+          return;
+        }
+      }
+
       if (import.meta.env.DEV) {
         console.error("[audio] element error:", msg, "src=", el.currentSrc);
       }
@@ -141,14 +365,20 @@ export function useAudioEngine() {
 
     el.addEventListener("timeupdate", onTimeUpdate);
     el.addEventListener("durationchange", onDurationChange);
+    el.addEventListener("progress", onProgress);
     el.addEventListener("ended", onEnded);
+    el.addEventListener("pause", onElPause);
+    el.addEventListener("play", onElPlay);
     el.addEventListener("error", onError);
     el.addEventListener("playing", onPlaying);
     el.addEventListener("waiting", onWaiting);
     return () => {
       el.removeEventListener("timeupdate", onTimeUpdate);
       el.removeEventListener("durationchange", onDurationChange);
+      el.removeEventListener("progress", onProgress);
       el.removeEventListener("ended", onEnded);
+      el.removeEventListener("pause", onElPause);
+      el.removeEventListener("play", onElPlay);
       el.removeEventListener("error", onError);
       el.removeEventListener("playing", onPlaying);
       el.removeEventListener("waiting", onWaiting);
@@ -171,6 +401,51 @@ export function useAudioEngine() {
     videoId ? resolveStreamId(videoId, s.byVideoId) : undefined,
   );
 
+  // True only when the user explicitly switched this track to its video
+  // source — then the stream request carries ?video=1 and the element
+  // has real frames to show.
+  const wantVideo = useTrackSourceStore((s) =>
+    videoId ? wantsVideoStream(videoId, s.byVideoId) : false,
+  );
+
+  // Tracks queued from surfaces without a length (home cards) carry no
+  // duration, which leaves the doubled-header clamp with no reference —
+  // a 2x file then displays and scrubs at twice its real length. Fetch
+  // the authoritative length from the track's own /next row once and
+  // patch the queue entry; the re-clamp effect below applies it.
+  useEffect(() => {
+    if (!videoId) return;
+    const cur = usePlaybackStore.getState();
+    const track = cur.index >= 0 ? cur.queue[cur.index] : undefined;
+    if (!track || track.videoId !== videoId || track.duration) return;
+    let cancelled = false;
+    fetchPanelDuration(videoId)
+      .then((secs) => {
+        if (cancelled || !secs) return;
+        usePlaybackStore.getState().patchTrackDuration(videoId, secs);
+      })
+      .catch(() => {
+        /* metadata nicety only — the element duration stays */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [videoId]);
+
+  // Re-apply the header clamp when the metadata length lands AFTER the
+  // element already reported durationchange (the late-fetch above).
+  const liveMetaDuration = usePlaybackStore((s) =>
+    s.index >= 0 ? s.queue[s.index]?.duration : undefined,
+  );
+  useEffect(() => {
+    if (!liveMetaDuration || !rawElDurationRef.current) return;
+    usePlaybackStore
+      .getState()
+      .setDuration(
+        correctedDuration(liveMetaDuration, rawElDurationRef.current),
+      );
+  }, [liveMetaDuration]);
+
   // Reactive Premium check for the gate below. Subscribing (rather than
   // calling isPremium() inside the effect) makes the resolve effect
   // re-run when the status lands after sign-in / the launch-time probe.
@@ -178,9 +453,104 @@ export function useAudioEngine() {
   // sit silent until the user re-picked it.
   const premiumOk = usePremiumStore((s) => s.status === "premium");
 
+  // Seed the song<->video pairing from InnerTube's own counterpart data
+  // (from a /next `playlistPanelVideoWrapperRenderer`) so the Source
+  // toggle flips to the real other version instead of a fuzzy search that
+  // can land on an unrelated clip. Only when we have a pairing and no
+  // record yet; `selected` lands on whichever kind was queued, so the
+  // default stream doesn't change and no wasteful re-resolve fires.
+  const counterpartId = track?.counterpartId;
+  const trackKind = track?.kind;
+  useEffect(() => {
+    if (!videoId || !counterpartId || !trackKind) return;
+    const ts = useTrackSourceStore.getState();
+    if (ts.byVideoId[videoId]) return;
+    const counterpartKind = trackKind === "video" ? "song" : "video";
+    ts.setAlternate(videoId, counterpartKind, counterpartId);
+  }, [videoId, counterpartId, trackKind]);
+
+  // Auto-hunt the clean album ("song") version of whatever was queued.
+  // Originally this only rescued kind==="video" rows, but extended/looped
+  // re-uploads also surface as ordinary song rows (a 7:45 "(Remix)" that
+  // keeps rolling minutes after the actual song ends), so it now fires for
+  // any kind and leans on findCleanAudioAlternate's guarantees instead:
+  // artists must exist (a bare title is not identity — a wrong swap here
+  // changes what's PLAYING, worse than wrong lyrics), the found title has
+  // to match, and the duration gate only ever swaps to a meaningfully
+  // shorter album version (or a near-equal one for true video rows).
+  // Fires once per id; /next counterpart data (handled above) and manual
+  // Song/Video choices both take precedence.
+  const huntTitle = track?.title;
+  useEffect(() => {
+    // Video rows only. The kind-agnostic expansion was chasing what
+    // turned out to be the doubled-header bug (see correctedDuration) —
+    // and for a normal song row an aggressively shorter "match" is a
+    // sped-up bootleg, not a cleaner version.
+    if (!videoId || trackKind !== "video") return;
+    if (huntedRef.current.has(videoId)) return;
+    const ts = useTrackSourceStore.getState();
+    // A record alone doesn't mean "leave it alone": the counterpart
+    // seeding above creates one for every popular song (song = the row
+    // itself + its music video), which used to block the hunt exactly
+    // where it's most needed. Only back off when the song side already
+    // points elsewhere (a previous hunt or manual pick) or the user
+    // explicitly selected the video source.
+    const rec = ts.byVideoId[videoId];
+    if (rec && (rec.song !== videoId || rec.selected === "video")) return;
+    huntedRef.current.add(videoId);
+    const s = usePlaybackStore.getState();
+    const cur = s.index >= 0 ? s.queue[s.index] : undefined;
+    if (!cur || cur.videoId !== videoId) return;
+    void findCleanAudioAlternate({
+      videoId,
+      title: cur.title,
+      artists: cur.artists,
+      kind: cur.kind,
+      duration: cur.duration,
+    })
+      .then((altId) => {
+        if (!altId) return;
+        // Bail if a manual choice or /next pairing landed while we searched.
+        const now = useTrackSourceStore.getState();
+        if (now.byVideoId[videoId]) return;
+        now.setAlternate(videoId, "song", altId);
+        now.setSelected(videoId, "song");
+      })
+      .catch(() => {
+        /* stay on the queued source; a later manual switch still works */
+      });
+  }, [videoId, trackKind, huntTitle]);
+
   useEffect(() => {
     const el = audioRef.current;
     if (!el) return;
+    // Same logical track re-resolving (source flip / retry)? Grab the
+    // playhead before anything below can destroy it. A premium-state
+    // change re-resolves too but is a gating event, not a continuity
+    // request, so it breaks the carry.
+    const prevKey = prevResolveKeyRef.current;
+    const sameTrack =
+      !!prevKey &&
+      prevKey.videoId === videoId &&
+      prevKey.index === index &&
+      prevKey.premiumOk === premiumOk;
+    const posBefore = el.currentTime;
+    prevResolveKeyRef.current = { videoId, index, premiumOk };
+    // Invalidate in-flight resolutions of ANY earlier run before the
+    // early returns below: without this, gating (premium loss, empty
+    // queue) leaves the previous token live and a stale streamUrlFor()
+    // promise can land afterwards and reinstall its src.
+    const token = ++resolveTokenRef.current;
+    // Only a same-track reload with a live playhead captures fresh; a
+    // rapid double flip re-runs while the playhead is still 0 (the
+    // first reload reset it), so an existing same-track carry is
+    // retagged to the new generation instead of being dropped.
+    carrySeekRef.current =
+      sameTrack && posBefore > 0.5
+        ? { token, seconds: posBefore }
+        : sameTrack && carrySeekRef.current
+          ? { token, seconds: carrySeekRef.current.seconds }
+          : null;
     // Stop the previous track immediately. Without this the old src keeps
     // playing through the streamUrlFor() round-trip (~50–500 ms), so the
     // user hears the tail of track A bleed into the start of track B.
@@ -188,7 +558,9 @@ export function useAudioEngine() {
     if (!streamVideoId) {
       el.removeAttribute("src");
       el.load();
-      usePlaybackStore.getState().setStreamUrl(undefined);
+      const store = usePlaybackStore.getState();
+      store.setStreamUrl(undefined);
+      store.setStreamKind("audio");
       return;
     }
     // Premium gate: signed-out / Free accounts browse but don't stream.
@@ -203,6 +575,7 @@ export function useAudioEngine() {
       el.load();
       const store = usePlaybackStore.getState();
       store.setStreamUrl(undefined);
+      store.setStreamKind("audio");
       store.setStatus("idle");
       if (store.playing) {
         store.setPlaying(false);
@@ -215,9 +588,45 @@ export function useAudioEngine() {
     // playing: true) makes the [playing] effect below re-play the OLD src
     // for the duration of the streamUrlFor() round-trip.
     el.removeAttribute("src");
+    // streamKind is only promoted to "video" after a resolve SUCCEEDS,
+    // so reset it at the same moment the src drops. Otherwise a video
+    // surface keeps rendering the previous track's last frame through
+    // the loading gap (or forever, when resolution fails).
+    usePlaybackStore.getState().setStreamKind("audio");
 
-    const token = ++resolveTokenRef.current;
     usePlaybackStore.getState().setStatus("loading");
+
+    // Establish the startup hold NOW (not in the async .then) so the
+    // companion becoming ready first still finds it. Staged timeout:
+    // cold 4K legitimately takes ~15s, 1080p should never.
+    if (videoHoldRef.current) {
+      window.clearTimeout(videoHoldRef.current.timer);
+      videoHoldRef.current = null;
+    }
+    if (wantVideo) {
+      const cap = useSettingsStore.getState().videoQuality;
+      const timer = window.setTimeout(
+        () => {
+          const h = videoHoldRef.current;
+          if (!h || h.token !== token) return;
+          fallbackHeld("fallback");
+        },
+        cap > 1080 ? 20_000 : 12_000,
+      );
+      videoHoldRef.current = {
+        token,
+        audioReady: false,
+        videoReady: false,
+        timer,
+        targetSeconds:
+          carrySeekRef.current?.token === token
+            ? carrySeekRef.current.seconds
+            : undefined,
+      };
+      usePlaybackStore.getState().setVideoStartup("waiting");
+    } else {
+      usePlaybackStore.getState().setVideoStartup("idle");
+    }
 
     // Persist this track's title/artist beside its cache file so the
     // Storage tab can name it without depending on the library walk.
@@ -231,10 +640,14 @@ export function useAudioEngine() {
       );
     }
 
-    // Playback goes through our local streaming HTTP server. It spawns
-    // yt-dlp and pipes the audio bytes progressively so playback starts
-    // as soon as the first chunk lands (typically ~200ms after the
-    // yt-dlp subprocess starts emitting bytes).
+    // Playback goes through the local cache server: yt-dlp downloads
+    // the file and the server serves it with Range support, so a
+    // metadata-time seek (position carry below) is an ordinary range
+    // request, not a stall.
+    // Master always plays the AUDIO variant, even in video mode: the
+    // companion element (effect below) carries the picture. streamKind
+    // is promoted to "video" only when the companion actually has
+    // frames, so the reset-on-src-drop above stays authoritative.
     streamUrlFor(streamVideoId)
       .then((src) => {
         if (token !== resolveTokenRef.current) return;
@@ -242,8 +655,51 @@ export function useAudioEngine() {
           console.debug("[audio] setting src for", videoId, "→", src);
         }
         el.src = src;
-        usePlaybackStore.getState().setStreamUrl(src);
+        const st = usePlaybackStore.getState();
+        st.setStreamUrl(src);
+        const carry = carrySeekRef.current;
+        if (carry && carry.token === token) {
+          el.addEventListener(
+            "loadedmetadata",
+            () => {
+              const c = carrySeekRef.current;
+              if (!c || c.token !== token) return;
+              carrySeekRef.current = null;
+              if (token !== resolveTokenRef.current) return;
+              // The two cuts can differ in length (MV intros/outros):
+              // clamp into the new cut instead of restarting, a
+              // near-the-end toggle restarting at 0 would look exactly
+              // like the bug this exists to fix.
+              const dur = Number.isFinite(el.duration)
+                ? el.duration
+                : undefined;
+              const target =
+                dur && dur > 1 ? Math.min(c.seconds, dur - 1) : c.seconds;
+              try {
+                el.currentTime = target;
+              } catch {
+                /* seek failed — plays from 0, non-fatal */
+              }
+            },
+            { once: true },
+          );
+        }
         el.load();
+        const hold = videoHoldRef.current;
+        if (hold && hold.token === token) {
+          el.addEventListener(
+            "canplay",
+            () => {
+              const h = videoHoldRef.current;
+              if (h && h.token === token) {
+                h.audioReady = true;
+                maybeStartHeld();
+              }
+            },
+            { once: true },
+          );
+          return;
+        }
         if (usePlaybackStore.getState().playing) {
           void el.play().catch((e) => {
             // AbortError is what we get when a pending play() is
@@ -275,13 +731,237 @@ export function useAudioEngine() {
     // (sign-in, status re-check) re-resolves a track the gate parked.
     // `retryNonce` so the error handler can force a fresh stream-URL fetch
     // for the current track after a transient failure without changing id.
-  }, [streamVideoId, videoId, index, premiumOk, retryNonce]);
+  }, [streamVideoId, wantVideo, videoId, index, premiumOk, retryNonce]);
+
+  // Companion video: when the user picked the video version, stream the
+  // high-res video-only DASH track into a muted element and keep it
+  // glued to the audio master's clock. Frames come from the companion,
+  // sound and all engine logic (duration correction, outro advance,
+  // media keys) stay on the master. Drift is trimmed continuously with
+  // a playbackRate nudge and snapped when it exceeds SNAP_S (seeks,
+  // decoder stalls).
+  useEffect(() => {
+    const master = audioRef.current;
+    if (!master) return;
+    if (!wantVideo || !streamVideoId || !premiumOk) return;
+    let cancelled = false;
+    let comp = companionVideoSingleton;
+    if (!comp) {
+      comp = document.createElement("video");
+      comp.muted = true;
+      comp.playsInline = true;
+      comp.preload = "auto";
+      companionVideoSingleton = comp;
+    }
+    const video = comp;
+
+    const SNAP_S = 0.3;
+    const syncNow = () => {
+      if (Number.isFinite(master.currentTime)) {
+        video.currentTime = master.currentTime;
+      }
+    };
+    const follow = () => {
+      if (master.paused) {
+        video.pause();
+      } else if (video.src) {
+        void video.play().catch(() => {});
+      }
+    };
+    const onLoaded = () => {
+      if (cancelled) return;
+      const st = usePlaybackStore.getState();
+      st.setStreamKind("video");
+      st.setStreamVideoHeight(video.videoHeight || null);
+      const h = videoHoldRef.current;
+      if (h) {
+        // Carried start: frames-at-0 are the wrong frames. Seek to the
+        // carried target and count the companion ready only once it can
+        // play THERE, else the held release lets audio lead while the
+        // video buffers its way to the target. Identity-checked (h)
+        // so a stale canplay can't release a later generation's hold.
+        if (h.targetSeconds !== undefined) {
+          const onReadyAtTarget = () => {
+            if (cancelled || videoHoldRef.current !== h) return;
+            h.videoReady = true;
+            maybeStartHeld();
+          };
+          video.addEventListener("canplay", onReadyAtTarget, { once: true });
+          try {
+            video.currentTime = h.targetSeconds;
+          } catch {
+            video.removeEventListener("canplay", onReadyAtTarget);
+            h.videoReady = true;
+            maybeStartHeld();
+          }
+          return;
+        }
+        h.videoReady = true;
+        maybeStartHeld();
+        return;
+      }
+      syncNow();
+      follow();
+    };
+    const onError = () => {
+      if (cancelled) return;
+      // No high-res track (or it failed to decode): continue audio-only
+      // so the surfaces keep showing artwork instead of a black box.
+      if (videoHoldRef.current) {
+        fallbackHeld("fallback");
+      } else {
+        usePlaybackStore.getState().setStreamKind("audio");
+      }
+    };
+    const onWaiting = () => {
+      if (!cancelled) usePlaybackStore.getState().setVideoBuffering(true);
+    };
+    const onFlowing = () => {
+      if (!cancelled) usePlaybackStore.getState().setVideoBuffering(false);
+    };
+    video.addEventListener("loadeddata", onLoaded);
+    video.addEventListener("error", onError);
+    video.addEventListener("waiting", onWaiting);
+    video.addEventListener("playing", onFlowing);
+    video.addEventListener("canplay", onFlowing);
+    master.addEventListener("play", follow);
+    master.addEventListener("pause", follow);
+    master.addEventListener("seeked", syncNow);
+    // Continuous drift trim: small offsets are absorbed by a playback-
+    // rate nudge (invisible), anything past SNAP_S snaps. Also re-snaps
+    // after decoder stalls, where the companion silently falls behind.
+    const drift = window.setInterval(() => {
+      if (video.readyState < 2 || master.paused) return;
+      const d = master.currentTime - video.currentTime;
+      if (Math.abs(d) > SNAP_S) {
+        video.currentTime = master.currentTime;
+        video.playbackRate = master.playbackRate;
+      } else {
+        video.playbackRate =
+          master.playbackRate + Math.max(-0.04, Math.min(0.04, d * 0.1));
+      }
+    }, 1000);
+
+    streamUrlFor(streamVideoId, {
+      vonly: true,
+      vonlyHeight: useSettingsStore.getState().videoQuality,
+    })
+      .then((src) => {
+        if (cancelled) return;
+        video.src = src;
+        video.load();
+      })
+      .catch(() => {
+        if (cancelled) return;
+        if (videoHoldRef.current) {
+          fallbackHeld("fallback");
+        } else {
+          usePlaybackStore.getState().setStreamKind("audio");
+        }
+      });
+
+    // Quality changes hot-swap WITHOUT tearing the surface down: a
+    // throwaway element warms the proxy's cache for the new cap first,
+    // and only then the visible element reloads, which the local cache
+    // satisfies near-instantly. Doing this as a plain src swap instead
+    // (or by keying the whole effect on the quality) blanks the video
+    // and resets streamKind, so the player visibly falls back to the
+    // artwork layout for however long the new download takes: exactly
+    // the "video disappeared, audio kept going" report.
+    let switchToken = 0;
+    let warm: HTMLVideoElement | null = null;
+    const switchQuality = async (q: number) => {
+      const token = ++switchToken;
+      try {
+        const src = await streamUrlFor(streamVideoId, {
+          vonly: true,
+          vonlyHeight: q,
+        });
+        if (cancelled || token !== switchToken) return;
+        if (warm) {
+          warm.removeAttribute("src");
+          warm.load();
+        }
+        warm = document.createElement("video");
+        warm.muted = true;
+        warm.preload = "auto";
+        const w = warm;
+        w.addEventListener(
+          "loadeddata",
+          () => {
+            if (cancelled || token !== switchToken) return;
+            video.src = src;
+            video.load();
+            w.removeAttribute("src");
+            w.load();
+            if (warm === w) warm = null;
+          },
+          { once: true },
+        );
+        w.src = src;
+        w.load();
+      } catch {
+        // keep playing at the current quality
+      }
+    };
+    let lastQuality = useSettingsStore.getState().videoQuality;
+    const unsubQuality = useSettingsStore.subscribe((state) => {
+      const q = state.videoQuality;
+      if (q === lastQuality) return;
+      lastQuality = q;
+      void switchQuality(q);
+    });
+
+    return () => {
+      cancelled = true;
+      unsubQuality();
+      if (warm) {
+        warm.removeAttribute("src");
+        warm.load();
+      }
+      window.clearInterval(drift);
+      video.removeEventListener("loadeddata", onLoaded);
+      video.removeEventListener("error", onError);
+      video.removeEventListener("waiting", onWaiting);
+      video.removeEventListener("playing", onFlowing);
+      video.removeEventListener("canplay", onFlowing);
+      master.removeEventListener("play", follow);
+      master.removeEventListener("pause", follow);
+      master.removeEventListener("seeked", syncNow);
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+      const st = usePlaybackStore.getState();
+      st.setStreamKind("audio");
+      st.setStreamVideoHeight(null);
+      st.setVideoBuffering(false);
+      // A pending hold dies with this companion instance, SILENTLY (no
+      // play call: on a track change the old src is still on the master
+      // for a beat and starting it would blip the previous song). The
+      // master resolve effect re-runs right after every cleanup of this
+      // effect and re-establishes hold state for the new inputs.
+      if (videoHoldRef.current) {
+        window.clearTimeout(videoHoldRef.current.timer);
+        videoHoldRef.current = null;
+      }
+    };
+  }, [streamVideoId, wantVideo, premiumOk, retryNonce]);
 
   // Play / pause follow store.
   const playing = usePlaybackStore((s) => s.playing);
+  const casting = useCastStore((s) => s.deviceId !== null);
   useEffect(() => {
     const el = audioRef.current;
     if (!el) return;
+    if (casting) {
+      // The receiver pulls the same stream for itself, so anything playing
+      // here is a second copy of the track a few hundred ms out of phase.
+      // Pause rather than mute: a muted element still holds the audio
+      // session, which would leave the system Now Playing entry pointing at
+      // a track this machine is not the one playing.
+      el.pause();
+      return;
+    }
     if (playing && !premiumOk) {
       // Resume attempts (play button, Space, SMTC play) on a gated track
       // never reach the resolve effect (its deps don't include
@@ -292,6 +972,10 @@ export function useAudioEngine() {
     }
     if (!el.src) return;
     if (playing) {
+      // Startup hold active: the intent is recorded in `playing` and
+      // maybeStartHeld() acts on it at release. Playing now would leak
+      // audio ahead of the frames.
+      if (videoHoldRef.current) return;
       void el.play().catch((e) => {
         if (e?.name === "AbortError") return;
         usePlaybackStore.getState().setStatus("error", e?.message ?? String(e));
@@ -299,7 +983,7 @@ export function useAudioEngine() {
     } else {
       el.pause();
     }
-  }, [playing, premiumOk]);
+  }, [playing, premiumOk, casting]);
 
   // Volume / mute follow store.
   const volume = usePlaybackStore((s) => s.volume);
@@ -321,32 +1005,90 @@ export function useAudioEngine() {
   useEffect(() => {
     const el = audioRef.current;
     if (!el || pendingSeek === undefined) return;
+    // A deliberate seek while a same-track reload is in flight: the
+    // element still has the OLD (or no) src, so applying it here would
+    // be consumed by the reload and then overwritten by the carried
+    // position at loadedmetadata. Replace the carry (and the hold
+    // target) instead; the metadata listener applies it.
+    const carry = carrySeekRef.current;
+    if (carry && carry.token === resolveTokenRef.current) {
+      carry.seconds = pendingSeek;
+      const h = videoHoldRef.current;
+      if (h && h.token === carry.token) h.targetSeconds = pendingSeek;
+      usePlaybackStore.getState().clearPendingSeek();
+      return;
+    }
     try {
       el.currentTime = pendingSeek;
     } catch {
       /* seek failed — non-fatal */
     }
     usePlaybackStore.getState().clearPendingSeek();
+    // A deliberate seek into the tail means the user wants the outro —
+    // disable the long-outro auto-advance for this track.
+    if (
+      videoId &&
+      ((lastVocalRef.current !== null &&
+        pendingSeek > lastVocalRef.current + 10) ||
+        (() => {
+          const cur =
+            usePlaybackStore.getState().queue[
+              usePlaybackStore.getState().index
+            ];
+          return !!cur?.duration && pendingSeek > cur.duration;
+        })())
+    ) {
+      outroSuppressedRef.current = videoId;
+    }
+    {
+      // Keep the system Now Playing clock in step with the new playhead.
+      const s = usePlaybackStore.getState();
+      const cur = s.index >= 0 ? s.queue[s.index] : undefined;
+      const dur = s.duration > 0 ? s.duration : (cur?.duration ?? 0);
+      applyMediaSessionPosition(pendingSeek, dur);
+    }
     // repeat-one and error auto-advance re-select the same track and set
     // { pendingSeek: 0, playing: true } without changing `playing` (already
     // true), so the [playing] effect never re-fires. After an `ended` event
     // the element is paused, so seeking to 0 alone leaves it silent. Resume
     // here when the store wants playback but the element is paused.
-    if (usePlaybackStore.getState().playing && el.paused && el.src) {
+    if (
+      usePlaybackStore.getState().playing &&
+      el.paused &&
+      el.src &&
+      !videoHoldRef.current
+    ) {
       void el.play().catch((e) => {
         if (e?.name === "AbortError") return;
-        usePlaybackStore
-          .getState()
-          .setStatus("error", e?.message ?? String(e));
+        usePlaybackStore.getState().setStatus("error", e?.message ?? String(e));
       });
     }
   }, [pendingSeek]);
 
-  // OS media controls (Windows SMTC) are driven from Rust via souvlaki, not
+  // OS media controls are driven from Rust via souvlaki, not
   // navigator.mediaSession — the webview's own media session shows up as
   // "Unknown app" because it belongs to the WebView2 child process. Metadata /
   // state is pushed by the media_update effect lower down; buttons come back
   // via the media-control listener. See src-tauri/src/media.rs.
+
+  // macOS Now Playing is owned by the WEBVIEW's media session, not the
+  // native MPNowPlayingInfoCenter path. WebKit surfaces the playing
+  // <audio> element in the system widget on its own, so a native session
+  // alongside it produced two rows (a blank "YTubic" twin above the real
+  // track). We feed navigator.mediaSession full metadata (incl. artwork,
+  // which the native path could never safely provide) and leave the
+  // native session unregistered. Fires on track change and play/pause.
+  const videoStartupPhase = usePlaybackStore((s) => s.videoStartup);
+  useEffect(() => {
+    const s = usePlaybackStore.getState();
+    const dur = s.duration > 0 ? s.duration : (track?.duration ?? 0);
+    // Report ACTUAL playback: while the video-startup hold is pending
+    // the element is paused, and claiming "playing" would make Now
+    // Playing extrapolate a clock that is not moving.
+    const actuallyPlaying = playing && videoStartupPhase !== "waiting";
+    applyMediaSessionMetadata(track, actuallyPlaying);
+    applyMediaSessionPosition(s.position, dur);
+  }, [track, playing, videoStartupPhase]);
 
   // Tray menu commands come via a Tauri event. `cancelled` flag
   // protects against StrictMode's mount→unmount→mount race that
@@ -370,7 +1112,14 @@ export function useAudioEngine() {
     };
   }, []);
 
-  // SMTC / media-key button presses arrive from Rust (souvlaki) as a
+  // (The old MPRemoteCommandCenter bridge is gone: with the webview
+  // session owning macOS Now Playing, its action handlers below receive
+  // the system transport presses. Two registered command targets meant
+  // every press could fire twice.)
+
+
+  // System media-control / media-key button presses (SMTC on Windows, MPRIS
+  // on Linux) arrive from Rust via souvlaki as a
   // `media-control` event. Drive the store the same way the old
   // navigator.mediaSession action handlers did. `cancelled` guards against
   // StrictMode's mount→unmount→mount double-listen, like the tray listener.
@@ -397,7 +1146,8 @@ export function useAudioEngine() {
           store.prev();
           break;
         case "seek":
-          if (typeof e.payload.position === "number") store.seek(e.payload.position);
+          if (typeof e.payload.position === "number")
+            store.seek(e.payload.position);
           break;
       }
     }).then((un) => {
@@ -407,6 +1157,45 @@ export function useAudioEngine() {
     return () => {
       cancelled = true;
       dispose?.();
+    };
+  }, []);
+
+  // System media commands on macOS route through WKWebView's media
+  // session — upstream removed these handlers when souvlaki took over
+  // on Windows, which left the mac widget's buttons acting on the
+  // element directly and desyncing the store. Mac-only: Windows keeps
+  // the souvlaki media-control path.
+  useEffect(() => {
+    if (typeof navigator === "undefined" || !navigator.mediaSession) return;
+    if (!navigator.userAgent.includes("Mac")) return;
+    const api = navigator.mediaSession;
+    const store = usePlaybackStore.getState;
+    // Register each action separately: WebKit throws NotSupportedError for
+    // actions it doesn't implement, and one bad action must not abort the
+    // rest (or the cleanup).
+    const trySet = (
+      action: MediaSessionAction,
+      handler: MediaSessionActionHandler | null,
+    ) => {
+      try {
+        api.setActionHandler(action, handler);
+      } catch {
+        /* unsupported on this WebKit build */
+      }
+    };
+    trySet("play", () => store().setPlaying(true));
+    trySet("pause", () => store().setPlaying(false));
+    trySet("previoustrack", () => store().prev());
+    trySet("nexttrack", () => store().next());
+    trySet("seekto", (details) => {
+      if (typeof details.seekTime === "number") store().seek(details.seekTime);
+    });
+    return () => {
+      trySet("play", null);
+      trySet("pause", null);
+      trySet("previoustrack", null);
+      trySet("nexttrack", null);
+      trySet("seekto", null);
     };
   }, []);
 
@@ -450,13 +1239,54 @@ export function useAudioEngine() {
     useShallow((s) => ({
       qLen: s.queue.length,
       qIndex: s.index,
-      seedVideoId:
-        s.index >= 0 ? s.queue[s.index]?.videoId : undefined,
+      seedVideoId: s.index >= 0 ? s.queue[s.index]?.videoId : undefined,
     })),
   );
+
+  // Drain a pending server-side shuffle continuation: when playback nears
+  // the tail of the queue, pull the next ~50 tracks of the permutation and
+  // append them. Deduped against the queue — once the permutation is
+  // exhausted YTM starts repeating tracks, which is the signal to stop.
+  const queueContinuation = usePlaybackStore((s) => s.queueContinuation);
+  const continuationFetchingRef = useRef(false);
+  useEffect(() => {
+    if (!queueContinuation) return;
+    if (qIndex < 0 || qLen === 0) return;
+    // Only fetch once the playhead is close to the tail, so a freshly
+    // built 50-track queue doesn't immediately drain its whole source.
+    if (qLen - 1 - qIndex > 5) return;
+    if (continuationFetchingRef.current) return;
+    continuationFetchingRef.current = true;
+    const token = queueContinuation;
+    fetchWatchQueueContinuation(token)
+      .then((page) => {
+        const s = usePlaybackStore.getState();
+        // Stale guard: the queue was replaced while the fetch was in flight.
+        if (s.queueContinuation !== token) return;
+        const seen = new Set(s.queue.map((t) => t.videoId));
+        const fresh = page.tracks.filter((t) => !seen.has(t.id));
+        if (fresh.length) s.appendToQueue(fresh);
+        s.setQueueContinuation(
+          fresh.length > 0 ? page.continuationToken : undefined,
+        );
+      })
+      .catch(() => {
+        // Fail open: drop the token so auto-radio (if on) can take over at
+        // the end of the queue instead of wedging on a broken continuation.
+        const s = usePlaybackStore.getState();
+        if (s.queueContinuation === token) s.setQueueContinuation(undefined);
+      })
+      .finally(() => {
+        continuationFetchingRef.current = false;
+      });
+  }, [queueContinuation, qIndex, qLen]);
+
   const radioFetchedForRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (!autoRadio) return;
+    // A pending shuffle continuation owns the tail; radio only takes over
+    // once it's exhausted (the drain effect clears it).
+    if (queueContinuation) return;
     if (qIndex < 0 || !seedVideoId) return;
     // Only fire when the current track is the last queued one.
     if (qIndex < qLen - 1) return;
@@ -477,15 +1307,81 @@ export function useAudioEngine() {
         // Allow a retry on transient failure.
         radioFetchedForRef.current = undefined;
       });
-  }, [autoRadio, qIndex, qLen, seedVideoId]);
+  }, [autoRadio, queueContinuation, qIndex, qLen, seedVideoId]);
 
-  // Push metadata + playback state to the OS media controls (Windows SMTC).
-  // Windows interpolates the scrubber between pushes while the state is
+  // Push metadata + playback state to the OS media controls. Native backends
+  // interpolate the scrubber between pushes while the state is
   // Playing, so we don't push on every timeupdate — just on track / play-state
   // / duration change, plus a light 2s refresh while playing to correct drift
   // and reflect seeks. Live values are read imperatively so this OS sync never
   // re-triggers the resolve / playback effects above.
   const duration = usePlaybackStore((s) => s.duration);
+  const position = usePlaybackStore((s) => s.position);
+
+  // Long-outro auto-advance. Extended uploads and music-video audio can
+  // run minutes past the actual song; when the synced lyrics say the
+  // vocals ended long ago (see shouldSkipOutro's thresholds), move on.
+  // Reuses the same lyric queries the panel fires, so this costs no
+  // extra network beyond what the lyrics UI already does.
+  const { queries: lyricQueries, best: lyricBest } = useLyricsSources(
+    track,
+    !!track,
+  );
+  const lastVocal = useMemo(() => {
+    const data = lyricBest ? lyricQueries[lyricBest]?.data : null;
+    if (!data || data.kind !== "timed" || data.lines.length === 0) {
+      return null;
+    }
+    // Trailing "♪" instrumental markers aren't vocals — walk back to the
+    // last line with real text.
+    for (let i = data.lines.length - 1; i >= 0; i--) {
+      const line = data.lines[i];
+      const text = line.text.trim();
+      if (text && text !== "♪") return line.end ?? line.start;
+    }
+    return null;
+  }, [lyricBest, lyricQueries]);
+  useEffect(() => {
+    lastVocalRef.current = lastVocal;
+  }, [lastVocal]);
+  // Metadata-end guard: some YT entries stream audio whose container
+  // claims a far longer duration than the entry's own listed length
+  // (a "4:21" row whose element reports 8:41). The listed metadata
+  // length is the song; once playback runs meaningfully past it while
+  // the element believes in a much longer file, move on. Seeking past
+  // the listed end disables it for that track (same suppression as the
+  // outro skip — a deliberate listen wins).
+  const metaDuration = track?.duration ?? 0;
+  useEffect(() => {
+    if (!playing || !videoId) return;
+    if (outroSkippedRef.current === videoId) return;
+    if (outroSuppressedRef.current === videoId) return;
+    if (
+      metaDuration > 60 &&
+      rawElDurationRef.current > metaDuration * 1.5 &&
+      position > metaDuration + 2
+    ) {
+      outroSkippedRef.current = videoId;
+      usePlaybackStore.getState().next();
+    }
+  }, [position, duration, metaDuration, playing, videoId]);
+
+  useEffect(() => {
+    if (!playing || !videoId || !lastVocal) return;
+    if (outroSkippedRef.current === videoId) return;
+    if (outroSuppressedRef.current === videoId) return;
+    if (shouldSkipOutro(position, duration, lastVocal)) {
+      outroSkippedRef.current = videoId;
+      if (import.meta.env.DEV) {
+        console.debug(
+          "[audio] long outro: advancing",
+          videoId,
+          `pos=${Math.round(position)}s lastVocal=${Math.round(lastVocal)}s dur=${Math.round(duration)}s`,
+        );
+      }
+      usePlaybackStore.getState().next();
+    }
+  }, [position, duration, playing, videoId, lastVocal]);
   useEffect(() => {
     const push = () => {
       const s = usePlaybackStore.getState();
@@ -549,5 +1445,65 @@ export function useAudioEngine() {
 
 function buildArtistLabel(track: QueueTrack): string {
   if (track.artists?.length) return track.artists.map((a) => a.name).join(", ");
-  return track.subtitle ?? "";
+  return artistLineFromSubtitle(track.subtitle);
+}
+
+/**
+ * Feed the webview media session, which owns the macOS system Now
+ * Playing entry (Control Center / menu bar widget / AirPods). WebKit
+ * surfaces the playing <audio> element there regardless, so owning that
+ * session — instead of running a second native MPNowPlayingInfoCenter
+ * one next to it — is what keeps the widget to a single, correct row.
+ * Artwork comes free as a URL here; the native path couldn't provide it
+ * safely at all. Mac-gated like the action handlers below.
+ */
+function applyMediaSessionMetadata(
+  track: QueueTrack | undefined,
+  playing: boolean,
+): void {
+  if (typeof navigator === "undefined" || !navigator.mediaSession) return;
+  if (!navigator.userAgent.includes("Mac")) return;
+  const api = navigator.mediaSession;
+  if (!track) {
+    api.metadata = null;
+    api.playbackState = "none";
+    return;
+  }
+  const best = [...(track.thumbnails ?? [])]
+    .filter((t) => !!t.url)
+    .sort((a, b) => (b.width ?? 0) - (a.width ?? 0))[0];
+  const artwork: MediaImage[] = best
+    ? [
+        best.width && best.height
+          ? { src: best.url, sizes: `${best.width}x${best.height}` }
+          : { src: best.url },
+      ]
+    : [];
+  api.metadata = new MediaMetadata({
+    title: track.title,
+    artist: buildArtistLabel(track),
+    album: track.album ?? "",
+    artwork,
+  });
+  api.playbackState = playing ? "playing" : "paused";
+}
+
+/**
+ * Keep the widget's scrubber/clock in step. playbackRate stays 1;
+ * paused-ness is conveyed via playbackState, and a rate of 0 is
+ * rejected by some WebKit builds.
+ */
+function applyMediaSessionPosition(position: number, duration: number): void {
+  if (typeof navigator === "undefined" || !navigator.mediaSession?.setPositionState) return;
+  if (!navigator.userAgent.includes("Mac")) return;
+  if (!Number.isFinite(duration) || duration <= 0) return;
+  try {
+    navigator.mediaSession.setPositionState({
+      duration,
+      position: Math.min(Math.max(0, position), duration),
+      playbackRate: 1,
+    });
+  } catch {
+    /* transient position/duration mismatch during track switches */
+  }
 }

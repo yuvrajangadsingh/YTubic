@@ -1,7 +1,8 @@
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { createJSONStorage, persist } from "zustand/middleware";
 import { emit } from "@tauri-apps/api/event";
 import { isFloatingPlayerWindow } from "@/lib/floating-player";
+import { dropLegacyLocalStorageKey, safeIdbStorage } from "./idb-storage";
 
 export type SourceKind = "song" | "video";
 
@@ -12,6 +13,12 @@ export type TrackSources = {
   video?: string;
   /** Currently active source for this track. */
   selected: SourceKind;
+  /** True once the USER flipped the source (Switch to video/song).
+   *  Counterpart seeding also writes `selected`, so this is the only
+   *  signal that distinguishes "user asked for the video" — which
+   *  should stream the real video file and show it — from a seeded
+   *  default, which must stay audio-only. */
+  chosen?: boolean;
 };
 
 type State = {
@@ -22,16 +29,22 @@ type State = {
    * pair stays consistent.
    */
   byVideoId: Record<string, TrackSources>;
+  /** Sticky global mode: when true, every new track tries its video
+   *  version (resolving a counterpart when needed) instead of falling
+   *  back to song. Set by the source toggle, so "watch videos" survives
+   *  track changes the way it does on YT Music. A per-track explicit
+   *  song choice still wins for that track. */
+  preferVideo: boolean;
   /** Cache an alternate id we resolved. `kind` is the kind of `altId`. */
   setAlternate: (knownId: string, kind: SourceKind, altId: string) => void;
   /** Flip the active source for a track. */
   setSelected: (anyVideoId: string, selected: SourceKind) => void;
+  setPreferVideo: (v: boolean) => void;
 };
 
 // Soft cap on `byVideoId`. Each unique track contributes two keys (song
-// and video aliases), so 2000 keys ≈ 1000 tracks. localStorage has a 5–10
-// MB quota and this map is the only thing in `ytm-track-source`, but we'd
-// rather not let it grow without bound either way.
+// and video aliases), so 2000 keys ≈ 1000 tracks. It lives in IndexedDB,
+// outside WebKitGTK's tight localStorage quota, but is still bounded.
 const MAX_BY_VIDEO_ID_KEYS = 2000;
 const KEEP_ON_TRIM = 1500;
 
@@ -53,6 +66,7 @@ export const useTrackSourceStore = create<State>()(
   persist(
     (set) => ({
       byVideoId: {},
+      preferVideo: false,
       setAlternate: (knownId, kind, altId) =>
         set((s) => {
           const existing = s.byVideoId[knownId];
@@ -78,18 +92,43 @@ export const useTrackSourceStore = create<State>()(
           if (!existing) {
             // No record yet — synthesize a stub so the choice is sticky
             // even before we've resolved the alternate.
-            const fresh: TrackSources = { song: id, selected };
+            const fresh: TrackSources = { song: id, selected, chosen: true };
             return { byVideoId: capByVideoId({ ...s.byVideoId, [id]: fresh }) };
           }
-          const updated = { ...existing, selected };
+          const updated = { ...existing, selected, chosen: true };
           const next = { ...s.byVideoId, [existing.song]: updated };
           if (existing.video) next[existing.video] = updated;
           return { byVideoId: next };
         }),
+      // NB: not bridged from the floating window (its toggle only flips
+      // per-track state); the main window owns the global mode.
+      setPreferVideo: (preferVideo) => set({ preferVideo }),
     }),
-    { name: "ytm-track-source" },
+    {
+      name: "ytm-track-source",
+      storage: createJSONStorage(() => safeIdbStorage),
+      // Drop all cached song<->video pairs whenever the identity gate gets
+      // stricter — the toggle short-circuits on a cached pair and never
+      // re-resolves, so a tightened gate is invisible to anyone already
+      // holding a bad one. Pairs are cheap to re-resolve.
+      //   v2: the pre-gate resolver (blind first-search-result) cached a
+      //       0:38 track against a 12:29 upload.
+      //   v3: the gate itself had holes — an unnamed artist counted as
+      //       agreement and a candidate with no duration skipped the window
+      //       check, so a 0:38 track cached against a 6:56 upload.
+      version: 3,
+      migrate: (persisted: unknown, version: number) => {
+        const prev = (persisted ?? {}) as Partial<State>;
+        if (version < 3) {
+          return { byVideoId: {}, preferVideo: prev.preferVideo ?? false };
+        }
+        return prev as State;
+      },
+    },
   ),
 );
+
+dropLegacyLocalStorageKey("ytm-track-source");
 
 /**
  * In the floating player window, redirect mutations to the main window
@@ -137,4 +176,19 @@ export function resolveStreamId(
   if (!rec) return displayedId;
   if (rec.selected === "video" && rec.video) return rec.video;
   return rec.song;
+}
+
+/**
+ * Whether the stream for `displayedId` should be the actual video file
+ * (progressive h264, `?video=1` on the local server) instead of the
+ * audio-only download. Requires the user's explicit switch — seeded
+ * records with `selected: "video"` (video-native queue items) keep
+ * streaming audio-only until the user asks for the video.
+ */
+export function wantsVideoStream(
+  displayedId: string,
+  byVideoId: Record<string, TrackSources>,
+): boolean {
+  const rec = byVideoId[displayedId];
+  return !!rec && rec.selected === "video" && rec.chosen === true;
 }

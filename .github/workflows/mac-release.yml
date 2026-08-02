@@ -1,0 +1,120 @@
+# Cuts the fork's macOS release.
+#
+# `main` here tracks upstream, so upstream syncs land on it constantly and
+# must never ship anything. Git can't tell "I merged my work" from "I pulled
+# theirs" by looking at topology — a merge commit is a merge commit — and a
+# version-bump trigger misfires the moment upstream bumps their own version
+# (they went 0.4.0 on Jul 23). So the trigger is a file that exists only in
+# this fork: bump `.github/mac-release-version` and a release goes out.
+# Upstream cannot touch a file they don't have, which makes the paths filter
+# below an exact answer to "only when I mean it".
+#
+# To release: set the version in that file (matching src-tauri/tauri.conf.json),
+# merge to main, done. Everything else on main is ignored.
+#
+# Deliberately a separate file from release.yml — that one is upstream's and
+# would conflict on every sync.
+name: Mac release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/mac-release-version"
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Build and publish macOS
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The release version and the app version have to agree or the tag says
+      # one thing and the .dmg filename says another.
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          release_version="$(tr -d '[:space:]' < .github/mac-release-version)"
+          app_version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          if [ -z "$release_version" ]; then
+            echo "::error::.github/mac-release-version is empty"
+            exit 1
+          fi
+          if [ "$release_version" != "$app_version" ]; then
+            echo "::error::version mismatch: .github/mac-release-version is $release_version but tauri.conf.json is $app_version"
+            exit 1
+          fi
+          echo "version=$release_version" >> "$GITHUB_OUTPUT"
+          echo "tag=mac-v$release_version" >> "$GITHUB_OUTPUT"
+
+      # Re-running the workflow (or bumping to a version that already shipped)
+      # should be a no-op, not a clobbered release.
+      - name: Skip if already released
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "::notice::${{ steps.version.outputs.tag }} is already released, nothing to do"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: pnpm/action-setup@v4
+        if: steps.guard.outputs.proceed == 'true'
+      - uses: actions/setup-node@v4
+        if: steps.guard.outputs.proceed == 'true'
+        with:
+          node-version: 20
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.guard.outputs.proceed == 'true'
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: swatinem/rust-cache@v2
+        if: steps.guard.outputs.proceed == 'true'
+        with:
+          workspaces: src-tauri
+      - run: pnpm install --frozen-lockfile
+        if: steps.guard.outputs.proceed == 'true'
+
+      - uses: tauri-apps/tauri-action@v0
+        if: steps.guard.outputs.proceed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Startup update checks are opt-in; released builds get them.
+          VITE_ENABLE_UPDATE_CHECK: "1"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Ad-hoc signature. Without it the bundle is only linker-signed and
+          # a recipient's Mac reads that as tampering ("YTubic is damaged"),
+          # which has no Open Anyway path. No Developer ID cert on this
+          # account, so notarization is out; see release.yml for the note on
+          # why APPLE_* vars must not be set from `secrets.*` directly.
+          APPLE_SIGNING_IDENTITY: "-"
+          YTUBIC_LASTFM_API_KEY: ${{ secrets.YTUBIC_LASTFM_API_KEY }}
+          YTUBIC_LASTFM_API_SECRET: ${{ secrets.YTUBIC_LASTFM_API_SECRET }}
+        with:
+          tagName: ${{ steps.version.outputs.tag }}
+          releaseName: "YTubic ${{ steps.version.outputs.version }} — macOS"
+          releaseBody: |
+            macOS build of YTubic, from a fork of
+            [NUber-dev/YTubic](https://github.com/NUber-dev/YTubic).
+
+            Universal binary, Intel and Apple Silicon. The app is ad-hoc
+            signed and not notarized, so on first launch macOS will block it:
+            open **System Settings → Privacy & Security** and click **Open
+            Anyway**. If it says the app is damaged, run
+            `xattr -cr /Applications/YTubic.app`.
+          # Left as a draft on purpose: this workflow has never run, so the
+          # first release it produces deserves a look before it goes public.
+          # Flip to false once you've seen it publish a good one.
+          releaseDraft: true
+          prerelease: false
+          args: --target universal-apple-darwin

@@ -1,6 +1,6 @@
 [package]
 name = "ytubic"
-version = "0.3.2"
+version = "0.4.0"
 description = "YTubic — fast, responsive YouTube Music desktop client"
 authors = ["George Shyshov"]
 license = "GPL-3.0-only"
@@ -55,12 +55,17 @@ tauri-plugin-process = "2.3.1"
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
-# OS media controls: on Windows this is the System Media Transport Controls
-# (the media tile in Quick Settings / the volume flyout, the lock screen, and
-# the hardware media keys). We create the SMTC ourselves from the host process
-# so the tile resolves to YTubic's own identity — the webview's built-in media
-# session can't, because it belongs to the msedgewebview2.exe child process and
-# shows up as "Unknown app". See src/media.rs.
+# Already in the dependency tree via tauri's `image-png` feature; declared
+# here so we can decode album art server-side and pull a vibrant accent
+# color for the fullscreen player (a client-side <canvas> read taints on
+# the CORS-less art CDNs and throws in WKWebView). jpeg is what the art
+# hosts serve; other formats ride in through feature unification.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# Native media controls: SMTC on Windows and MPRIS on Linux. We create the
+# Windows SMTC from the host process so the tile resolves to YTubic's identity
+# instead of the msedgewebview2.exe child. See media.rs. macOS is NOT handled
+# here — it has its own MPRemoteCommandCenter bridge (now_playing.rs), and
+# letting souvlaki register too would fight over the system Now Playing entry.
 souvlaki = "0.7"
 # Discord Rich Presence: talks to the local Discord client over its IPC
 # socket / named pipe (no native deps beyond that). Off by default; opt-in
@@ -70,6 +75,19 @@ discord-rich-presence = "0.2"
 # MD5 for Last.fm request signing (api_sig = md5 of sorted params + secret).
 # Tiny, single-purpose crate. See src/lastfm.rs.
 md5 = "0.7"
+# Casting to Google TV / Chromecast. `mdns-sd` browses _googlecast._tcp to find
+# receivers; `rust-cast` speaks the CASTv2 protobuf-over-TLS protocol on :8009.
+# The receiver fetches media from our own stream server over the LAN, so nothing
+# is transcoded — verified against a 4K Google TV Stick that a plain http:// LAN
+# url is accepted and opus/webm decodes natively. See src/cast.rs.
+mdns-sd = "0.20"
+# NB: the package is `rust_cast` with an underscore, not a hyphen.
+rust_cast = "0.21"
+# Not used directly for TLS — declared only so we can name a crypto provider
+# at startup. rustls arrives transitively with BOTH `ring` and `aws-lc-rs`
+# enabled (feature unification across reqwest and rust_cast), and in that state
+# it panics rather than choosing. See the install_default call in run().
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -81,7 +99,41 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Shell",
 ] }
 
+# macOS system Now Playing (Control Center / media keys / AirPods). A
+# Tauri WKWebView doesn't bridge the JS MediaSession API to the system
+# the way WebView2 does for Windows, so we drive MediaPlayer.framework
+# directly. objc2 + objc2-foundation are already in the tree via tauri;
+# declared here so we can use them, plus the MediaPlayer bindings.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSDictionary",
+    "NSValue",
+] }
+objc2-media-player = { version = "0.3", features = [
+    "MPNowPlayingInfoCenter",
+    "MPRemoteCommandCenter",
+    "MPRemoteCommand",
+    "MPRemoteCommandEvent",
+    "MPMediaItem",
+    "block2",
+] }
+block2 = "0.6"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+# Cookie jars remain files in app data, but their random AES key lives in the
+# native credential store: Secret Service on Linux and Keychain on macOS.
+aes-gcm = "0.10"
+keyring = "4.1.5"
+rand = "0.8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Reach the underlying WebKitGTK WebView for Linux-only settings that wry
+# does not expose. Keep this pinned to the version already used by wry so
+# `PlatformWebview::inner()` returns the same type.
+webkit2gtk = "=2.0.2"
+
 [dev-dependencies]
 # ServiceExt::oneshot for the stream-server routing test.
 tower = { version = "0.5", features = ["util"] }
-
