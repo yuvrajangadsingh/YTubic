@@ -85,11 +85,7 @@ function AlbumPageView() {
         }}
         onShuffle={() => {
           if (tracksWithCover.length > 0) {
-            const start = Math.floor(Math.random() * tracksWithCover.length);
-            usePlaybackStore
-              .getState()
-              .playShelfItems(tracksWithCover, start);
-            usePlaybackStore.getState().setShuffle(true);
+            usePlaybackStore.getState().shufflePlayShelfItems(tracksWithCover);
           }
         }}
       />

@@ -258,9 +258,7 @@ function PlaylistPageView() {
       }
     }
     if (tracks.length > 0) {
-      const start = Math.floor(Math.random() * tracks.length);
-      store.playShelfItems(tracks, start);
-      store.setShuffle(true);
+      store.shufflePlayShelfItems(tracks);
     }
   };
 
