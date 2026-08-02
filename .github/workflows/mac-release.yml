@@ -1,13 +1,13 @@
 # Cuts the fork's macOS release.
 #
-# `main` here tracks upstream, so upstream syncs land on it constantly and
-# must never ship anything. Git can't tell "I merged my work" from "I pulled
-# theirs" by looking at topology — a merge commit is a merge commit — and a
-# version-bump trigger misfires the moment upstream bumps their own version
-# (they went 0.4.0 on Jul 23). So the trigger is a file that exists only in
-# this fork: bump `.github/mac-release-version` and a release goes out.
-# Upstream cannot touch a file they don't have, which makes the paths filter
-# below an exact answer to "only when I mean it".
+# `main` is this project's trunk, but upstream still gets merged into it, so
+# the trigger has to tell "I shipped something" from "I pulled theirs". Git
+# can't: a merge commit is a merge commit either way. A version-bump trigger
+# doesn't work either, because it misfires the moment upstream bumps their
+# own version (they went 0.4.0 on Jul 23). So the trigger is a file that
+# exists only in this fork: bump `.github/mac-release-version` and a release
+# goes out. Upstream cannot touch a file they don't have, which makes the
+# paths filter below an exact answer to "only when I mean it".
 #
 # To release: set the version in that file (matching src-tauri/tauri.conf.json),
 # merge to main, done. Everything else on main is ignored.
