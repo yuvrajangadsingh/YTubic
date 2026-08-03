@@ -50,6 +50,8 @@ type State = {
    * this machine. Transport routing keys off this, not off `state`.
    */
   deviceId: string | null;
+  /** True only once cast_connect has resolved and Rust holds a session. */
+  ready: boolean;
   state: CastPlayerState;
   position: number;
   duration: number;
@@ -84,6 +86,7 @@ export const useCastStore = create<State>()((set, get) => ({
   devices: [],
   discovering: false,
   deviceId: null,
+  ready: false,
   state: "idle",
   position: 0,
   duration: 0,
@@ -112,11 +115,16 @@ export const useCastStore = create<State>()((set, get) => ({
   connect: async (deviceId) => {
     // Optimistic: the handshake with a cold receiver takes a moment, and
     // the first `cast-status` only lands after it completes.
-    set({ deviceId, state: "connecting", error: null, lastError: null });
+    set({ deviceId, ready: false, state: "connecting", error: null, lastError: null });
     try {
       await invoke("cast_connect", { deviceId });
+      // Only now is there a session on the Rust side to send commands to.
+      // `deviceId` alone means "the user picked this", not "we are talking to
+      // it" — anything that loads media has to wait for this instead, or it
+      // races the handshake and comes back "not connected to a cast device".
+      set({ ready: true });
     } catch (e) {
-      set({ deviceId: null, state: "idle", lastError: String(e) });
+      set({ deviceId: null, ready: false, state: "idle", lastError: String(e) });
     }
   },
 
@@ -131,6 +139,7 @@ export const useCastStore = create<State>()((set, get) => ({
     // will correct us if Rust disagrees.
     set({
       deviceId: null,
+      ready: false,
       state: "idle",
       position: 0,
       duration: 0,
