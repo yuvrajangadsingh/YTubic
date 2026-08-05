@@ -3067,6 +3067,141 @@ async fn stream_lan_stop(state: tauri::State<'_, StreamServerState>) -> Result<(
     Ok(())
 }
 
+/// One complete yt-dlp attempt for `spawn_downloader`: spawn with the
+/// given `--extractor-args` player clients, pump stdout into the part
+/// file, and rename it to its final name when the payload is complete
+/// and plausibly real. Returns true only once `final_path` is in
+/// place; every failure path removes the part file.
+async fn download_attempt(
+    video_id: &str,
+    variant: StreamVariant,
+    part_path: &std::path::Path,
+    final_path: &std::path::Path,
+    ytdlp_bin: &std::path::Path,
+    player_client: &str,
+    state: &DownloadState,
+) -> bool {
+    let url = format!("https://www.youtube.com/watch?v={video_id}");
+    let mut cmd = TokioCommand::new(ytdlp::program(ytdlp_bin));
+    cmd.args([
+        "-f",
+        &match variant {
+            StreamVariant::Muxed => VIDEO_FORMAT.to_string(),
+            StreamVariant::VideoOnly(h) => vonly_format(h),
+            StreamVariant::Audio => AUDIO_FORMAT.to_string(),
+        },
+        "--no-playlist",
+        "--no-warnings",
+        "--no-part",
+        "-q",
+        // --retries re-requests the same signed URL, which clears
+        // transient network errors but NOT the 403-at-first-byte case:
+        // that URL is dead for good, and only a fresh extraction (the
+        // caller's client rotation) recovers it.
+        "--retries",
+        "5",
+        "--extractor-retries",
+        "3",
+        "--socket-timeout",
+        "15",
+        "--extractor-args",
+        player_client,
+        "-o",
+        "-",
+    ]);
+    cmd.arg(&url);
+    // Windows: suppress the console window for the child yt-dlp.exe
+    // (see resolve_stream_ytdlp for rationale).
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[stream] spawn {video_id}: {e}");
+            return false;
+        }
+    };
+
+    let mut stdout = child.stdout.take().unwrap();
+    let mut file = tokio::fs::File::create(part_path).await.ok();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut ok = true;
+    // Per-read timeout so a wedged yt-dlp (stalled TCP / hung extractor)
+    // can't keep this task and the child process alive forever with
+    // `complete` stuck false — otherwise every later request for the id
+    // attaches to the dead entry and blocks 120s then 504.
+    const READ_TIMEOUT: Duration = Duration::from_secs(60);
+    loop {
+        match tokio::time::timeout(READ_TIMEOUT, stdout.read(&mut buf)).await {
+            Err(_) => {
+                eprintln!("[stream] read timeout for {video_id}; killing yt-dlp");
+                let _ = child.start_kill();
+                ok = false;
+                break;
+            }
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                let chunk = &buf[..n];
+                if let Some(ref mut f) = file {
+                    if let Err(e) = f.write_all(chunk).await {
+                        eprintln!("[stream] write .part: {e}");
+                        file = None;
+                        // A truncated prefix must NOT be renamed to .webm
+                        // and cached — mark the whole download failed.
+                        ok = false;
+                    }
+                }
+                state.notify.notify_waiters();
+            }
+            Ok(Err(e)) => {
+                eprintln!("[stream] read stdout: {e}");
+                ok = false;
+                break;
+            }
+        }
+    }
+    if let Some(mut f) = file.take() {
+        let _ = f.flush().await;
+        drop(f);
+    }
+    let status = child.wait().await;
+    let success = ok && status.map(|s| s.success()).unwrap_or(false);
+
+    // Finish all file operations BEFORE the caller signals completion.
+    // Otherwise handlers waiting on `state.complete` can race and
+    // observe `final_path.exists() == false` in the tiny window
+    // between yt-dlp exit and our rename, returning 502 even
+    // though the download succeeded.
+    // 32 KB floor: yt-dlp can exit 0 with a near-empty payload when
+    // YouTube serves a storyboard-only response (rate-limit, geo-block,
+    // SABR fallout). Renaming such a stub to .webm would pin a
+    // permanently-broken cache entry that fails MEDIA_ERR_DECODE on
+    // every replay — drop it instead so the next request retries.
+    const MIN_AUDIO_BYTES: u64 = 32 * 1024;
+    let part_size = tokio::fs::metadata(part_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if success && part_size >= MIN_AUDIO_BYTES {
+        if let Err(e) = tokio::fs::rename(part_path, final_path).await {
+            eprintln!("[stream] rename: {e}");
+            let _ = tokio::fs::remove_file(part_path).await;
+            false
+        } else {
+            eprintln!("[stream] cached {video_id} ({part_size} bytes)");
+            true
+        }
+    } else {
+        if success {
+            eprintln!(
+                "[stream] download too small for {video_id}: {part_size} bytes (min {MIN_AUDIO_BYTES})"
+            );
+        }
+        let _ = tokio::fs::remove_file(part_path).await;
+        false
+    }
+}
+
 /// Spawn a yt-dlp downloader that writes into the shared memory buffer
 /// AND to a part file on disk (names per `stream_file_names`). On
 /// successful exit, renames the part file to its final name. Updates
@@ -3087,135 +3222,47 @@ fn spawn_downloader(
 ) {
     let downloads = srv.downloads.clone();
     tokio::spawn(async move {
-        let url = format!("https://www.youtube.com/watch?v={video_id}");
         let (part_name, final_name) = stream_file_names(&video_id, variant);
         let part_path = target_dir.join(part_name);
         let final_path = target_dir.join(final_name);
         let _ = tokio::fs::create_dir_all(&target_dir).await;
         let _ = tokio::fs::remove_file(&part_path).await; // clean stale
 
-        let mut cmd = TokioCommand::new(ytdlp::program(&srv.ytdlp_bin));
-        cmd.args([
-            "-f",
-            &match variant {
-                StreamVariant::Muxed => VIDEO_FORMAT.to_string(),
-                StreamVariant::VideoOnly(h) => vonly_format(h),
-                StreamVariant::Audio => AUDIO_FORMAT.to_string(),
-            },
-            "--no-playlist",
-            "--no-warnings",
-            "--no-part",
-            "-q",
-            // YouTube regularly hands out a signed media URL that then 403s
-            // on the very first byte-range request (token/pot desync or
-            // per-URL throttling). Left alone this surfaces as a one-off
-            // "download failed" that a manual re-click fixes. Retrying the
-            // data download and the extractor a few times clears the vast
-            // majority of these inside a single spawn, before the handler
-            // ever returns 502 to the audio element.
-            "--retries",
-            "5",
-            "--extractor-retries",
-            "3",
-            "--socket-timeout",
-            "15",
-            "--extractor-args",
+        // YouTube regularly hands out a signed media URL that 403s on the
+        // very first byte-range request (token/pot desync or per-URL
+        // throttling). yt-dlp's own --retries re-request that same dead
+        // URL, so the whole attempt dies in seconds; what recovers it is a
+        // fresh extraction, which mints a fresh signed URL. That used to
+        // happen only when the frontend sent a second play request. Run the
+        // second extraction here instead, on a different player client.
+        // `complete` stays false across both attempts, so waiting handlers
+        // keep blocking instead of seeing a 502 in between.
+        let mut success = download_attempt(
+            &video_id,
+            variant,
+            &part_path,
+            &final_path,
+            &srv.ytdlp_bin,
             "youtube:player_client=android_vr,ios",
-            "-o",
-            "-",
-        ]);
-        cmd.arg(&url);
-        // Windows: suppress the console window for the child yt-dlp.exe
-        // (see resolve_stream_ytdlp for rationale).
-        #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[stream] spawn {video_id}: {e}");
-                state.complete.store(true, Ordering::Release);
-                state.notify.notify_waiters();
-                downloads.lock().await.remove(&map_key);
-                return;
-            }
-        };
-
-        let mut stdout = child.stdout.take().unwrap();
-        let mut file = tokio::fs::File::create(&part_path).await.ok();
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut ok = true;
-        // Per-read timeout so a wedged yt-dlp (stalled TCP / hung extractor)
-        // can't keep this task and the child process alive forever with
-        // `complete` stuck false — otherwise every later request for the id
-        // attaches to the dead entry and blocks 120s then 504.
-        const READ_TIMEOUT: Duration = Duration::from_secs(60);
-        loop {
-            match tokio::time::timeout(READ_TIMEOUT, stdout.read(&mut buf)).await {
-                Err(_) => {
-                    eprintln!("[stream] read timeout for {video_id}; killing yt-dlp");
-                    let _ = child.start_kill();
-                    ok = false;
-                    break;
-                }
-                Ok(Ok(0)) => break,
-                Ok(Ok(n)) => {
-                    let chunk = &buf[..n];
-                    if let Some(ref mut f) = file {
-                        if let Err(e) = f.write_all(chunk).await {
-                            eprintln!("[stream] write .part: {e}");
-                            file = None;
-                            // A truncated prefix must NOT be renamed to .webm
-                            // and cached — mark the whole download failed.
-                            ok = false;
-                        }
-                    }
-                    state.notify.notify_waiters();
-                }
-                Ok(Err(e)) => {
-                    eprintln!("[stream] read stdout: {e}");
-                    ok = false;
-                    break;
-                }
-            }
+            &state,
+        )
+        .await;
+        if !success {
+            eprintln!("[stream] {video_id}: first attempt failed, retrying with ios client");
+            let _ = tokio::fs::remove_file(&part_path).await; // clean attempt 1's leftovers
+            success = download_attempt(
+                &video_id,
+                variant,
+                &part_path,
+                &final_path,
+                &srv.ytdlp_bin,
+                "youtube:player_client=ios",
+                &state,
+            )
+            .await;
         }
-        if let Some(mut f) = file.take() {
-            let _ = f.flush().await;
-            drop(f);
-        }
-        let status = child.wait().await;
-        let success = ok && status.map(|s| s.success()).unwrap_or(false);
-
-        // Finish all file operations BEFORE signalling completion.
-        // Otherwise handlers waiting on `state.complete` can race and
-        // observe `final_path.exists() == false` in the tiny window
-        // between yt-dlp exit and our rename, returning 502 even
-        // though the download succeeded.
-        // 32 KB floor: yt-dlp can exit 0 with a near-empty payload when
-        // YouTube serves a storyboard-only response (rate-limit, geo-block,
-        // SABR fallout). Renaming such a stub to .webm would pin a
-        // permanently-broken cache entry that fails MEDIA_ERR_DECODE on
-        // every replay — drop it instead so the next request retries.
-        const MIN_AUDIO_BYTES: u64 = 32 * 1024;
-        let part_size = tokio::fs::metadata(&part_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if success && part_size >= MIN_AUDIO_BYTES {
-            if let Err(e) = tokio::fs::rename(&part_path, &final_path).await {
-                eprintln!("[stream] rename: {e}");
-                let _ = tokio::fs::remove_file(&part_path).await;
-            } else {
-                eprintln!("[stream] cached {video_id} ({part_size} bytes)");
-            }
-        } else {
-            if success {
-                eprintln!(
-                    "[stream] download too small for {video_id}: {part_size} bytes (min {MIN_AUDIO_BYTES})"
-                );
-            } else {
-                eprintln!("[stream] download failed {video_id}");
-            }
-            let _ = tokio::fs::remove_file(&part_path).await;
+        if !success {
+            eprintln!("[stream] download failed {video_id}");
         }
 
         state.complete.store(true, Ordering::Release);
