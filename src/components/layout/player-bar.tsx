@@ -459,6 +459,13 @@ export function ProgressSlider({
     setHoverTime(Math.round(scrub));
   }, [scrub, duration]);
 
+  // A failed stream leaves `duration` at 0 (or the element reports NaN/
+  // Infinity) while `position` keeps ticking, and the slider fill is
+  // value/max with max floored to 1, so the fill computes >100% and
+  // draws past the bar's container. With no real duration there is no
+  // meaningful progress to show, so pin the fill at 0 until one arrives.
+  const hasDuration = Number.isFinite(duration) && duration > 0;
+
   return (
     <div
       ref={wrapperRef}
@@ -488,7 +495,7 @@ export function ProgressSlider({
         </div>
       ) : null}
       <Slider
-        value={[scrub ?? position]}
+        value={[hasDuration ? (scrub ?? position) : 0]}
         max={Math.max(duration, 1)}
         step={1}
         disabled={disabled}
