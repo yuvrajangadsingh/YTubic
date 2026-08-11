@@ -4,8 +4,7 @@ import {
   isQualityCapped,
   mediaErrorFailure,
   watchdogVerdict,
-  VIDEO_ABSOLUTE_MS,
-  VIDEO_NO_PROGRESS_MS,
+  VIDEO_PHASE_BUDGET,
   VIDEO_QUALITY_CEILING,
 } from "./video-diagnostics";
 
@@ -57,57 +56,79 @@ describe("mediaErrorFailure", () => {
 });
 
 describe("watchdogVerdict", () => {
-  const base = { startedAtMs: 0, lastProgressMs: 0, phase: "transport" as const };
+  const transport = VIDEO_PHASE_BUDGET.transport;
+  const decode = VIDEO_PHASE_BUDGET.decode;
 
   it("lets a healthy attempt run", () => {
     expect(
-      watchdogVerdict({ ...base, nowMs: 5_000, lastProgressMs: 4_800 }),
-    ).toBeNull();
-  });
-
-  it("gives up when nothing has moved for the no-progress window", () => {
-    const v = watchdogVerdict({
-      ...base,
-      nowMs: VIDEO_NO_PROGRESS_MS,
-      lastProgressMs: 0,
-    });
-    expect(v?.phase).toBe("transport");
-    expect(v?.reason).toContain("no progress");
-  });
-
-  it("keeps waiting while progress keeps arriving, up to the hard cap", () => {
-    // Steady progress: a long but healthy download is not a failure...
-    expect(
       watchdogVerdict({
-        ...base,
-        nowMs: VIDEO_ABSOLUTE_MS - 1,
-        lastProgressMs: VIDEO_ABSOLUTE_MS - 1_000,
+        nowMs: 5_000,
+        phaseStartedAtMs: 0,
+        lastProgressMs: 4_800,
+        phase: "transport",
       }),
     ).toBeNull();
-    // ...until it has simply taken too long overall.
-    const v = watchdogVerdict({
-      ...base,
-      nowMs: VIDEO_ABSOLUTE_MS,
-      lastProgressMs: VIDEO_ABSOLUTE_MS - 1_000,
-    });
-    expect(v?.reason).toContain("gave up after");
   });
 
-  it("names the phase it timed out in, never the decoder", () => {
+  // The server withholds the whole HTTP response until the file has
+  // finished downloading, so during transport the frontend observes no
+  // buffered growth, no readyState change and no byte events. Silence is
+  // the NORMAL case here, not evidence of death — a stall rule on this
+  // phase would cancel every cold download that ran long.
+  it("never fails transport for silence alone", () => {
+    expect(transport.noProgressMs).toBeUndefined();
+    expect(
+      watchdogVerdict({
+        nowMs: transport.absoluteMs - 1,
+        phaseStartedAtMs: 0,
+        lastProgressMs: 0, // nothing has moved since the very beginning
+        phase: "transport",
+      }),
+    ).toBeNull();
+  });
+
+  it("gives transport up only at its deadline, and names the phase", () => {
     const v = watchdogVerdict({
-      nowMs: VIDEO_NO_PROGRESS_MS,
-      startedAtMs: 0,
+      nowMs: transport.absoluteMs,
+      phaseStartedAtMs: 0,
       lastProgressMs: 0,
       phase: "transport",
     });
+    expect(v?.phase).toBe("transport");
+    expect(v?.reason).toContain("gave up after");
     expect(v?.reason).toContain("downloading");
     expect(v?.reason).not.toContain("decod");
   });
 
-  it("reports the resolve phase when it never got as far as a URL", () => {
+  // Decode is the one phase where media events genuinely fire, so here
+  // silence really is evidence.
+  it("does fail decode for silence, before its deadline", () => {
+    expect(decode.noProgressMs).toBeDefined();
     const v = watchdogVerdict({
-      nowMs: VIDEO_NO_PROGRESS_MS,
-      startedAtMs: 0,
+      nowMs: decode.noProgressMs!,
+      phaseStartedAtMs: 0,
+      lastProgressMs: 0,
+      phase: "decode",
+    });
+    expect(v?.phase).toBe("decode");
+    expect(v?.reason).toContain("stalled");
+  });
+
+  it("keeps waiting in decode while progress keeps arriving", () => {
+    expect(
+      watchdogVerdict({
+        nowMs: decode.absoluteMs - 1,
+        phaseStartedAtMs: 0,
+        lastProgressMs: decode.absoluteMs - 1_000,
+        phase: "decode",
+      }),
+    ).toBeNull();
+  });
+
+  it("reports the resolve phase when no URL was ever produced", () => {
+    const v = watchdogVerdict({
+      nowMs: VIDEO_PHASE_BUDGET.resolving.absoluteMs,
+      phaseStartedAtMs: 0,
       lastProgressMs: 0,
       phase: "resolving",
     });

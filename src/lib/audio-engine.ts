@@ -25,8 +25,9 @@ import {
   formatVideoTrace,
   mediaErrorFailure,
   watchdogVerdict,
-  VIDEO_ABSOLUTE_MS,
+  watchVideoReadiness,
   VIDEO_FIRST_FRAME_MS,
+  VIDEO_PHASE_BUDGET,
   type VideoFailure,
   type VideoFailurePhase,
   type VideoOutcome,
@@ -83,6 +84,128 @@ function playLocal(el: HTMLMediaElement | null | undefined): Promise<void> {
   return el.play();
 }
 
+/** How often the startup watchdog looks at the attempt. */
+const VIDEO_WATCHDOG_TICK_MS = 1_000;
+
+/**
+ * Everything known about the video attempt in flight: the timings that
+ * end up in its `[vtrace]` line, plus the bookkeeping the watchdog
+ * judges it on.
+ */
+type VideoProbe = VideoTrace & {
+  /** Resolve-effect generation, so a stale listener can't write here. */
+  token: number;
+  /** Wall clock start, used for the trace's timings only. */
+  startedAt: number;
+  /** Accrued-time baselines. Both are pushed forward while the page is
+   *  hidden, casting, or its timers are throttled: a background tab
+   *  waking up after two minutes was never waiting for two minutes. */
+  phaseStartedAt: number;
+  lastProgressAt: number;
+  /** When the watchdog last ran, to measure how long it was away. */
+  lastTickAt: number;
+  phase: VideoFailurePhase;
+  lastReadyState: number;
+  lastBuffered: number;
+  /** What has already been logged for this attempt: nothing, the
+   *  success line, or a terminal failure. A video that plays and THEN
+   *  dies is worth both lines; a repeat of the same event is not. */
+  traced: "none" | "played" | "final";
+};
+
+/**
+ * Video-mode startup hold: audio and frames start TOGETHER (YouTube
+ * semantics) instead of audio leading by however long the vonly
+ * download takes. Generation-keyed by the resolve token so duplicate
+ * ids, retries and stale listeners can't release someone else's hold.
+ */
+type VideoHold = {
+  token: number;
+  audioReady: boolean;
+  videoReady: boolean;
+  /** Interval id of the startup watchdog, not a one-shot timer: it
+   *  judges each phase on its own budget and stops accruing time while
+   *  the page is not really waiting. */
+  watchdog: number;
+  /** Carried playhead for a same-track reload: the companion must be
+   *  seeked here and ready HERE (not at 0) before the held start
+   *  releases, or the audio leads while the video buffers its target. */
+  targetSeconds?: number;
+};
+
+/**
+ * One watchdog tick's decision. `null` means carry on; "release-hold"
+ * means start playback without waiting for the video any longer.
+ *
+ * Reads the element directly for progress because the failure this
+ * exists to catch fires no media event at all (networkState stuck
+ * LOADING, readyState HAVE_NOTHING) — waiting to be told would wait
+ * forever. Lives out here so the effect body stays flat and so the
+ * suspension accounting is in one readable place.
+ */
+function judgeVideoAttempt(
+  hold: VideoHold,
+  p: VideoProbe,
+): VideoFailure | "release-hold" | null {
+  const nowMs = performance.now();
+  const sinceTick = nowMs - p.lastTickAt;
+  p.lastTickAt = nowMs;
+  // Don't count time we weren't really waiting. A hidden page has its
+  // timers throttled to a crawl, casting means the receiver owns
+  // playback entirely, and either way this tick can wake up minutes
+  // later and blow every deadline at once.
+  const suspended =
+    document.hidden || isCasting() || sinceTick > VIDEO_WATCHDOG_TICK_MS * 3;
+  if (suspended) {
+    p.phaseStartedAt += sinceTick;
+    p.lastProgressAt += sinceTick;
+    return null;
+  }
+  if (hold.videoReady) {
+    // The video side is done and the hold is only waiting on the audio
+    // master now. That is never a video failure — release at the
+    // deadline rather than blaming the picture for the sound.
+    const budget = VIDEO_PHASE_BUDGET.decode.absoluteMs;
+    return nowMs - p.phaseStartedAt >= budget ? "release-hold" : null;
+  }
+  const live = companionVideoSingleton;
+  if (live) {
+    const buffered = live.buffered.length
+      ? live.buffered.end(live.buffered.length - 1)
+      : 0;
+    if (live.readyState !== p.lastReadyState || buffered > p.lastBuffered) {
+      p.lastReadyState = live.readyState;
+      p.lastBuffered = buffered;
+      p.lastProgressAt = nowMs;
+      if (p.firstByteMs === undefined && (live.readyState > 0 || buffered > 0)) {
+        p.firstByteMs = nowMs - p.startedAt;
+      }
+    }
+  }
+  return watchdogVerdict({
+    nowMs,
+    phaseStartedAtMs: p.phaseStartedAt,
+    lastProgressMs: p.lastProgressAt,
+    phase: p.phase,
+  });
+}
+
+/**
+ * Close out an attempt with one `[vtrace]` line.
+ *
+ * Deliberately at info level and not behind a DEV flag: the failure this
+ * exists to explain only happens in the installed app, so a diagnostic
+ * that vanishes in production explains nothing. Bounded to one line per
+ * attempt by the `traced` latch above.
+ */
+function traceVideoAttempt(p: VideoProbe | null, outcome: VideoOutcome): void {
+  if (!p || p.traced === "final") return;
+  if (outcome.kind === "played" && p.traced === "played") return;
+  p.traced = outcome.kind === "played" ? "played" : "final";
+  // vibecheck-disable-next-line no-console-pollution -- see the note above
+  console.info(formatVideoTrace(p, outcome, performance.now() - p.startedAt));
+}
+
 export function useAudioEngine() {
   const audioRef = useRef<HTMLVideoElement | null>(null);
   // Guard against stale stream resolutions when the user skips mid-fetch.
@@ -129,70 +252,31 @@ export function useAudioEngine() {
   // stream URL after a transient failure (e.g. a googlevideo 403).
   const [retryNonce, setRetryNonce] = useState(0);
 
-  // Video-mode startup hold: audio and frames start TOGETHER (YouTube
-  // semantics) instead of audio leading by however long the vonly
-  // download takes. Generation-keyed by the resolve token so duplicate
-  // ids, retries, and stale listeners can't release someone else's
-  // hold. Every route to el.play() must respect it.
-  const videoHoldRef = useRef<{
-    token: number;
-    audioReady: boolean;
-    videoReady: boolean;
-    /** Interval id of the startup watchdog, not a one-shot timer: the
-     *  attempt is judged on lack of PROGRESS, not on a fixed budget
-     *  spanning resolve + download + decode. */
-    watchdog: number;
-    // Carried playhead for a same-track reload: the companion must be
-    // seeked here and ready HERE (not at 0) before the held start
-    // releases, or the audio leads while the video buffers its target.
-    targetSeconds?: number;
-  } | null>(null);
+  // The pending startup hold (see VideoHold). Every route to el.play()
+  // must respect it.
+  const videoHoldRef = useRef<VideoHold | null>(null);
   // What the current video attempt has actually achieved, written by
   // the companion effect below and judged by the watchdog above it.
   // Separate from the hold because the hold is about WHEN to start
   // playing and this is about whether anything is happening at all.
-  const videoProbeRef = useRef<
-    | (VideoTrace & {
-        token: number;
-        startedAt: number;
-        lastProgressAt: number;
-        phase: VideoFailurePhase;
-        lastReadyState: number;
-        lastBuffered: number;
-        /** What has already been logged for this attempt: nothing, the
-         *  success line, or a terminal failure. A video that plays and
-         *  THEN dies is worth both lines; the same event repeating (a
-         *  `resize` after `loadeddata`) is not. */
-        traced: "none" | "played" | "final";
-      })
-    | null
-  >(null);
-  /** Mark forward motion (and optionally advance the phase). */
+  const videoProbeRef = useRef<VideoProbe | null>(null);
+  /** Mark forward motion (and optionally advance the phase). Entering a
+   *  new phase restarts that phase's own deadline. */
   const noteVideoProgress = (phase?: VideoFailurePhase) => {
     const p = videoProbeRef.current;
     if (!p) return;
-    if (phase) p.phase = phase;
-    p.lastProgressAt = performance.now();
+    const now = performance.now();
+    if (phase && phase !== p.phase) {
+      p.phase = phase;
+      p.phaseStartedAt = now;
+    }
+    p.lastProgressAt = now;
   };
   /** First sign of actual data, whatever reported it. */
   const noteFirstByte = () => {
     const p = videoProbeRef.current;
     if (!p || p.firstByteMs !== undefined) return;
     p.firstByteMs = performance.now() - p.startedAt;
-  };
-  /**
-   * Close out the attempt with one `[vtrace]` line. Logged at info
-   * level, not behind a DEV flag: the whole point is being able to read
-   * what happened in the installed app, which is where this fails.
-   */
-  const traceVideo = (outcome: VideoOutcome) => {
-    const p = videoProbeRef.current;
-    if (!p || p.traced === "final") return;
-    if (outcome.kind === "played" && p.traced === "played") return;
-    p.traced = outcome.kind === "played" ? "played" : "final";
-    console.info(
-      formatVideoTrace(p, outcome, performance.now() - p.startedAt),
-    );
   };
   const maybeStartHeld = () => {
     const el = audioRef.current;
@@ -235,7 +319,8 @@ export function useAudioEngine() {
       window.clearInterval(h.watchdog);
       videoHoldRef.current = null;
     }
-    traceVideo(
+    traceVideoAttempt(
+      videoProbeRef.current,
       outcome ??
         (failure
           ? { kind: "failed", failure }
@@ -722,7 +807,9 @@ export function useAudioEngine() {
       videoProbeRef.current = {
         token,
         startedAt,
+        phaseStartedAt: startedAt,
         lastProgressAt: startedAt,
+        lastTickAt: startedAt,
         phase: "resolving",
         lastReadyState: comp?.readyState ?? 0,
         lastBuffered: 0,
@@ -736,44 +823,14 @@ export function useAudioEngine() {
         const h = videoHoldRef.current;
         const p = videoProbeRef.current;
         if (!h || h.token !== token || !p || p.token !== token) return;
-        const nowMs = performance.now();
-        if (h.videoReady) {
-          // The video side is done and the hold is only waiting on the
-          // audio master now. That is never a video failure — release
-          // the hold at the absolute cap and let both elements catch
-          // up rather than blaming the picture for the sound.
-          if (nowMs - p.startedAt >= VIDEO_ABSOLUTE_MS) {
-            h.audioReady = true;
-            maybeStartHeld();
-          }
-          return;
-        }
-        // Affirmative progress: bytes buffered or a readyState step.
-        // The failure this exists to catch fires NO media event at all
-        // (networkState stuck LOADING, readyState HAVE_NOTHING), so
-        // waiting to be told would wait forever.
-        const live = companionVideoSingleton;
-        if (live) {
-          const buffered = live.buffered.length
-            ? live.buffered.end(live.buffered.length - 1)
-            : 0;
-          if (live.readyState !== p.lastReadyState || buffered > p.lastBuffered) {
-            p.lastReadyState = live.readyState;
-            p.lastBuffered = buffered;
-            p.lastProgressAt = nowMs;
-            if (live.readyState > 0 || buffered > 0) noteFirstByte();
-          }
-        }
-        const verdict = watchdogVerdict({
-          nowMs,
-          startedAtMs: p.startedAt,
-          lastProgressMs: p.lastProgressAt,
-          phase: p.phase,
-        });
-        if (verdict) {
+        const verdict = judgeVideoAttempt(h, p);
+        if (verdict === "release-hold") {
+          h.audioReady = true;
+          maybeStartHeld();
+        } else if (verdict) {
           abandonVideo(verdict, { kind: "timeout", failure: verdict });
         }
-      }, 1000);
+      }, VIDEO_WATCHDOG_TICK_MS);
       videoHoldRef.current = {
         token,
         audioReady: false,
@@ -929,26 +986,23 @@ export function useAudioEngine() {
         void playLocal(video).catch(() => {});
       }
     };
-    const onLoaded = () => {
+    // Runs when there is genuinely a frame to show — see
+    // watchVideoReadiness, which owns the "is there a picture yet"
+    // question and re-asks it on every event that could change the
+    // answer, in either order.
+    const onPromoted = () => {
       if (cancelled) return;
       noteVideoProgress("decode");
       const probe = videoProbeRef.current;
-      if (probe && probe.dataMs === undefined) {
-        probe.dataMs = performance.now() - probe.startedAt;
-      }
-      // Affirmative readiness: `loadeddata` alone is not a picture.
-      // WKWebView will happily report data for a track it cannot show,
-      // and promoting that to "video" is how a dead 4K pull ended up
-      // looking exactly like a track that simply has no video. Wait for
-      // real dimensions (they can still arrive on a later `resize`);
-      // the watchdog calls it if they never do.
-      if (!video.videoWidth || !video.videoHeight) return;
       if (probe) {
+        if (probe.dataMs === undefined) {
+          probe.dataMs = performance.now() - probe.startedAt;
+        }
         probe.width = video.videoWidth;
         probe.height = video.videoHeight;
       }
       // A picture exists — that is the success this attempt was for.
-      traceVideo({ kind: "played" });
+      traceVideoAttempt(probe, { kind: "played" });
       const st = usePlaybackStore.getState();
       st.setStreamKind("video");
       st.setStreamVideoHeight(video.videoHeight || null);
@@ -1057,10 +1111,10 @@ export function useAudioEngine() {
         });
       }, VIDEO_FIRST_FRAME_MS);
     };
-    video.addEventListener("loadeddata", onLoaded);
-    // Dimensions can land after loadeddata; re-run the readiness check
-    // rather than sitting on a 0x0 element until the watchdog fires.
-    video.addEventListener("resize", onLoaded);
+    // Readiness owns "is there a picture yet" and re-asks on every event
+    // that could change the answer, in either order — loadeddata seeing
+    // 0x0 with dimensions arriving later must not strand a working video.
+    const stopReadiness = watchVideoReadiness(video, onPromoted);
     video.addEventListener("error", onError);
     video.addEventListener("waiting", onWaiting);
     video.addEventListener("playing", onCompanionPlaying);
@@ -1181,8 +1235,7 @@ export function useAudioEngine() {
       if (frameHandle && typeof video.cancelVideoFrameCallback === "function") {
         video.cancelVideoFrameCallback(frameHandle);
       }
-      video.removeEventListener("loadeddata", onLoaded);
-      video.removeEventListener("resize", onLoaded);
+      stopReadiness();
       video.removeEventListener("error", onError);
       video.removeEventListener("waiting", onWaiting);
       video.removeEventListener("playing", onCompanionPlaying);
@@ -1212,7 +1265,10 @@ export function useAudioEngine() {
       // An attempt torn down before it ever settled still gets its line:
       // "the video never appeared and nothing was logged" is the exact
       // hole this trace exists to close.
-      traceVideo({ kind: "abandoned", why: "track or mode changed" });
+      traceVideoAttempt(videoProbeRef.current, {
+        kind: "abandoned",
+        why: "track or mode changed",
+      });
       videoProbeRef.current = null;
     };
   }, [streamVideoId, wantVideo, premiumOk, retryNonce]);
