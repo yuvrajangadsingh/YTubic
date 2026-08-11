@@ -2,14 +2,17 @@
 //!
 //! End users don't have yt-dlp on PATH, so the app owns its copy: the
 //! official single-file release is downloaded into
-//! `<app-data>/bin/yt-dlp.exe` on first run and self-updated via
-//! `yt-dlp -U` on a 72-hour cadence. The managed copy is canonical —
-//! PATH is only a fallback for dev machines while the download hasn't
-//! happened (or failed).
+//! `<app-data>/bin/yt-dlp.exe` on first run and held at `PINNED_VERSION`
+//! on a 72-hour cadence (or self-updated via `yt-dlp -U` when unpinned).
+//! The managed copy is canonical — PATH is only a fallback for dev
+//! machines while the download hasn't happened (or failed).
 //!
 //! Streaming resilience depends on this: YouTube regularly breaks
 //! extractors and yt-dlp ships fixes within days, so the binary must
-//! update on its own schedule, not the app's release schedule.
+//! update on its own schedule, not the app's release schedule. The
+//! exception is a release that breaks format selection outright — see
+//! `PINNED_VERSION`, which exists to stop an unattended update from
+//! quietly degrading playback.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,6 +37,18 @@ const DOWNLOAD_URL: &str =
 #[cfg(all(unix, not(target_os = "macos")))]
 const DOWNLOAD_URL: &str =
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
+
+/// Version the managed binary is held at, or `None` to track latest.
+///
+/// Pinned to 2026.07.04 because newer builds require a GVS PO token for
+/// every `android_vr` format except itag 18. Measured on master: the
+/// audio path drops from format 140 to a 360p muxed file, and
+/// `vonly_format()`'s VP9/avc1 rungs disappear entirely — so an
+/// unattended `-U` silently degrades playback to 360p.
+///
+/// Lift this once a PO token provider (e.g. bgutil-ytdlp-pot-provider)
+/// is wired in; the extractor fixes past this version are worth having.
+const PINNED_VERSION: Option<&str> = Some("2026.07.04");
 
 /// How often to let the managed binary check for its own update.
 const UPDATE_INTERVAL: Duration = Duration::from_secs(72 * 60 * 60);
@@ -239,7 +254,19 @@ async fn maybe_self_update(managed: &Path) {
     touch_update_stamp(managed);
 
     let mut cmd = tokio::process::Command::new(managed);
-    cmd.arg("-U");
+    match PINNED_VERSION {
+        // `--update-to` holds the binary at an exact release: a no-op
+        // when it already matches, a downgrade if something newer got
+        // installed underneath us. That second case is the point — it
+        // repairs a machine where the binary was replaced out of band.
+        Some(v) => {
+            cmd.arg("--update-to");
+            cmd.arg(format!("stable@{v}"));
+        }
+        None => {
+            cmd.arg("-U");
+        }
+    }
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
     cmd.stdout(std::process::Stdio::piped());
