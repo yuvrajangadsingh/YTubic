@@ -13,6 +13,10 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { CheckIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
+import {
+  effectiveVideoQuality,
+  isQualityCapped,
+} from "@/lib/video-diagnostics";
 
 /**
  * Adopts the audio engine's singleton <video> element as a visible
@@ -103,10 +107,16 @@ export function VideoQualityBadge({ className }: { className?: string }) {
           const visible = topsOut
             ? QUALITY_OPTIONS.filter((q) => q <= height * 1.05)
             : QUALITY_OPTIONS;
-          const checked = topsOut ? visible[0] : quality;
+          // What is really being requested, not what is stored: while
+          // the cap is on, a saved 4K preference plays 1080p and the
+          // check mark has to say so.
+          const checked = topsOut
+            ? visible[0]
+            : effectiveVideoQuality(quality);
           return visible.map((q) => (
             <DropdownMenuItem
               key={q}
+              disabled={isQualityCapped(q)}
               onClick={() => setQuality(q)}
               className="flex items-center justify-between"
             >
@@ -115,6 +125,11 @@ export function VideoQualityBadge({ className }: { className?: string }) {
             </DropdownMenuItem>
           ));
         })()}
+        {QUALITY_OPTIONS.some(isQualityCapped) ? (
+          <div className="border-t border-hairline px-2 py-1.5 text-xs text-muted-foreground">
+            1440p and 4K are temporarily unavailable
+          </div>
+        ) : null}
         {height < quality * 0.9 ? (
           <div className="border-t border-hairline px-2 py-1.5 text-xs text-muted-foreground">
             this video tops out at {height}p

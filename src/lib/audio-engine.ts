@@ -20,6 +20,7 @@ import { fetchPanelDuration } from "@/lib/innertube/radio";
 import { pickThumbnail } from "@/components/shared/thumbnail";
 import { useLyricsSources } from "@/lib/lyrics/sources";
 import { correctedDuration, shouldSkipOutro } from "@/lib/outro";
+import { effectiveVideoQuality } from "@/lib/video-diagnostics";
 
 /**
  * AudioEngine binds the playback store to a singleton HTMLAudioElement and
@@ -863,7 +864,9 @@ export function useAudioEngine() {
 
     streamUrlFor(streamVideoId, {
       vonly: true,
-      vonlyHeight: useSettingsStore.getState().videoQuality,
+      vonlyHeight: effectiveVideoQuality(
+        useSettingsStore.getState().videoQuality,
+      ),
     })
       .then((src) => {
         if (cancelled) return;
@@ -894,7 +897,7 @@ export function useAudioEngine() {
       try {
         const src = await streamUrlFor(streamVideoId, {
           vonly: true,
-          vonlyHeight: q,
+          vonlyHeight: effectiveVideoQuality(q),
         });
         if (cancelled || token !== switchToken) return;
         if (warm) {
@@ -923,9 +926,14 @@ export function useAudioEngine() {
         // keep playing at the current quality
       }
     };
-    let lastQuality = useSettingsStore.getState().videoQuality;
+    // Compared as EFFECTIVE heights: while the cap is in place, 2160 and
+    // 1440 both resolve to the same request as 1080, and re-downloading
+    // an identical file to satisfy a menu click is pure churn.
+    let lastQuality = effectiveVideoQuality(
+      useSettingsStore.getState().videoQuality,
+    );
     const unsubQuality = useSettingsStore.subscribe((state) => {
-      const q = state.videoQuality;
+      const q = effectiveVideoQuality(state.videoQuality);
       if (q === lastQuality) return;
       lastQuality = q;
       void switchQuality(q);
