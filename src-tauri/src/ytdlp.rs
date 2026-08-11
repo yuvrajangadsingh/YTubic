@@ -102,6 +102,12 @@ pub async fn ensure(app: tauri::AppHandle) {
     let managed = managed_path(&app);
 
     if managed.exists() {
+        // Reconcile the pin BEFORE the throttled update path. A binary
+        // that is already the wrong version must not get to serve tracks
+        // for up to UPDATE_INTERVAL just because its stamp is fresh —
+        // and the stamp is fresh on exactly the install that just
+        // downloaded `releases/latest`.
+        reconcile_pin(&managed).await;
         emit_state(&app, "ready", None);
         maybe_self_update(&managed).await;
         return;
@@ -120,6 +126,11 @@ pub async fn ensure(app: tauri::AppHandle) {
     match download(&managed).await {
         Ok(()) => {
             eprintln!("[ytdlp] downloaded managed binary to {managed:?}");
+            // The download URL is `releases/latest`, so a fresh install
+            // lands on whatever shipped most recently — which is the one
+            // thing the pin exists to prevent. Correct it before this
+            // binary is ever used, not 72 hours later.
+            reconcile_pin(&managed).await;
             touch_update_stamp(&managed);
             emit_state(&app, "ready", None);
         }
@@ -129,6 +140,71 @@ pub async fn ensure(app: tauri::AppHandle) {
                 emit_state(&app, "error", Some(e));
             }
         }
+    }
+}
+
+/// Report the managed binary's own version string, or None if it
+/// cannot be asked.
+async fn managed_version(managed: &Path) -> Option<String> {
+    let mut cmd = tokio::process::Command::new(managed);
+    cmd.arg("--version");
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = cmd.output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() { None } else { Some(v) }
+}
+
+/// Force the managed binary onto `PINNED_VERSION` when it is something
+/// else, ignoring the update throttle entirely.
+///
+/// This is the half of pinning that `maybe_self_update` cannot do. The
+/// first-run download fetches `releases/latest`, and the update path is
+/// rate-limited by a stamp that the download itself just refreshed, so
+/// without this a new install would run the newest release — precisely
+/// the version the pin exists to avoid — until the throttle expired.
+async fn reconcile_pin(managed: &Path) {
+    let Some(want) = PINNED_VERSION else { return };
+    let Some(have) = managed_version(managed).await else {
+        eprintln!("[ytdlp] pin: could not read version, leaving binary alone");
+        return;
+    };
+    if have == want {
+        return;
+    }
+    eprintln!("[ytdlp] pin: have {have}, want {want} — correcting");
+
+    let mut cmd = tokio::process::Command::new(managed);
+    cmd.arg("--update-to");
+    cmd.arg(format!("stable@{want}"));
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let run = async {
+        match cmd.output().await {
+            Ok(out) => {
+                let s = String::from_utf8_lossy(&out.stdout);
+                let line = s.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+                eprintln!("[ytdlp] pin ({}): {line}", out.status);
+            }
+            Err(e) => eprintln!("[ytdlp] pin spawn failed: {e}"),
+        }
+    };
+    if tokio::time::timeout(UPDATE_TIMEOUT, run).await.is_err() {
+        eprintln!("[ytdlp] pin timed out");
+    }
+    // Say plainly whether it worked; a silent failure here means the app
+    // is running an unvetted extractor policy.
+    match managed_version(managed).await {
+        Some(v) if v == want => eprintln!("[ytdlp] pin: now at {v}"),
+        Some(v) => eprintln!("[ytdlp] pin: STILL at {v}, wanted {want}"),
+        None => eprintln!("[ytdlp] pin: version unreadable after correction"),
     }
 }
 
