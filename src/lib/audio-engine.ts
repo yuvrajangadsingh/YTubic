@@ -22,12 +22,15 @@ import { useLyricsSources } from "@/lib/lyrics/sources";
 import { correctedDuration, shouldSkipOutro } from "@/lib/outro";
 import {
   effectiveVideoQuality,
+  formatVideoTrace,
   mediaErrorFailure,
   watchdogVerdict,
   VIDEO_ABSOLUTE_MS,
   VIDEO_FIRST_FRAME_MS,
   type VideoFailure,
   type VideoFailurePhase,
+  type VideoOutcome,
+  type VideoTrace,
 } from "@/lib/video-diagnostics";
 
 /**
@@ -148,20 +151,48 @@ export function useAudioEngine() {
   // the companion effect below and judged by the watchdog above it.
   // Separate from the hold because the hold is about WHEN to start
   // playing and this is about whether anything is happening at all.
-  const videoProbeRef = useRef<{
-    token: number;
-    startedAt: number;
-    lastProgressAt: number;
-    phase: VideoFailurePhase;
-    lastReadyState: number;
-    lastBuffered: number;
-  } | null>(null);
+  const videoProbeRef = useRef<
+    | (VideoTrace & {
+        token: number;
+        startedAt: number;
+        lastProgressAt: number;
+        phase: VideoFailurePhase;
+        lastReadyState: number;
+        lastBuffered: number;
+        /** What has already been logged for this attempt: nothing, the
+         *  success line, or a terminal failure. A video that plays and
+         *  THEN dies is worth both lines; the same event repeating (a
+         *  `resize` after `loadeddata`) is not. */
+        traced: "none" | "played" | "final";
+      })
+    | null
+  >(null);
   /** Mark forward motion (and optionally advance the phase). */
   const noteVideoProgress = (phase?: VideoFailurePhase) => {
     const p = videoProbeRef.current;
     if (!p) return;
     if (phase) p.phase = phase;
     p.lastProgressAt = performance.now();
+  };
+  /** First sign of actual data, whatever reported it. */
+  const noteFirstByte = () => {
+    const p = videoProbeRef.current;
+    if (!p || p.firstByteMs !== undefined) return;
+    p.firstByteMs = performance.now() - p.startedAt;
+  };
+  /**
+   * Close out the attempt with one `[vtrace]` line. Logged at info
+   * level, not behind a DEV flag: the whole point is being able to read
+   * what happened in the installed app, which is where this fails.
+   */
+  const traceVideo = (outcome: VideoOutcome) => {
+    const p = videoProbeRef.current;
+    if (!p || p.traced === "final") return;
+    if (outcome.kind === "played" && p.traced === "played") return;
+    p.traced = outcome.kind === "played" ? "played" : "final";
+    console.info(
+      formatVideoTrace(p, outcome, performance.now() - p.startedAt),
+    );
   };
   const maybeStartHeld = () => {
     const el = audioRef.current;
@@ -194,13 +225,22 @@ export function useAudioEngine() {
    * fallbackHeld this also runs when no hold is pending, because a
    * video can die mid-song too and that was silently swallowed.
    */
-  const abandonVideo = (failure: VideoFailure | null) => {
+  const abandonVideo = (
+    failure: VideoFailure | null,
+    outcome?: VideoOutcome,
+  ) => {
     const el = audioRef.current;
     const h = videoHoldRef.current;
     if (h) {
       window.clearInterval(h.watchdog);
       videoHoldRef.current = null;
     }
+    traceVideo(
+      outcome ??
+        (failure
+          ? { kind: "failed", failure }
+          : { kind: "abandoned", why: "video mode off" }),
+    );
     videoProbeRef.current = null;
     const st = usePlaybackStore.getState();
     st.setVideoStartup(failure ? "failed" : "idle", failure ?? undefined);
@@ -686,6 +726,11 @@ export function useAudioEngine() {
         phase: "resolving",
         lastReadyState: comp?.readyState ?? 0,
         lastBuffered: 0,
+        traced: "none",
+        videoId: streamVideoId,
+        requestedHeight: effectiveVideoQuality(
+          useSettingsStore.getState().videoQuality,
+        ),
       };
       const watchdog = window.setInterval(() => {
         const h = videoHoldRef.current;
@@ -716,6 +761,7 @@ export function useAudioEngine() {
             p.lastReadyState = live.readyState;
             p.lastBuffered = buffered;
             p.lastProgressAt = nowMs;
+            if (live.readyState > 0 || buffered > 0) noteFirstByte();
           }
         }
         const verdict = watchdogVerdict({
@@ -724,7 +770,9 @@ export function useAudioEngine() {
           lastProgressMs: p.lastProgressAt,
           phase: p.phase,
         });
-        if (verdict) abandonVideo(verdict);
+        if (verdict) {
+          abandonVideo(verdict, { kind: "timeout", failure: verdict });
+        }
       }, 1000);
       videoHoldRef.current = {
         token,
@@ -884,6 +932,10 @@ export function useAudioEngine() {
     const onLoaded = () => {
       if (cancelled) return;
       noteVideoProgress("decode");
+      const probe = videoProbeRef.current;
+      if (probe && probe.dataMs === undefined) {
+        probe.dataMs = performance.now() - probe.startedAt;
+      }
       // Affirmative readiness: `loadeddata` alone is not a picture.
       // WKWebView will happily report data for a track it cannot show,
       // and promoting that to "video" is how a dead 4K pull ended up
@@ -891,6 +943,12 @@ export function useAudioEngine() {
       // real dimensions (they can still arrive on a later `resize`);
       // the watchdog calls it if they never do.
       if (!video.videoWidth || !video.videoHeight) return;
+      if (probe) {
+        probe.width = video.videoWidth;
+        probe.height = video.videoHeight;
+      }
+      // A picture exists — that is the success this attempt was for.
+      traceVideo({ kind: "played" });
       const st = usePlaybackStore.getState();
       st.setStreamKind("video");
       st.setStreamVideoHeight(video.videoHeight || null);
@@ -942,8 +1000,18 @@ export function useAudioEngine() {
       if (!cancelled) usePlaybackStore.getState().setVideoBuffering(false);
     };
     const onLoadStart = () => noteVideoProgress("transport");
-    const onProgress = () => noteVideoProgress();
-    const onMetadata = () => noteVideoProgress("decode");
+    const onProgress = () => {
+      noteVideoProgress();
+      noteFirstByte();
+    };
+    const onMetadata = () => {
+      noteVideoProgress("decode");
+      noteFirstByte();
+      const p = videoProbeRef.current;
+      if (p && p.metadataMs === undefined) {
+        p.metadataMs = performance.now() - p.startedAt;
+      }
+    };
     // First-frame check. Frames that decode but never reach the screen
     // are a distinct failure from frames that never decode, and only
     // this phase can tell them apart. Armed on actual playback and only
@@ -1027,6 +1095,10 @@ export function useAudioEngine() {
       .then((src) => {
         if (cancelled) return;
         noteVideoProgress("transport");
+        const p = videoProbeRef.current;
+        if (p && p.resolveMs === undefined) {
+          p.resolveMs = performance.now() - p.startedAt;
+        }
         video.src = src;
         video.load();
       })
@@ -1137,6 +1209,10 @@ export function useAudioEngine() {
         window.clearInterval(videoHoldRef.current.watchdog);
         videoHoldRef.current = null;
       }
+      // An attempt torn down before it ever settled still gets its line:
+      // "the video never appeared and nothing was logged" is the exact
+      // hole this trace exists to close.
+      traceVideo({ kind: "abandoned", why: "track or mode changed" });
       videoProbeRef.current = null;
     };
   }, [streamVideoId, wantVideo, premiumOk, retryNonce]);

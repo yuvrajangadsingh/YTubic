@@ -2457,6 +2457,15 @@ fn vonly_height(req: &Request) -> u32 {
     if VONLY_HEIGHTS.contains(&h) { h } else { 1080 }
 }
 
+/// Short name for logs and `[vtrace]` lines.
+fn variant_label(variant: StreamVariant) -> String {
+    match variant {
+        StreamVariant::Muxed => "muxed".to_string(),
+        StreamVariant::VideoOnly(h) => format!("vonly{h}"),
+        StreamVariant::Audio => "audio".to_string(),
+    }
+}
+
 fn stream_variant(req: &Request) -> StreamVariant {
     if query_flag(req, "vonly") {
         StreamVariant::VideoOnly(vonly_height(req))
@@ -3094,14 +3103,20 @@ fn spawn_downloader(
         let _ = tokio::fs::create_dir_all(&target_dir).await;
         let _ = tokio::fs::remove_file(&part_path).await; // clean stale
 
+        let format = match variant {
+            StreamVariant::Muxed => VIDEO_FORMAT.to_string(),
+            StreamVariant::VideoOnly(h) => vonly_format(h),
+            StreamVariant::Audio => AUDIO_FORMAT.to_string(),
+        };
+        let label = variant_label(variant);
+        let t0 = std::time::Instant::now();
+        let mut first_byte_ms: Option<u128> = None;
+        let mut received: u64 = 0;
+
         let mut cmd = TokioCommand::new(ytdlp::program(&srv.ytdlp_bin));
         cmd.args([
             "-f",
-            &match variant {
-                StreamVariant::Muxed => VIDEO_FORMAT.to_string(),
-                StreamVariant::VideoOnly(h) => vonly_format(h),
-                StreamVariant::Audio => AUDIO_FORMAT.to_string(),
-            },
+            &format,
             "--no-playlist",
             "--no-warnings",
             "--no-part",
@@ -3159,6 +3174,10 @@ fn spawn_downloader(
                 }
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
+                    if first_byte_ms.is_none() {
+                        first_byte_ms = Some(t0.elapsed().as_millis());
+                    }
+                    received += n as u64;
                     let chunk = &buf[..n];
                     if let Some(ref mut f) = file {
                         if let Err(e) = f.write_all(chunk).await {
@@ -3200,23 +3219,40 @@ fn spawn_downloader(
             .await
             .map(|m| m.len())
             .unwrap_or(0);
-        if success && part_size >= MIN_AUDIO_BYTES {
+        let outcome = if success && part_size >= MIN_AUDIO_BYTES {
             if let Err(e) = tokio::fs::rename(&part_path, &final_path).await {
                 eprintln!("[stream] rename: {e}");
                 let _ = tokio::fs::remove_file(&part_path).await;
+                "rename-failed"
             } else {
                 eprintln!("[stream] cached {video_id} ({part_size} bytes)");
+                "cached"
             }
         } else {
-            if success {
+            let why = if success {
                 eprintln!(
                     "[stream] download too small for {video_id}: {part_size} bytes (min {MIN_AUDIO_BYTES})"
                 );
+                "too-small"
             } else {
                 eprintln!("[stream] download failed {video_id}");
-            }
+                "failed"
+            };
             let _ = tokio::fs::remove_file(&part_path).await;
-        }
+            why
+        };
+        // Server half of the [vtrace] record: what was asked for, how
+        // long the bytes took and how many there were. `format` is the
+        // yt-dlp selector, which is as close to "chosen itag" as we can
+        // get without a second resolve; the container the element
+        // actually receives is sniffed and logged by stream_handler.
+        eprintln!(
+            "[vtrace] download video={video_id} variant={label} format={format:?} first_byte_ms={} bytes={received} total_ms={} outcome={outcome}",
+            first_byte_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            t0.elapsed().as_millis(),
+        );
 
         state.complete.store(true, Ordering::Release);
         state.notify.notify_waiters();
@@ -3292,6 +3328,7 @@ async fn stream_handler(
         },
     );
     let final_path = target_dir.join(stream_file_names(&video_id, variant).1);
+    let variant_label = variant_label(variant);
 
     // If the full file isn't on disk yet, start (or attach to) the
     // download and block until it completes. Attempting to progressively
@@ -3320,17 +3357,16 @@ async fn stream_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // Snapshot BEFORE the (possibly very long) wait below, so the trace
+    // can say whether this request was served from disk or paid for the
+    // whole download itself.
+    let cached = final_path.exists();
     eprintln!(
-        "[stream] GET /stream/{video_id} range={range_hdr:?} cached={} ephemeral={ephemeral} variant={}",
-        match variant {
-            StreamVariant::Muxed => "muxed".to_string(),
-            StreamVariant::VideoOnly(h) => format!("vonly{h}"),
-            StreamVariant::Audio => "audio".to_string(),
-        },
-        final_path.exists()
+        "[stream] GET /stream/{video_id} range={range_hdr:?} cached={cached} ephemeral={ephemeral} variant={variant_label}"
     );
+    let mut wait_ms: u128 = 0;
 
-    if !final_path.exists() {
+    if !cached {
         let state = {
             let mut map = srv.downloads.lock().await;
             if let Some(s) = map.get(&map_key) {
@@ -3361,17 +3397,27 @@ async fn stream_handler(
         while !state.complete.load(Ordering::Acquire) {
             if tokio::time::Instant::now() >= deadline {
                 eprintln!("[stream] {video_id}: TIMEOUT after 120s");
+                eprintln!(
+                    "[vtrace] serve video={video_id} variant={variant_label} cached=false blocked=true wait_ms={} total_ms={} bytes=0 status=504",
+                    t0.elapsed().as_millis(),
+                    t0.elapsed().as_millis(),
+                );
                 return (StatusCode::GATEWAY_TIMEOUT, "download timeout").into_response();
             }
             let notified = state.notify.notified();
             tokio::pin!(notified);
             let _ = tokio::time::timeout(Duration::from_secs(5), notified).await;
         }
+        wait_ms = t0.elapsed().as_millis();
 
         if !final_path.exists() {
             eprintln!(
                 "[stream] {video_id}: BAD_GATEWAY — complete but no .webm (elapsed {:.2}s)",
                 t0.elapsed().as_secs_f32()
+            );
+            eprintln!(
+                "[vtrace] serve video={video_id} variant={variant_label} cached=false blocked=true wait_ms={wait_ms} total_ms={} bytes=0 status=502",
+                t0.elapsed().as_millis(),
             );
             return (StatusCode::BAD_GATEWAY, "download failed").into_response();
         }
@@ -3410,6 +3456,19 @@ async fn stream_handler(
         resp.headers()
             .get(axum::http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok()),
+    );
+    // The server half of the [vtrace] story the frontend logs for the
+    // same attempt. `blocked=true` is the expensive case: this request
+    // waited out a whole download before it could answer with byte 0.
+    let bytes = tokio::fs::metadata(&final_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    eprintln!(
+        "[vtrace] serve video={video_id} variant={variant_label} cached={cached} blocked={} wait_ms={wait_ms} total_ms={} bytes={bytes} status={} ct={sniffed_ct}",
+        !cached,
+        t0.elapsed().as_millis(),
+        resp.status().as_u16(),
     );
     resp
 }

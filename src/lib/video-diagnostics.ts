@@ -135,6 +135,69 @@ export const VIDEO_ABSOLUTE_MS = 28_000;
 export const VIDEO_FIRST_FRAME_MS = 6_000;
 
 /**
+ * One video attempt's timing, as the frontend sees it. The server half
+ * of the same story (cache hit, whether the request blocked on a whole
+ * download, bytes) is logged from Rust under the same `[vtrace]` prefix
+ * — grep both and a single attempt reads end to end.
+ */
+export type VideoTrace = {
+  videoId: string;
+  /** Height actually requested, i.e. already capped. */
+  requestedHeight: number;
+  /** ms from the attempt starting to holding a stream URL. */
+  resolveMs?: number;
+  /** ms to the first sign of data on the element. */
+  firstByteMs?: number;
+  metadataMs?: number;
+  dataMs?: number;
+  width?: number;
+  height?: number;
+};
+
+/**
+ * Terminal state of an attempt. `timeout:<phase>` is kept distinct from
+ * `failed:<phase>` on purpose: one means nothing answered, the other
+ * means something answered and was wrong.
+ */
+export type VideoOutcome =
+  | { kind: "played" }
+  | { kind: "failed"; failure: VideoFailure }
+  | { kind: "timeout"; failure: VideoFailure }
+  | { kind: "abandoned"; why: string };
+
+function outcomeField(o: VideoOutcome): string {
+  switch (o.kind) {
+    case "played":
+      return "played";
+    case "failed":
+      return `failed:${o.failure.phase}:${o.failure.reason}`;
+    case "timeout":
+      return `timeout:${o.failure.phase}`;
+    case "abandoned":
+      return `abandoned:${o.why}`;
+  }
+}
+
+const ms = (v: number | undefined) => (v === undefined ? "-" : Math.round(v));
+
+/** One greppable line per attempt. Pure so the format is testable. */
+export function formatVideoTrace(
+  t: VideoTrace,
+  outcome: VideoOutcome,
+  totalMs: number,
+): string {
+  const dims =
+    t.width && t.height ? `${t.width}x${t.height}` : "-";
+  return (
+    `[vtrace] video=${t.videoId} h=${t.requestedHeight}` +
+    ` resolve_ms=${ms(t.resolveMs)} first_byte_ms=${ms(t.firstByteMs)}` +
+    ` meta_ms=${ms(t.metadataMs)} data_ms=${ms(t.dataMs)}` +
+    ` dims=${dims} total_ms=${Math.round(totalMs)}` +
+    ` outcome=${outcomeField(outcome)}`
+  );
+}
+
+/**
  * The watchdog's whole decision, kept pure so it can be tested without
  * a media element. Returns null while the attempt is still allowed to
  * run. The message always names the phase it gave up in — a stall in
