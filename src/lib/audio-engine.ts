@@ -20,7 +20,15 @@ import { fetchPanelDuration } from "@/lib/innertube/radio";
 import { pickThumbnail } from "@/components/shared/thumbnail";
 import { useLyricsSources } from "@/lib/lyrics/sources";
 import { correctedDuration, shouldSkipOutro } from "@/lib/outro";
-import { effectiveVideoQuality } from "@/lib/video-diagnostics";
+import {
+  effectiveVideoQuality,
+  mediaErrorFailure,
+  watchdogVerdict,
+  VIDEO_ABSOLUTE_MS,
+  VIDEO_FIRST_FRAME_MS,
+  type VideoFailure,
+  type VideoFailurePhase,
+} from "@/lib/video-diagnostics";
 
 /**
  * AudioEngine binds the playback store to a singleton HTMLAudioElement and
@@ -127,17 +135,39 @@ export function useAudioEngine() {
     token: number;
     audioReady: boolean;
     videoReady: boolean;
-    timer: number;
+    /** Interval id of the startup watchdog, not a one-shot timer: the
+     *  attempt is judged on lack of PROGRESS, not on a fixed budget
+     *  spanning resolve + download + decode. */
+    watchdog: number;
     // Carried playhead for a same-track reload: the companion must be
     // seeked here and ready HERE (not at 0) before the held start
     // releases, or the audio leads while the video buffers its target.
     targetSeconds?: number;
   } | null>(null);
+  // What the current video attempt has actually achieved, written by
+  // the companion effect below and judged by the watchdog above it.
+  // Separate from the hold because the hold is about WHEN to start
+  // playing and this is about whether anything is happening at all.
+  const videoProbeRef = useRef<{
+    token: number;
+    startedAt: number;
+    lastProgressAt: number;
+    phase: VideoFailurePhase;
+    lastReadyState: number;
+    lastBuffered: number;
+  } | null>(null);
+  /** Mark forward motion (and optionally advance the phase). */
+  const noteVideoProgress = (phase?: VideoFailurePhase) => {
+    const p = videoProbeRef.current;
+    if (!p) return;
+    if (phase) p.phase = phase;
+    p.lastProgressAt = performance.now();
+  };
   const maybeStartHeld = () => {
     const el = audioRef.current;
     const h = videoHoldRef.current;
     if (!el || !h || !h.audioReady || !h.videoReady) return;
-    window.clearTimeout(h.timer);
+    window.clearInterval(h.watchdog);
     videoHoldRef.current = null;
     const st = usePlaybackStore.getState();
     st.setVideoStartup("ready");
@@ -153,24 +183,38 @@ export function useAudioEngine() {
       if (comp) void playLocal(comp).catch(() => {});
     }
   };
-  /** Abandon the hold and continue audio-only (timeout / error / mode
-   *  off). Detaches the companion so a late loadeddata can't resurrect
-   *  the video mid-song at the wrong time. */
-  const fallbackHeld = (startup: "fallback" | "idle") => {
+  /**
+   * Give up on the video and continue audio-only. Detaches the
+   * companion so a late loadeddata can't resurrect the video mid-song
+   * at the wrong time.
+   *
+   * `failure` is what the UI shows and what the trace records; pass
+   * null only for a deliberate stand-down (video mode switched off),
+   * which is not a failure and must not display one. Unlike the old
+   * fallbackHeld this also runs when no hold is pending, because a
+   * video can die mid-song too and that was silently swallowed.
+   */
+  const abandonVideo = (failure: VideoFailure | null) => {
     const el = audioRef.current;
     const h = videoHoldRef.current;
-    if (!h) return;
-    window.clearTimeout(h.timer);
-    videoHoldRef.current = null;
+    if (h) {
+      window.clearInterval(h.watchdog);
+      videoHoldRef.current = null;
+    }
+    videoProbeRef.current = null;
     const st = usePlaybackStore.getState();
-    st.setVideoStartup(startup);
+    st.setVideoStartup(failure ? "failed" : "idle", failure ?? undefined);
     st.setStreamKind("audio");
+    st.setStreamVideoHeight(null);
+    st.setVideoBuffering(false);
     const comp = companionVideoSingleton;
     if (comp) {
       comp.removeAttribute("src");
       comp.load();
     }
-    if (el && st.playing) void playLocal(el).catch(() => {});
+    // Only a HELD start owes the user a play(): without a hold the
+    // master was never suppressed and is already running.
+    if (h && el && st.playing) void playLocal(el).catch(() => {});
   };
 
   // Ensure a single media element exists. It's a <video> element, not
@@ -617,27 +661,76 @@ export function useAudioEngine() {
     usePlaybackStore.getState().setStatus("loading");
 
     // Establish the startup hold NOW (not in the async .then) so the
-    // companion becoming ready first still finds it. Staged timeout:
-    // cold 4K legitimately takes ~15s, 1080p should never.
+    // companion becoming ready first still finds it.
     if (videoHoldRef.current) {
-      window.clearTimeout(videoHoldRef.current.timer);
+      window.clearInterval(videoHoldRef.current.watchdog);
       videoHoldRef.current = null;
     }
     if (wantVideo) {
-      const cap = useSettingsStore.getState().videoQuality;
-      const timer = window.setTimeout(
-        () => {
-          const h = videoHoldRef.current;
-          if (!h || h.token !== token) return;
-          fallbackHeld("fallback");
-        },
-        cap > 1080 ? 20_000 : 12_000,
+      const startedAt = performance.now();
+      const comp = companionVideoSingleton;
+      // Advancing to a DUPLICATE of the playing track (same videoId at
+      // another queue index) re-runs this effect but not the companion
+      // effect, so no second loadeddata is coming for frames that are
+      // already decoded. Count them as ready instead of waiting out a
+      // timeout and throwing away a working video.
+      const alreadyShowing = !!(
+        comp?.getAttribute("src") &&
+        comp.readyState >= 2 &&
+        comp.videoWidth > 0
       );
+      videoProbeRef.current = {
+        token,
+        startedAt,
+        lastProgressAt: startedAt,
+        phase: "resolving",
+        lastReadyState: comp?.readyState ?? 0,
+        lastBuffered: 0,
+      };
+      const watchdog = window.setInterval(() => {
+        const h = videoHoldRef.current;
+        const p = videoProbeRef.current;
+        if (!h || h.token !== token || !p || p.token !== token) return;
+        const nowMs = performance.now();
+        if (h.videoReady) {
+          // The video side is done and the hold is only waiting on the
+          // audio master now. That is never a video failure — release
+          // the hold at the absolute cap and let both elements catch
+          // up rather than blaming the picture for the sound.
+          if (nowMs - p.startedAt >= VIDEO_ABSOLUTE_MS) {
+            h.audioReady = true;
+            maybeStartHeld();
+          }
+          return;
+        }
+        // Affirmative progress: bytes buffered or a readyState step.
+        // The failure this exists to catch fires NO media event at all
+        // (networkState stuck LOADING, readyState HAVE_NOTHING), so
+        // waiting to be told would wait forever.
+        const live = companionVideoSingleton;
+        if (live) {
+          const buffered = live.buffered.length
+            ? live.buffered.end(live.buffered.length - 1)
+            : 0;
+          if (live.readyState !== p.lastReadyState || buffered > p.lastBuffered) {
+            p.lastReadyState = live.readyState;
+            p.lastBuffered = buffered;
+            p.lastProgressAt = nowMs;
+          }
+        }
+        const verdict = watchdogVerdict({
+          nowMs,
+          startedAtMs: p.startedAt,
+          lastProgressMs: p.lastProgressAt,
+          phase: p.phase,
+        });
+        if (verdict) abandonVideo(verdict);
+      }, 1000);
       videoHoldRef.current = {
         token,
         audioReady: false,
-        videoReady: false,
-        timer,
+        videoReady: alreadyShowing,
+        watchdog,
         targetSeconds:
           carrySeekRef.current?.token === token
             ? carrySeekRef.current.seconds
@@ -790,6 +883,14 @@ export function useAudioEngine() {
     };
     const onLoaded = () => {
       if (cancelled) return;
+      noteVideoProgress("decode");
+      // Affirmative readiness: `loadeddata` alone is not a picture.
+      // WKWebView will happily report data for a track it cannot show,
+      // and promoting that to "video" is how a dead 4K pull ended up
+      // looking exactly like a track that simply has no video. Wait for
+      // real dimensions (they can still arrive on a later `resize`);
+      // the watchdog calls it if they never do.
+      if (!video.videoWidth || !video.videoHeight) return;
       const st = usePlaybackStore.getState();
       st.setStreamKind("video");
       st.setStreamVideoHeight(video.videoHeight || null);
@@ -825,13 +926,14 @@ export function useAudioEngine() {
     };
     const onError = () => {
       if (cancelled) return;
-      // No high-res track (or it failed to decode): continue audio-only
-      // so the surfaces keep showing artwork instead of a black box.
-      if (videoHoldRef.current) {
-        fallbackHeld("fallback");
-      } else {
-        usePlaybackStore.getState().setStreamKind("audio");
-      }
+      // Tearing the element down (`removeAttribute("src")` + `load()`)
+      // can surface as an error event; an element holding nothing has
+      // nothing to report.
+      if (!video.getAttribute("src")) return;
+      // READ the error. The old handler ignored `video.error` entirely,
+      // which is the whole reason a failed 4K pull produced artwork and
+      // not one word about why.
+      abandonVideo(mediaErrorFailure(video.error));
     };
     const onWaiting = () => {
       if (!cancelled) usePlaybackStore.getState().setVideoBuffering(true);
@@ -839,11 +941,65 @@ export function useAudioEngine() {
     const onFlowing = () => {
       if (!cancelled) usePlaybackStore.getState().setVideoBuffering(false);
     };
+    const onLoadStart = () => noteVideoProgress("transport");
+    const onProgress = () => noteVideoProgress();
+    const onMetadata = () => noteVideoProgress("decode");
+    // First-frame check. Frames that decode but never reach the screen
+    // are a distinct failure from frames that never decode, and only
+    // this phase can tell them apart. Armed on actual playback and only
+    // while the surface is really on screen: a paused, detached or
+    // backgrounded element is SUPPOSED to present nothing, and demanding
+    // a frame from one would invent failures.
+    let framesSeen = false;
+    let frameHandle = 0;
+    let frameTimer = 0;
+    const onScreen = () =>
+      video.isConnected && document.visibilityState === "visible";
+    const onCompanionPlaying = () => {
+      onFlowing();
+      noteVideoProgress();
+      if (cancelled || framesSeen || frameTimer) return;
+      if (typeof video.requestVideoFrameCallback !== "function") return;
+      if (!onScreen()) return;
+      const armedAt = video.currentTime;
+      frameHandle = video.requestVideoFrameCallback(() => {
+        framesSeen = true;
+        frameHandle = 0;
+        window.clearTimeout(frameTimer);
+        frameTimer = 0;
+      });
+      frameTimer = window.setTimeout(() => {
+        frameTimer = 0;
+        if (cancelled || framesSeen) return;
+        // Re-check: the user may have paused, hidden the window or
+        // navigated the surface away since it was armed.
+        if (video.paused || !onScreen()) return;
+        // A missing frame callback on its own is not proof of a broken
+        // picture — WebKit throttles rendering for an occluded window
+        // while still calling itself visible, and killing a video the
+        // user is only half-watching would be a worse bug than the one
+        // this whole change exists to fix. Only call it dead when the
+        // media clock is stuck too, i.e. nothing at all is coming out.
+        if (video.currentTime > armedAt + 0.25) return;
+        abandonVideo({
+          phase: "presentation",
+          reason: `playback started but no frame appeared in ${Math.round(
+            VIDEO_FIRST_FRAME_MS / 1000,
+          )}s`,
+        });
+      }, VIDEO_FIRST_FRAME_MS);
+    };
     video.addEventListener("loadeddata", onLoaded);
+    // Dimensions can land after loadeddata; re-run the readiness check
+    // rather than sitting on a 0x0 element until the watchdog fires.
+    video.addEventListener("resize", onLoaded);
     video.addEventListener("error", onError);
     video.addEventListener("waiting", onWaiting);
-    video.addEventListener("playing", onFlowing);
+    video.addEventListener("playing", onCompanionPlaying);
     video.addEventListener("canplay", onFlowing);
+    video.addEventListener("loadstart", onLoadStart);
+    video.addEventListener("progress", onProgress);
+    video.addEventListener("loadedmetadata", onMetadata);
     master.addEventListener("play", follow);
     master.addEventListener("pause", follow);
     master.addEventListener("seeked", syncNow);
@@ -870,16 +1026,18 @@ export function useAudioEngine() {
     })
       .then((src) => {
         if (cancelled) return;
+        noteVideoProgress("transport");
         video.src = src;
         video.load();
       })
-      .catch(() => {
+      .catch((e: unknown) => {
         if (cancelled) return;
-        if (videoHoldRef.current) {
-          fallbackHeld("fallback");
-        } else {
-          usePlaybackStore.getState().setStreamKind("audio");
-        }
+        abandonVideo({
+          phase: "resolving",
+          reason: `could not reach the local stream server (${
+            e instanceof Error ? e.message : String(e)
+          })`,
+        });
       });
 
     // Quality changes hot-swap WITHOUT tearing the surface down: a
@@ -947,11 +1105,19 @@ export function useAudioEngine() {
         warm.load();
       }
       window.clearInterval(drift);
+      window.clearTimeout(frameTimer);
+      if (frameHandle && typeof video.cancelVideoFrameCallback === "function") {
+        video.cancelVideoFrameCallback(frameHandle);
+      }
       video.removeEventListener("loadeddata", onLoaded);
+      video.removeEventListener("resize", onLoaded);
       video.removeEventListener("error", onError);
       video.removeEventListener("waiting", onWaiting);
-      video.removeEventListener("playing", onFlowing);
+      video.removeEventListener("playing", onCompanionPlaying);
       video.removeEventListener("canplay", onFlowing);
+      video.removeEventListener("loadstart", onLoadStart);
+      video.removeEventListener("progress", onProgress);
+      video.removeEventListener("loadedmetadata", onMetadata);
       master.removeEventListener("play", follow);
       master.removeEventListener("pause", follow);
       master.removeEventListener("seeked", syncNow);
@@ -968,9 +1134,10 @@ export function useAudioEngine() {
       // master resolve effect re-runs right after every cleanup of this
       // effect and re-establishes hold state for the new inputs.
       if (videoHoldRef.current) {
-        window.clearTimeout(videoHoldRef.current.timer);
+        window.clearInterval(videoHoldRef.current.watchdog);
         videoHoldRef.current = null;
       }
+      videoProbeRef.current = null;
     };
   }, [streamVideoId, wantVideo, premiumOk, retryNonce]);
 

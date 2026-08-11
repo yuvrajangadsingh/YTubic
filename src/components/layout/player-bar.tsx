@@ -714,6 +714,7 @@ export function PlayerBar({
   const castState = useCastStore((s) => (s.deviceId ? s.state : null));
   const videoBuffering = usePlaybackStore((s) => s.videoBuffering);
   const videoStartup = usePlaybackStore((s) => s.videoStartup);
+  const videoFailure = usePlaybackStore((s) => s.videoFailure);
   const iTunesCover = useLatchedCover(track, useITunesCover(track));
   // Accent for the whole player surface, pulled from the cover art (same
   // source the fullscreen view uses) so the seek fill, play button, and
@@ -885,12 +886,24 @@ export function PlayerBar({
               />
               {/* Playback is held until the video is ready (loader in
                   the middle of the art, YouTube style). "waiting" only;
-                  a fallback start must not leave a stuck loader. */}
+                  a failed start must not leave a stuck loader. */}
               {videoStartup === "waiting" ? (
                 <div className="absolute inset-0 flex items-center justify-center">
                   <div className="flex items-center gap-1.5 rounded-full border border-hairline bg-black/55 px-3 py-1.5 text-xs font-medium text-white/85 backdrop-blur-md">
                     <Loader2Icon className="size-3.5 animate-spin" />
                     loading video
+                  </div>
+                </div>
+              ) : null}
+              {/* The video gave up and the artwork took over. Say so:
+                  this used to render nothing at all, so the picture
+                  vanishing looked identical to a track that never had
+                  one. Artwork stays, sound keeps playing. */}
+              {videoStartup === "failed" ? (
+                <div className="absolute inset-x-0 bottom-0 p-2">
+                  <div className="rounded-md border border-hairline bg-black/60 px-2 py-1 text-[11px] leading-snug text-white/85 backdrop-blur-md">
+                    video unavailable
+                    {videoFailure ? ` — ${videoFailure.reason}` : null}
                   </div>
                 </div>
               ) : null}

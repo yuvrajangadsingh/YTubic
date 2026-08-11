@@ -201,6 +201,7 @@ export function FullscreenPlayer({ onClose }: { onClose: () => void }) {
   const streamKind = usePlaybackStore((s) => s.streamKind);
   const videoBuffering = usePlaybackStore((s) => s.videoBuffering);
   const videoStartup = usePlaybackStore((s) => s.videoStartup);
+  const videoFailure = usePlaybackStore((s) => s.videoFailure);
 
   // Video mode hides the chrome after a few idle seconds (YouTube
   // behavior): any mouse/key activity brings it back, leaving video
@@ -525,6 +526,16 @@ export function FullscreenPlayer({ onClose }: { onClose: () => void }) {
                   <div className="flex items-center gap-1.5 rounded-full border border-hairline bg-black/55 px-3 py-1.5 text-sm font-medium text-white/85 backdrop-blur-md">
                     <Loader2Icon className="size-4 animate-spin" />
                     loading video
+                  </div>
+                </div>
+              ) : null}
+              {/* Same as the player bar: a video that gave up says why
+                  instead of silently becoming artwork. */}
+              {videoStartup === "failed" ? (
+                <div className="pointer-events-none absolute inset-x-0 top-0 flex aspect-square items-end justify-center p-3">
+                  <div className="rounded-md border border-hairline bg-black/60 px-2.5 py-1.5 text-xs leading-snug text-white/85 backdrop-blur-md">
+                    video unavailable
+                    {videoFailure ? ` — ${videoFailure.reason}` : null}
                   </div>
                 </div>
               ) : null}

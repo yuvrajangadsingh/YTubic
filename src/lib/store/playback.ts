@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ShelfItem, Thumbnail } from "@/lib/innertube/types";
 import { isFloatingPlayerWindow } from "@/lib/floating-player";
 import { isCasting } from "@/lib/store/cast";
+import type { VideoFailure } from "@/lib/video-diagnostics";
 import { safeLocalStorage } from "./safe-storage";
 
 /**
@@ -77,9 +78,15 @@ export type PlaybackState = {
   videoBuffering: boolean;
   /** Video-mode startup phase. "waiting" = playback is HELD until the
    *  video track is ready so audio and frames start together (loader
-   *  UI); "fallback" = the video never arrived (timeout/error) and
-   *  playback continued audio-only; "ready"/"idle" = nothing pending. */
-  videoStartup: "idle" | "waiting" | "ready" | "fallback";
+   *  UI); "failed" = the video never arrived and playback continued
+   *  audio-only, with `videoFailure` saying which phase died and why;
+   *  "ready"/"idle" = nothing pending. */
+  videoStartup: "idle" | "waiting" | "ready" | "failed";
+  /** Why the last video attempt was abandoned, for the UI line and the
+   *  [vtrace] log. Null unless `videoStartup` is "failed". This exists
+   *  because the old "fallback" value carried no reason and was matched
+   *  by no JSX, so a failure looked identical to having no video. */
+  videoFailure: VideoFailure | null;
 
   // Transport
   playing: boolean;
@@ -132,7 +139,10 @@ export type PlaybackState = {
   setStreamKind: (kind: "audio" | "video") => void;
   setStreamVideoHeight: (height: number | null) => void;
   setVideoBuffering: (v: boolean) => void;
-  setVideoStartup: (v: "idle" | "waiting" | "ready" | "fallback") => void;
+  setVideoStartup: (
+    v: "idle" | "waiting" | "ready" | "failed",
+    failure?: VideoFailure,
+  ) => void;
   /** Fill in a queue track's duration when it arrived without one
    *  (home-card queues). Only writes missing durations. */
   patchTrackDuration: (videoId: string, seconds: number) => void;
@@ -234,6 +244,7 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
   streamVideoHeight: null,
   videoBuffering: false,
   videoStartup: "idle",
+  videoFailure: null,
 
   playing: false,
   volume: 0.8,
@@ -515,7 +526,8 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
   setStreamKind: (streamKind) => set({ streamKind }),
   setStreamVideoHeight: (streamVideoHeight) => set({ streamVideoHeight }),
   setVideoBuffering: (videoBuffering) => set({ videoBuffering }),
-  setVideoStartup: (videoStartup) => set({ videoStartup }),
+  setVideoStartup: (videoStartup, failure) =>
+    set({ videoStartup, videoFailure: failure ?? null }),
   patchTrackDuration: (videoId, seconds) =>
     set((s) => {
       if (!(seconds > 0)) return s;
