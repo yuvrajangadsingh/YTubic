@@ -440,7 +440,9 @@ const TrackRow = memo(function TrackRow({
       ) : null}
 
       <span className="shrink-0 text-right text-xs tabular-nums text-muted-foreground">
-        {showPlays ? formatPlays(t.playCount) : formatDuration(t.duration)}
+        {showPlays && t.playCount
+          ? formatPlays(t.playCount)
+          : formatDuration(t.duration)}
       </span>
 
       <div className="flex shrink-0 items-center justify-end">
