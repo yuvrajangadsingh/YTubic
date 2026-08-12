@@ -102,7 +102,10 @@ function AlbumPageView() {
 
       <JumpToCurrentButton tracks={tracksWithCover} />
 
-      <TrackList tracks={tracksWithCover} hideThumbnails />
+      {/* Album rows carry YT Music's own play counts (parsed in
+          shared.ts); show those where present, with duration as the
+          fallback for rows that arrive without one. */}
+      <TrackList tracks={tracksWithCover} hideThumbnails showPlays />
     </div>
   );
 }
