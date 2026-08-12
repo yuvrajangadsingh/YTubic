@@ -20,9 +20,9 @@ type Props = {
   hideThumbnails?: boolean;
   /** Hide the album column. */
   hideAlbum?: boolean;
-  /** Replace the Duration column with Plays. Used on artist Top Songs
-   *  where YT doesn't ship duration in the shelf payload but does
-   *  ship a play count. */
+  /** Add a Plays column before Duration. Only worth setting where YT
+   *  ships play counts in the shelf payload (album pages, artist Top
+   *  Songs); rows without a count render the cell empty. */
   showPlays?: boolean;
   /** Enables "Remove from playlist" on rows; set only by an editable
    *  (user-owned) playlist page. */
@@ -154,18 +154,21 @@ export function TrackList({
 
   const showAlbum = !hideAlbum && tracks.some((t) => t.album);
 
-  // Grid template shared by the header row and every track row so the
-  // columns line up in a real "table" layout.
-  // Duration and Actions use FIXED widths so the header grid and the
-  // row grids agree on column boundaries — `auto` would let each
+  // Grid template shared by every track row so the columns line up in a
+  // real "table" layout.
+  // Plays, Duration and Actions use FIXED widths so the header grid and
+  // the row grids agree on column boundaries — `auto` would let each
   // container size the column to its own content (e.g. the word
   // "Duration" vs. "3:32") and the columns would visually drift apart.
+  // Every entry here must have a matching child in TrackRow, in the same
+  // order: a child with no column wraps onto an implicit second row.
   const gridTemplate = [
     "minmax(0,2fr)", // TRACK (thumb/index + title) — 2x weight so long
     // titles get the breathing room before truncation
     "minmax(0,1fr)", // ARTIST
     showAlbum ? "minmax(0,1fr)" : null, // ALBUM
-    showPlays ? "5rem" : "3.5rem", // DURATION or PLAYS — plays is wider
+    showPlays ? "5rem" : null, // PLAYS
+    "3.5rem", // DURATION
     "4rem", // ACTIONS (heart + more)
   ]
     .filter(Boolean)
@@ -439,10 +442,21 @@ const TrackRow = memo(function TrackRow({
         </div>
       ) : null}
 
-      <span className="shrink-0 text-right text-xs tabular-nums text-muted-foreground">
-        {showPlays && t.playCount
-          ? formatPlays(t.playCount)
-          : formatDuration(t.duration)}
+      {/* Plays and duration are separate columns rather than one slot:
+          both are wanted at once, and the fixed-width plays column keeps
+          the durations flush right even when a row has no count. */}
+      {showPlays ? (
+        <span className="min-w-0 truncate text-right text-xs tabular-nums text-muted-foreground">
+          {t.playCount ? formatPlays(t.playCount) : ""}
+        </span>
+      ) : null}
+
+      {/* The "no duration" placeholder only earns its space when
+          duration is the row's one trailing number. Artist Top Songs
+          ships plays but no duration, and a column of placeholders next
+          to real play counts is just noise. */}
+      <span className="text-right text-xs tabular-nums text-muted-foreground">
+        {t.duration || !showPlays ? formatDuration(t.duration) : ""}
       </span>
 
       <div className="flex shrink-0 items-center justify-end">
