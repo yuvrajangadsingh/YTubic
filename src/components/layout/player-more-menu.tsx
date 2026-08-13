@@ -82,22 +82,25 @@ function PlayerMoreMenuMain(props: Props) {
       onGoToArtist={(id) =>
         navigate({ to: "/artist/$id", params: { id } })
       }
+      onGoToAlbum={(id) => navigate({ to: "/album/$id", params: { id } })}
     />
   );
 }
 
 function PlayerMoreMenuFloating(props: Props) {
+  // Bring the main window to the front after either nav, so the user
+  // actually sees the page they just navigated to.
+  const handOff = (event: string, id: string) => {
+    void emit(event, { id });
+    void invoke("focus_main_window").catch(() => {
+      /* command might not be registered in older builds */
+    });
+  };
   return (
     <PlayerMoreMenuInner
       {...props}
-      onGoToArtist={(id) => {
-        void emit("nav:artist", { id });
-        // Bring the main window to the front so the user actually
-        // sees the page they just navigated to.
-        void invoke("focus_main_window").catch(() => {
-          /* command might not be registered in older builds */
-        });
-      }}
+      onGoToArtist={(id) => handOff("nav:artist", id)}
+      onGoToAlbum={(id) => handOff("nav:album", id)}
     />
   );
 }
@@ -114,7 +117,11 @@ function PlayerMoreMenuInner({
   align = "end",
   side = "top",
   onGoToArtist,
-}: Props & { onGoToArtist: (artistId: string) => void }) {
+  onGoToAlbum,
+}: Props & {
+  onGoToArtist: (artistId: string) => void;
+  onGoToAlbum: (albumId: string) => void;
+}) {
   const item: ShelfItem = track
     ? {
         kind: "song",
@@ -123,6 +130,7 @@ function PlayerMoreMenuInner({
         thumbnails: track.thumbnails,
         artists: track.artists,
         album: track.album,
+        albumId: track.albumId,
         duration: track.duration,
       }
     : { kind: "song", id: "", title: "", thumbnails: [] };
@@ -162,6 +170,7 @@ function PlayerMoreMenuInner({
                 controller={controller}
                 primitives={dropPrimitives}
                 onGoToArtist={onGoToArtist}
+                onGoToAlbum={onGoToAlbum}
               />
             </>
           ) : null}

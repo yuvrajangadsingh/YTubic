@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { mapShelfWrapper, splitSetCookieHeader, type YtNode } from "./shared";
+import {
+  mapShelfWrapper,
+  readMenuNavigation,
+  splitSetCookieHeader,
+  type YtNode,
+} from "./shared";
 
 // Fallback splitter for runtimes without Headers.getSetCookie. The
 // tricky part is NOT splitting on the comma inside an Expires date.
@@ -122,5 +127,83 @@ describe("mapShelfWrapper more endpoint", () => {
       },
     };
     expect(mapShelfWrapper(wrapper, 0).more).toBeUndefined();
+  });
+});
+
+// "Go to album" lives in a row's own overflow menu, not its byline.
+// Shapes below are from a live WEB_REMIX /search response (2026-08-13):
+// search song rows carry ALBUM + ARTIST menu entries, while song cards on
+// an artist page ship a menu with no navigation entries at all.
+describe("readMenuNavigation", () => {
+  const navItem = (pageType: string, browseId: string): YtNode => ({
+    menuNavigationItemRenderer: {
+      text: { runs: [{ text: "Go to something" }] },
+      navigationEndpoint: {
+        browseEndpoint: {
+          browseId,
+          browseEndpointContextSupportedConfigs: {
+            browseEndpointContextMusicConfig: { pageType },
+          },
+        },
+      },
+    },
+  });
+
+  it("pulls the album and artist browse ids out of a row menu", () => {
+    const raw: YtNode = {
+      menu: {
+        menuRenderer: {
+          items: [
+            { menuServiceItemRenderer: { text: { runs: [{ text: "Play next" }] } } },
+            navItem("MUSIC_PAGE_TYPE_ALBUM", "MPREb_vun6H0AZwAa"),
+            navItem("MUSIC_PAGE_TYPE_ARTIST", "UCwu0WWz0qynUrZilwyu0G5w"),
+          ],
+        },
+      },
+    };
+    expect(readMenuNavigation(raw)).toEqual({
+      albumId: "MPREb_vun6H0AZwAa",
+      artistId: "UCwu0WWz0qynUrZilwyu0G5w",
+    });
+  });
+
+  it("ignores non-album/artist navigation entries", () => {
+    const raw: YtNode = {
+      menu: {
+        menuRenderer: {
+          items: [navItem("MUSIC_PAGE_TYPE_TRACK_CREDITS", "MPTCHaSuADL62l0")],
+        },
+      },
+    };
+    expect(readMenuNavigation(raw)).toEqual({});
+  });
+
+  it("returns nothing for a menu with no navigation entries", () => {
+    const raw: YtNode = {
+      menu: {
+        menuRenderer: {
+          items: [{ menuServiceItemRenderer: { text: { runs: [{ text: "Share" }] } } }],
+        },
+      },
+    };
+    expect(readMenuNavigation(raw)).toEqual({});
+  });
+
+  it("returns nothing when the item has no menu at all", () => {
+    expect(readMenuNavigation({})).toEqual({});
+  });
+
+  it("keeps the first album id when a menu somehow lists two", () => {
+    const raw: YtNode = {
+      menu: {
+        menuRenderer: {
+          items: [
+            navItem("MUSIC_PAGE_TYPE_ALBUM", "MPREb_first"),
+            navItem("MUSIC_PAGE_TYPE_ALBUM", "MPREb_second"),
+          ],
+        },
+      },
+    };
+    expect(readMenuNavigation(raw).albumId).toBe("MPREb_first");
   });
 });
