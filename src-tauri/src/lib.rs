@@ -2284,8 +2284,6 @@ fn resolve_stream_ytdlp(app: tauri::AppHandle, video_id: String) -> Result<Strin
         AUDIO_FORMAT,
         "--no-playlist",
         "--no-warnings",
-        "--extractor-args",
-        "youtube:player_client=android_vr,ios",
         &url,
     ]);
     // Windows: a console-less GUI process spawning the console-subsystem
@@ -2373,8 +2371,8 @@ type DownloadMap = Arc<Mutex<HashMap<String, Arc<DownloadState>>>>;
 // search, liked songs). We deliberately do NOT forward cookies to
 // yt-dlp: YouTube's bot-detection treats any authenticated yt-dlp
 // request as a bot and strips every real audio format, leaving only
-// storyboard thumbnails — so anonymous streaming via the android_vr/
-// ios/mweb clients actually works better than authenticated streaming.
+// storyboard thumbnails — so anonymous streaming via yt-dlp's default
+// clients actually works better than authenticated streaming.
 #[derive(Clone)]
 struct StreamServer {
     /// Persistent cache. Tracks land here for Premium-authenticated
@@ -3119,8 +3117,14 @@ fn spawn_downloader(
             "3",
             "--socket-timeout",
             "15",
-            "--extractor-args",
-            "youtube:player_client=android_vr,ios",
+            // No player_client pin. Every pinned client dies eventually
+            // (tv → DRM Jul 2026, android_vr → deterministic 403 on all
+            // media data Aug 20 2026), and a dead pin turns into this
+            // exact failure: every track 403s, the handler returns 502,
+            // the audio element throws SRC_NOT_SUPPORTED and the queue
+            // skip-cascades. yt-dlp's own default client rotation is
+            // maintained against YouTube changes and ships fixes within
+            // days — the managed binary self-updates on the same cadence.
             "-o",
             "-",
         ]);
