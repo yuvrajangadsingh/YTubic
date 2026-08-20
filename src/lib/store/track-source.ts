@@ -1,5 +1,4 @@
 import { create } from "zustand";
-import { createJSONStorage, persist } from "zustand/middleware";
 import { emit } from "@tauri-apps/api/event";
 import { isFloatingPlayerWindow } from "@/lib/floating-player";
 import { dropLegacyLocalStorageKey, safeIdbStorage } from "./idb-storage";
@@ -62,9 +61,7 @@ function capByVideoId(
   return out;
 }
 
-export const useTrackSourceStore = create<State>()(
-  persist(
-    (set) => ({
+export const useTrackSourceStore = create<State>()((set) => ({
       byVideoId: {},
       preferVideo: false,
       setAlternate: (knownId, kind, altId) =>
@@ -100,33 +97,23 @@ export const useTrackSourceStore = create<State>()(
           if (existing.video) next[existing.video] = updated;
           return { byVideoId: next };
         }),
-      // NB: not bridged from the floating window (its toggle only flips
-      // per-track state); the main window owns the global mode.
-      setPreferVideo: (preferVideo) => set({ preferVideo }),
-    }),
-    {
-      name: "ytm-track-source",
-      storage: createJSONStorage(() => safeIdbStorage),
-      // Drop all cached song<->video pairs whenever the identity gate gets
-      // stricter — the toggle short-circuits on a cached pair and never
-      // re-resolves, so a tightened gate is invisible to anyone already
-      // holding a bad one. Pairs are cheap to re-resolve.
-      //   v2: the pre-gate resolver (blind first-search-result) cached a
-      //       0:38 track against a 12:29 upload.
-      //   v3: the gate itself had holes — an unnamed artist counted as
-      //       agreement and a candidate with no duration skipped the window
-      //       check, so a 0:38 track cached against a 6:56 upload.
-      version: 3,
-      migrate: (persisted: unknown, version: number) => {
-        const prev = (persisted ?? {}) as Partial<State>;
-        if (version < 3) {
-          return { byVideoId: {}, preferVideo: prev.preferVideo ?? false };
-        }
-        return prev as State;
-      },
-    },
-  ),
-);
+  // NB: not bridged from the floating window (its toggle only flips
+  // per-track state); the main window owns the global mode.
+  setPreferVideo: (preferVideo) => set({ preferVideo }),
+}));
+
+// Session-only, deliberately. This store used to persist to IndexedDB,
+// and that turned the Source toggle into a trap: watching one music
+// video set the global `preferVideo` flag AND the auto-switch stamped
+// `chosen: true` per track, so a week later every launch still held
+// each song's start behind a "loading video" spinner and pulled a
+// 130-460MB 4K companion nobody asked for (2.5GB of vonly2160 files in
+// the cache before anyone noticed). A mode with no always-visible
+// indicator must not outlive the session that turned it on: every
+// launch now starts in Song mode with an empty pair cache. Pairs are
+// cheap to re-resolve, and an intentional video session still gets the
+// sticky behavior until the app closes.
+void safeIdbStorage.removeItem("ytm-track-source");
 
 dropLegacyLocalStorageKey("ytm-track-source");
 
