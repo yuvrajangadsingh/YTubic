@@ -110,6 +110,8 @@ objc2-foundation = { version = "0.3", features = [
     "NSString",
     "NSDictionary",
     "NSValue",
+    "NSProcessInfo",
+    "NSObjCRuntime",
 ] }
 objc2-media-player = { version = "0.3", features = [
     "MPNowPlayingInfoCenter",

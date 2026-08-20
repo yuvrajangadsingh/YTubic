@@ -25,6 +25,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeFile;
 
 mod now_playing;
+mod app_nap;
 mod appid;
 mod cast;
 mod discord;
@@ -2902,6 +2903,15 @@ fn set_now_playing(info: now_playing::NowPlayingInfo) {
     now_playing::apply(&info);
 }
 
+/// Hold (or release) the anti-App-Nap activity assertion. The audio
+/// engine sends true while a track is loading or playing and false
+/// when idle/paused — see `app_nap` for why the loading gap needs it.
+/// A no-op off macOS.
+#[tauri::command]
+fn set_playback_activity(active: bool) {
+    app_nap::set_active(active);
+}
+
 #[derive(Default)]
 struct StreamServerState {
     port: Arc<Mutex<Option<u16>>>,
@@ -3841,6 +3851,7 @@ pub fn run() {
             open_player_window,
             close_player_window,
             set_now_playing,
+            set_playback_activity,
             media::media_update,
             media::media_clear,
             discord::discord_update,
