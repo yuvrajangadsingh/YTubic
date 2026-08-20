@@ -1223,6 +1223,21 @@ export function useAudioEngine() {
   // chunk); by the time the user hits "next" the file is cached on
   // disk and playback starts instantly with full seek support.
   const status = usePlaybackStore((s) => s.status);
+
+  // App Nap guard. Audible audio keeps the process awake on its own,
+  // but the silent gap between tracks doesn't: with the window on
+  // another Space, macOS naps the process mid-download and the
+  // "download done → play" completion crawls until the window is
+  // visible again (next song only started after switching back to
+  // that desktop). Hold an activity assertion whenever playback is
+  // wanted — loading counts — and release it when idle, so a parked
+  // player still naps like any background app. No-op off macOS.
+  useEffect(() => {
+    const active = playing || status === "loading";
+    invoke("set_playback_activity", { active }).catch(() => {
+      /* older backend without the command — nap stays, nothing breaks */
+    });
+  }, [playing, status]);
   const { nextVideoId } = usePlaybackStore(
     useShallow((s) => ({
       nextVideoId:
