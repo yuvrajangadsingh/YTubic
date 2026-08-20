@@ -81,6 +81,25 @@ export async function fetchPanelDuration(
   return hit?.duration;
 }
 
+/**
+ * Album browse id for a single video, read from its own /next panel row.
+ *
+ * Home cards and some shelves ship no album anywhere in their payload —
+ * not in the byline, not in the overflow menu. The /next byline always
+ * carries it ("Artist • Album • Year"), and `mapPlaylistPanelVideo`
+ * already parses that, so this is the last-resort lookup behind
+ * "Go to album". Returns undefined for singles and non-album uploads,
+ * which genuinely have no album page.
+ */
+export async function fetchTrackAlbumId(
+  videoId: string,
+): Promise<string | undefined> {
+  const tracks = parsePanelTracks(
+    await rawNext({ videoId, isAudioOnly: true }),
+  );
+  return tracks.find((t) => t.id === videoId)?.albumId;
+}
+
 export async function fetchRadio(videoId: string): Promise<ShelfItem[]> {
   const tracks = parsePanelTracks(
     await rawNext({

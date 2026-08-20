@@ -378,6 +378,9 @@ export function mapPlaylistPanelVideo(raw: YtNode): ShelfItem | null {
     }
   }
 
+  const menuNav = readMenuNavigation(raw);
+  if (!albumId) albumId = menuNav.albumId;
+
   const duration = parseDuration(readRuns(raw.lengthText));
   const thumbnails = readThumbnails(raw.thumbnail);
   const explicit = readExplicit(raw);
@@ -428,6 +431,42 @@ export function readExplicit(raw: YtNode): boolean {
     }
   }
   return false;
+}
+
+/**
+ * Read the album/artist targets out of a row's own overflow menu.
+ *
+ * YTM ships "Go to album" / "Go to artist" as `menuNavigationItemRenderer`
+ * entries carrying a browseEndpoint, tagged by pageType. This is the more
+ * reliable source than the visible byline: search rows, for instance, put
+ * the album in the menu while the flex columns only carry artist names.
+ *
+ * Not every surface includes them (artist-page song cards ship a menu with
+ * no navigation entries at all), so callers must treat the result as
+ * optional and fall back to whatever the byline gave them.
+ */
+export function readMenuNavigation(raw: YtNode): {
+  albumId?: string;
+  artistId?: string;
+} {
+  const items: YtNode[] = raw.menu?.menuRenderer?.items ?? [];
+  const out: { albumId?: string; artistId?: string } = {};
+  for (const it of items) {
+    const nav = it.menuNavigationItemRenderer;
+    const browse = nav?.navigationEndpoint?.browseEndpoint;
+    const browseId: string | undefined = browse?.browseId;
+    if (!browseId) continue;
+    const pageType: string | undefined =
+      browse.browseEndpointContextSupportedConfigs
+        ?.browseEndpointContextMusicConfig?.pageType;
+    if (!pageType) continue;
+    if (pageType.includes("ALBUM") && !out.albumId) {
+      out.albumId = browseId;
+    } else if (pageType.includes("ARTIST") && !out.artistId) {
+      out.artistId = browseId;
+    }
+  }
+  return out;
 }
 
 export function readThumbnails(node: YtNode | undefined): Thumbnail[] {
@@ -665,6 +704,17 @@ export function mapTwoRowItem(raw: YtNode): ShelfItem | null {
         ?.videoId;
   }
 
+  // `artists` was parsed above but never returned, so a right-clicked
+  // card had no "Go to artist" (and no album at all — a card only ever
+  // exposes that through its menu). Carry both through.
+  const menuNav = readMenuNavigation(raw);
+  // Only when the byline produced no linkable artist: the menu gives an
+  // id but no name, and the card's subtitle is the whole byline
+  // ("Nanku, Karun & Bhuvan"), not one artist's name.
+  if (menuNav.artistId && !artists.some((a) => a.id)) {
+    artists.push({ id: menuNav.artistId, name: subtitle });
+  }
+
   return {
     kind,
     id,
@@ -674,6 +724,8 @@ export function mapTwoRowItem(raw: YtNode): ShelfItem | null {
     round,
     explicit: readExplicit(raw) || undefined,
     playableVideoId,
+    artists: artists.length ? artists : undefined,
+    albumId: menuNav.albumId,
   };
 }
 
@@ -762,6 +814,11 @@ export function mapResponsiveListItem(raw: YtNode): ShelfItem | null {
   }
 
   const explicit = readExplicit(raw);
+
+  // Search rows carry the album only in their overflow menu — the flex
+  // columns stop at the artist — so fall back to the menu's browseId.
+  const menuNav = readMenuNavigation(raw);
+  if (!albumId) albumId = menuNav.albumId;
 
   let thumbnails = readThumbnails(
     raw.thumbnail?.musicThumbnailRenderer?.thumbnail,

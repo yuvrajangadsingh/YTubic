@@ -55,7 +55,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { getLikedIdsSet } from "@/components/shared/like-buttons";
-import { fetchRadio } from "@/lib/innertube/radio";
+import { fetchRadio, fetchTrackAlbumId } from "@/lib/innertube/radio";
 import { fetchLikedSongs } from "@/lib/innertube/library";
 import {
   addToPlaylist,
@@ -251,6 +251,7 @@ export function TrackMenuItems({
   primitives,
   removal,
   onGoToArtist,
+  onGoToAlbum,
 }: {
   item: ShelfItem;
   context?: TrackContext;
@@ -265,6 +266,8 @@ export function TrackMenuItems({
    * forward to `useNavigate()`.
    */
   onGoToArtist?: (artistId: string) => void;
+  /** Same deal as `onGoToArtist`, for the album page. */
+  onGoToAlbum?: (albumId: string) => void;
 }) {
   const store = usePlaybackStore.getState;
   const { Item, Separator, Sub, SubTrigger, SubContent } = primitives;
@@ -281,7 +284,18 @@ export function TrackMenuItems({
   } = controller;
 
   const artist = item.artists?.find((a) => !!a.id);
-  const albumBrowseId = undefined;
+
+  // Home cards ship no album anywhere in their payload, so fall back to a
+  // /next lookup. Menu content only mounts while the menu is open, so this
+  // fires once per opened track rather than once per rendered row.
+  const albumLookup = useQuery({
+    queryKey: ["track-album", item.id],
+    queryFn: () => fetchTrackAlbumId(item.id),
+    enabled: !item.albumId && !!item.id && !!onGoToAlbum,
+    staleTime: 24 * 60 * 60 * 1000,
+    retry: false,
+  });
+  const albumBrowseId = item.albumId ?? albumLookup.data;
 
   return (
     <>
@@ -379,7 +393,9 @@ export function TrackMenuItems({
         </Item>
       ) : null}
 
-      {(artist || albumBrowseId) && <Separator />}
+      {((artist && onGoToArtist) || (albumBrowseId && onGoToAlbum)) && (
+        <Separator />
+      )}
 
       {artist?.id && onGoToArtist && (
         <Item onSelect={() => onGoToArtist(artist.id!)}>
@@ -387,16 +403,8 @@ export function TrackMenuItems({
           Go to artist
         </Item>
       )}
-      {albumBrowseId && (
-        <Item
-          onSelect={() => {
-            // Album navigation isn't wired yet — `albumBrowseId` is
-            // currently always undefined so this branch never runs.
-            // Left as a placeholder for when album browse IDs start
-            // flowing through.
-            void albumBrowseId;
-          }}
-        >
+      {albumBrowseId && onGoToAlbum && (
+        <Item onSelect={() => onGoToAlbum(albumBrowseId)}>
           <DiscAlbumIcon />
           Go to album
         </Item>
@@ -441,6 +449,7 @@ export function TrackContextMenu({ item, children, context, removal }: Props) {
             onGoToArtist={(id) =>
               navigate({ to: "/artist/$id", params: { id } })
             }
+            onGoToAlbum={(id) => navigate({ to: "/album/$id", params: { id } })}
           />
         </ContextMenuContent>
       </ContextMenu>
@@ -504,6 +513,7 @@ export function TrackMoreMenu({
             onGoToArtist={(id) =>
               navigate({ to: "/artist/$id", params: { id } })
             }
+            onGoToAlbum={(id) => navigate({ to: "/album/$id", params: { id } })}
           />
         </DropdownMenuContent>
       </DropdownMenu>
