@@ -443,6 +443,13 @@ function SidebarSignInButton() {
 }
 
 function UserProfile() {
+  // Sign out drops the session cookies and empties library state - it
+  // fired straight off a menu row one slot below "Manage subscription",
+  // so a slipped click logged the user out. Gate it behind a dialog.
+  // MUST be declared before the isLoading early-returns below: a hook
+  // after a conditional return crashes the whole tree on the second
+  // render ("rendered more hooks than during the previous render").
+  const [confirmSignOut, setConfirmSignOut] = useState(false);
   const loggedIn = useQuery({
     queryKey: ["auth-logged-in"],
     queryFn: () => invoke<boolean>("is_logged_in"),
@@ -494,11 +501,6 @@ function UserProfile() {
   const initial = (name || email || "?").trim().charAt(0).toUpperCase();
   const isPremium = premiumStatus === "premium";
   const tierLabel = isPremium ? "Premium" : "Free";
-
-  // Sign out drops the session cookies and empties library state - it
-  // fired straight off a menu row one slot below "Manage subscription",
-  // so a slipped click logged the user out. Gate it behind a dialog.
-  const [confirmSignOut, setConfirmSignOut] = useState(false);
 
   const signOut = async () => {
     if (!activeAccount) {
