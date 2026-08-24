@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { toast } from "sonner";
 import { useShallow } from "zustand/react/shallow";
 import {
   ListMusicIcon,
@@ -64,6 +65,23 @@ export function QueueBody({ onClose }: { onClose?: () => void }) {
 
   const [tab, setTab] = useState<Tab>("queue");
 
+  // One misclick on the trash icon used to wipe the whole queue with no
+  // way back. Undo beats a confirm dialog here: clearing stays one
+  // click, and the snapshot restores both tracks and playing position.
+  const handleClearQueue = () => {
+    const s = usePlaybackStore.getState();
+    const tracks = s.queue;
+    const at = s.index;
+    clearQueue();
+    toast("Queue cleared", {
+      action: {
+        label: "Undo",
+        onClick: () =>
+          usePlaybackStore.getState().setQueue(tracks, Math.max(0, at)),
+      },
+    });
+  };
+
   // Drag-and-drop state for "Up next". Stores the absolute queue index
   // of the row being dragged and of the row currently being hovered.
   // Both are needed to render visual indicators (faded source row,
@@ -111,7 +129,7 @@ export function QueueBody({ onClose }: { onClose?: () => void }) {
                 size="icon"
                 aria-label="Clear queue"
                 disabled={queue.length === 0}
-                onClick={clearQueue}
+                onClick={handleClearQueue}
               >
                 <Trash2Icon />
               </Button>

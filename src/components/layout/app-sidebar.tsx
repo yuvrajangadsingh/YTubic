@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useRouterState } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
@@ -37,6 +37,14 @@ import {
   SidebarMenuItem,
 } from "@/components/ui/sidebar";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -487,6 +495,11 @@ function UserProfile() {
   const isPremium = premiumStatus === "premium";
   const tierLabel = isPremium ? "Premium" : "Free";
 
+  // Sign out drops the session cookies and empties library state - it
+  // fired straight off a menu row one slot below "Manage subscription",
+  // so a slipped click logged the user out. Gate it behind a dialog.
+  const [confirmSignOut, setConfirmSignOut] = useState(false);
+
   const signOut = async () => {
     if (!activeAccount) {
       // Defensive: should never happen because the trigger only
@@ -659,12 +672,47 @@ function UserProfile() {
               <ExternalLinkIcon className="ms-auto" />
             </DropdownMenuItem>
             <DropdownMenuSeparator />
-            <DropdownMenuItem variant="destructive" onSelect={signOut}>
+            <DropdownMenuItem
+              variant="destructive"
+              onSelect={() => setConfirmSignOut(true)}
+            >
               <LogOutIcon />
               Sign out
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
+
+        <Dialog open={confirmSignOut} onOpenChange={setConfirmSignOut}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Sign out?</DialogTitle>
+              <DialogDescription>
+                {email
+                  ? `This signs ${email} out of YTubic.`
+                  : "This signs the current account out of YTubic."}{" "}
+                Your library and playlists stay on YouTube Music; signing
+                back in restores them.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => setConfirmSignOut(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={() => {
+                  setConfirmSignOut(false);
+                  void signOut();
+                }}
+              >
+                Sign out
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </SidebarMenuItem>
     </SidebarMenu>
   );

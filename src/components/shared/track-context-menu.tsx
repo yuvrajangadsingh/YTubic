@@ -8,6 +8,7 @@ import {
 import { useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  LinkIcon,
   ListPlusIcon,
   ListEndIcon,
   RadioIcon,
@@ -79,6 +80,18 @@ type TrackContext = { tracks: ShelfItem[]; index: number };
  * playlist id for the edit_playlist call.
  */
 export type PlaylistRemovalContext = { playlistId: string };
+
+/** Copy the track's music.youtube.com URL, with a toast either way. */
+async function copyTrackLink(videoId: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(
+      `https://music.youtube.com/watch?v=${videoId}`,
+    );
+    toast.success("Link copied");
+  } catch {
+    toast.error("Couldn't copy link");
+  }
+}
 
 type Primitives = {
   Item: ComponentType<any>;
@@ -194,6 +207,18 @@ export function useTrackMenuController(item: ShelfItem) {
   const runRemoveFromPlaylist = async (removal: PlaylistRemovalContext) => {
     const setVideoId = item.setVideoId;
     if (!setVideoId) return;
+    // Escape hatch for a misclick in the context menu. Re-adding puts
+    // the track at the END of the playlist (YT has no insert-at), so
+    // this restores membership, not position.
+    const undoRemove = async () => {
+      try {
+        await addToPlaylist(removal.playlistId, item.id);
+        await qc.invalidateQueries({ queryKey: ["playlist-pages-v2"] });
+        toast.success("Added back (at the end of the playlist)");
+      } catch (e) {
+        toast.error(`Undo failed: ${String(e)}`);
+      }
+    };
     try {
       await removeFromPlaylist(removal.playlistId, item.id, setVideoId);
       // Drop the row from every cached playlist page in place instead of
@@ -214,7 +239,9 @@ export function useTrackMenuController(item: ShelfItem) {
           })),
         };
       });
-      toast.success("Removed from playlist");
+      toast.success("Removed from playlist", {
+        action: { label: "Undo", onClick: () => void undoRemove() },
+      });
     } catch (e) {
       toast.error(`Remove failed: ${String(e)}`);
     }
@@ -329,6 +356,11 @@ export function TrackMenuItems({
       >
         <RadioIcon />
         Start radio
+      </Item>
+
+      <Item onSelect={() => void copyTrackLink(item.id)}>
+        <LinkIcon />
+        Copy link
       </Item>
 
       <Separator />
