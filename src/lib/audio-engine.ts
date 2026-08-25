@@ -883,7 +883,10 @@ export function useAudioEngine() {
         if (video.paused) void playLocal(video).catch(() => {});
         return;
       }
-      if (d > HOLD_S) {
+      // Target unreachable in EITHER direction (evicted early data on a
+      // backward seek behaves like undownloaded data on a forward one):
+      // freeze rather than play wrong-time frames.
+      if (Math.abs(d) > HOLD_S) {
         if (!video.paused) video.pause();
         usePlaybackStore.getState().setVideoBuffering(true);
         return;
