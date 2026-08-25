@@ -877,6 +877,27 @@ export function mapResponsiveListItem(raw: YtNode): ShelfItem | null {
     artists.map((a) => a.name).join(", ") ||
     readRuns(flex[1]?.musicResponsiveListItemFlexColumnRenderer?.text);
 
+  // A row that NAVIGATES (album/artist/playlist page) must be
+  // classified by its browse target even when a playable videoId is
+  // also present: album rows — singles especially, and authenticated
+  // payloads generally — ship a playable id in the overlay or
+  // playlistItemData alongside the album browseEndpoint. Checking
+  // videoId first turned those albums into "songs", so clicking an
+  // album on the search Albums tab played a track and built a radio
+  // queue instead of opening the album page.
+  const navKind = navBrowseId ? pageTypeToKind(navPageType) : undefined;
+  if (navBrowseId && navKind) {
+    return {
+      kind: navKind,
+      id: navBrowseId,
+      title,
+      subtitle: subtitleText || undefined,
+      thumbnails,
+      round: navKind === "artist",
+      explicit: explicit || undefined,
+    };
+  }
+
   if (videoId) {
     return {
       kind: "song",
@@ -892,20 +913,6 @@ export function mapResponsiveListItem(raw: YtNode): ShelfItem | null {
       playCount,
       dateAdded,
       setVideoId: raw.playlistItemData?.playlistSetVideoId,
-    };
-  }
-
-  if (navBrowseId) {
-    const kind = pageTypeToKind(navPageType);
-    if (!kind) return null;
-    return {
-      kind,
-      id: navBrowseId,
-      title,
-      subtitle: subtitleText || undefined,
-      thumbnails,
-      round: kind === "artist",
-      explicit: explicit || undefined,
     };
   }
 
