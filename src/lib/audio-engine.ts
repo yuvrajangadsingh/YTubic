@@ -66,6 +66,14 @@ export function getVideoSurfaceElement(): HTMLVideoElement | null {
  *
  * Always returns a promise so callers can keep chaining `.catch`.
  */
+/** Whether `t` falls inside any of the element's buffered ranges. */
+function timeInBuffered(b: TimeRanges, t: number): boolean {
+  for (let i = 0; i < b.length; i++) {
+    if (b.start(i) <= t && t <= b.end(i)) return true;
+  }
+  return false;
+}
+
 function playLocal(el: HTMLMediaElement | null | undefined): Promise<void> {
   if (!el || isCasting()) return Promise.resolve();
   return el.play();
@@ -858,41 +866,34 @@ export function useAudioEngine() {
     // companion's buffered ranges, freeze the frames with the buffering
     // chip up (what YT does) and re-snap once the download catches up.
     const HOLD_S = 1.5;
-    const masterInBuffer = () => {
-      const b = video.buffered;
-      for (let i = 0; i < b.length; i++) {
-        if (
-          b.start(i) <= master.currentTime &&
-          master.currentTime <= b.end(i)
-        ) {
-          return true;
-        }
-      }
-      return false;
-    };
-    const drift = window.setInterval(() => {
+    const masterInBuffer = () =>
+      timeInBuffered(video.buffered, master.currentTime);
+    const driftTick = () => {
       if (video.readyState < 2 || master.paused) return;
       const d = master.currentTime - video.currentTime;
-      if (Math.abs(d) > SNAP_S) {
-        if (masterInBuffer()) {
-          video.currentTime = master.currentTime;
-          video.playbackRate = master.playbackRate;
-          if (video.paused) void playLocal(video).catch(() => {});
-        } else if (d > HOLD_S) {
-          if (!video.paused) video.pause();
-          usePlaybackStore.getState().setVideoBuffering(true);
-        } else {
-          // Small or backward miss with odd buffer state: try anyway,
-          // the next tick re-evaluates.
-          video.currentTime = master.currentTime;
-          video.playbackRate = master.playbackRate;
-        }
-      } else {
+      if (Math.abs(d) <= SNAP_S) {
         if (video.paused) void playLocal(video).catch(() => {});
         video.playbackRate =
           master.playbackRate + Math.max(-0.04, Math.min(0.04, d * 0.1));
+        return;
       }
-    }, 1000);
+      if (masterInBuffer()) {
+        video.currentTime = master.currentTime;
+        video.playbackRate = master.playbackRate;
+        if (video.paused) void playLocal(video).catch(() => {});
+        return;
+      }
+      if (d > HOLD_S) {
+        if (!video.paused) video.pause();
+        usePlaybackStore.getState().setVideoBuffering(true);
+        return;
+      }
+      // Small or backward miss with odd buffer state: try anyway, the
+      // next tick re-evaluates.
+      video.currentTime = master.currentTime;
+      video.playbackRate = master.playbackRate;
+    };
+    const drift = window.setInterval(driftTick, 1000);
 
     streamUrlFor(streamVideoId, {
       vonly: true,
