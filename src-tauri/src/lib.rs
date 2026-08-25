@@ -31,6 +31,7 @@ mod cast;
 mod discord;
 mod lastfm;
 mod media;
+mod stream_proxy;
 mod ytdlp;
 
 fn sanitize_video_id(id: &str) -> bool {
@@ -2392,6 +2393,12 @@ struct StreamServer {
     /// `ytdlp::program` so a mid-session download takes effect
     /// immediately.
     ytdlp_bin: PathBuf,
+    /// In-flight range-proxy downloads (see stream_proxy.rs). Keyed the
+    /// same as `downloads`; a proxied download ALSO holds a `downloads`
+    /// entry so the legacy attach/dedupe logic sees it.
+    proxies: stream_proxy::ProxyMap,
+    /// Shared client for googlevideo range fetches.
+    http: reqwest::Client,
 }
 
 /// Read a boolean query flag (`?name=1` / `?name=true`) off a stream/
@@ -3275,6 +3282,165 @@ async fn sniff_stream_mime(path: &std::path::Path, video: bool) -> &'static str 
     }
 }
 
+/// yt-dlp format selector for a variant — same selectors the legacy
+/// downloader uses, so the proxied file is bit-identical to what
+/// spawn_downloader would have produced.
+fn variant_format(variant: StreamVariant) -> String {
+    match variant {
+        StreamVariant::Muxed => VIDEO_FORMAT.to_string(),
+        StreamVariant::VideoOnly(h) => vonly_format(h),
+        StreamVariant::Audio => AUDIO_FORMAT.to_string(),
+    }
+}
+
+/// Get-or-start the range-proxy download for one (variant, id) key.
+/// Single-flight per key: concurrent callers await one resolve+probe.
+/// Errors mean "use the legacy blocking path" — and if a legacy
+/// download for the key is already in flight, this errors immediately
+/// so the caller attaches to it instead of double-downloading.
+async fn proxy_ensure(
+    srv: &StreamServer,
+    video_id: &str,
+    variant: StreamVariant,
+    target_dir: &std::path::Path,
+    map_key: &str,
+) -> Result<Arc<stream_proxy::ProxyState>, String> {
+    let cell = {
+        let mut map = srv.proxies.lock().await;
+        map.entry(map_key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone()
+    };
+    let state = cell
+        .get_or_try_init(|| async {
+            let ctx = stream_proxy::ResolveCtx {
+                ytdlp_program: ytdlp::program(&srv.ytdlp_bin),
+                video_id: video_id.to_string(),
+                format: variant_format(variant),
+                video: variant != StreamVariant::Audio,
+            };
+            let t0 = std::time::Instant::now();
+            let state = stream_proxy::prepare(&srv.http, &ctx).await?;
+            eprintln!(
+                "[proxy] {video_id}: resolved+probed in {:.2}s (total={} mime={})",
+                t0.elapsed().as_secs_f32(),
+                state.total,
+                state.mime
+            );
+
+            // Claim the legacy downloads slot so /prefetch and fallback
+            // requests see this download as in flight. If it's already
+            // claimed a legacy yt-dlp pipe owns the .part file — bail.
+            let legacy = {
+                let mut map = srv.downloads.lock().await;
+                if map.contains_key(map_key) {
+                    return Err("legacy download already in flight".to_string());
+                }
+                let s = Arc::new(DownloadState {
+                    complete: Arc::new(AtomicBool::new(false)),
+                    notify: Arc::new(Notify::new()),
+                });
+                map.insert(map_key.to_string(), s.clone());
+                s
+            };
+
+            let (part_name, final_name) = stream_file_names(video_id, variant);
+            let downloads = srv.downloads.clone();
+            let evict_key = map_key.to_string();
+            stream_proxy::spawn_filler(
+                srv.http.clone(),
+                ctx,
+                state.clone(),
+                target_dir.join(part_name),
+                target_dir.join(final_name),
+                srv.proxies.clone(),
+                map_key.to_string(),
+                legacy.complete.clone(),
+                legacy.notify.clone(),
+                move || {
+                    tokio::spawn(async move {
+                        downloads.lock().await.remove(&evict_key);
+                    });
+                },
+            );
+            Ok(state)
+        })
+        .await?;
+    Ok(state.clone())
+}
+
+/// Answer one request against an in-flight proxied download: bounded
+/// 206 windows for ranged requests, a tail-following 200 for rangeless
+/// ones (WebKit fetches WebM with a single plain GET).
+async fn proxy_respond(
+    srv: &StreamServer,
+    state: Arc<stream_proxy::ProxyState>,
+    video_id: &str,
+    variant: StreamVariant,
+    target_dir: &std::path::Path,
+    // NB: not &Request — axum's Body is !Sync, so borrowing the request
+    // across the awaits below would make the handler future !Send.
+    range_hdr: Option<&str>,
+    t0: std::time::Instant,
+) -> Response {
+    use axum::http::header;
+    let (part_name, final_name) = stream_file_names(video_id, variant);
+    let part_path = target_dir.join(part_name);
+    let final_path = target_dir.join(final_name);
+    let total = state.total;
+    let mime = state.mime.clone();
+
+    match stream_proxy::parse_range(range_hdr, total) {
+        Err(()) => Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+            .into_response(),
+        Ok(None) => {
+            eprintln!("[proxy] {video_id}: 200 tail-stream len={total} ({:.2}s)", t0.elapsed().as_secs_f32());
+            let rx = stream_proxy::spawn_tail_pump(state, part_path, final_path);
+            let body =
+                axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime)
+                .header(header::CONTENT_LENGTH, total)
+                .header(header::ACCEPT_RANGES, "bytes")
+                .body(body)
+                .unwrap()
+                .into_response()
+        }
+        Ok(Some(span)) => {
+            let w = stream_proxy::window_span(&span);
+            match stream_proxy::serve_span(&srv.http, &state, &part_path, &final_path, &w).await {
+                Ok(bytes) => {
+                    eprintln!(
+                        "[proxy] {video_id}: 206 {}-{}/{total} ({} bytes, {:.2}s)",
+                        w.start,
+                        w.end,
+                        bytes.len(),
+                        t0.elapsed().as_secs_f32()
+                    );
+                    Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(header::CONTENT_TYPE, mime)
+                        .header(header::CONTENT_LENGTH, bytes.len())
+                        .header(header::CONTENT_RANGE, format!("bytes {}-{}/{total}", w.start, w.end))
+                        .header(header::ACCEPT_RANGES, "bytes")
+                        .body(axum::body::Body::from(bytes))
+                        .unwrap()
+                        .into_response()
+                }
+                Err(e) => {
+                    eprintln!("[proxy] {video_id}: span {}-{} failed: {e}", w.start, w.end);
+                    (StatusCode::BAD_GATEWAY, "proxy fetch failed").into_response()
+                }
+            }
+        }
+    }
+}
+
 /// GET /stream/:video_id — unified serving path supporting Range
 /// requests even during an active download.
 async fn stream_handler(
@@ -3307,25 +3473,19 @@ async fn stream_handler(
     );
     let final_path = target_dir.join(stream_file_names(&video_id, variant).1);
 
-    // If the full file isn't on disk yet, start (or attach to) the
-    // download and block until it completes. Attempting to progressively
-    // stream yt-dlp's stdout broke in two ways:
-    //   - m4a/mp4 audio tracks often have the `moov` atom at the end of
-    //     the file, so Chromium can't decode them until every byte has
-    //     arrived. The first request then fails with
-    //     MEDIA_ERR_SRC_NOT_SUPPORTED.
-    //   - There's no valid HTTP response for a stream whose total length
-    //     is unknown AND whose Range subset has an unknown end
-    //     (`Content-Range: bytes 0-*/*` is grammatically invalid per
-    //     RFC 7233). Serving with `Accept-Ranges: none` works but then
-    //     Chromium disables seeking entirely.
+    // If the full file isn't on disk yet, the preferred path is the
+    // range proxy (stream_proxy.rs): resolve the direct googlevideo URL,
+    // learn the exact total via a 1-byte probe, start a background
+    // filler into the same .part/rename contract, and serve ranges
+    // immediately — from disk below the fill line, by direct passthrough
+    // above it. That answers the two constraints that historically
+    // forced serve-after-full-download (unknown total length making
+    // Content-Range invalid; moov-at-end m4a needing a tail read first).
     //
-    // Full download + `ServeFile` sidesteps both problems: Range
-    // requests, seeking, content-type detection, and large file support
-    // all become the crate's problem. The "first-play" latency is just
-    // the download time (~1-3 s on a healthy connection for a typical
-    // 3-minute track) and the existing next-track prefetcher hides it
-    // from the user on every track except the very first one.
+    // Any proxy failure (resolve, probe, legacy download already
+    // holding the .part) drops to the legacy path below: start (or
+    // attach to) a piped yt-dlp download and block until it completes,
+    // then let ServeFile handle ranges off the finished file.
     let t0 = std::time::Instant::now();
 
     let range_hdr = req
@@ -3335,7 +3495,7 @@ async fn stream_handler(
         .unwrap_or("")
         .to_string();
     eprintln!(
-        "[stream] GET /stream/{video_id} range={range_hdr:?} cached={} ephemeral={ephemeral} variant={}",
+        "[stream] GET /stream/{video_id} range={range_hdr:?} variant={} ephemeral={ephemeral} cached={}",
         match variant {
             StreamVariant::Muxed => "muxed".to_string(),
             StreamVariant::VideoOnly(h) => format!("vonly{h}"),
@@ -3343,6 +3503,25 @@ async fn stream_handler(
         },
         final_path.exists()
     );
+
+    if !final_path.exists() {
+        match proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key).await {
+            Ok(pstate) => {
+                let range = (!range_hdr.is_empty()).then_some(range_hdr.as_str());
+                return proxy_respond(&srv, pstate, &video_id, variant, &target_dir, range, t0)
+                    .await;
+            }
+            Err(e) => {
+                // The download may have completed in the window between
+                // the exists() check and now — serve the file if so.
+                if final_path.exists() {
+                    eprintln!("[proxy] {video_id}: completed during ensure; serving file");
+                } else {
+                    eprintln!("[proxy] {video_id}: {e}; using legacy blocking path");
+                }
+            }
+        }
+    }
 
     if !final_path.exists() {
         let state = {
@@ -3501,6 +3680,18 @@ async fn prefetch_handler(
     if final_path.exists() {
         return StatusCode::OK;
     }
+    // Preferred: start (or join) a range-proxy download. proxy_ensure
+    // claims the downloads slot atomically itself, so a concurrent
+    // /stream or /prefetch can't start a second writer for the key.
+    if proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key)
+        .await
+        .is_ok()
+    {
+        return StatusCode::ACCEPTED;
+    }
+    if final_path.exists() {
+        return StatusCode::OK;
+    }
     let state = {
         // Single lock hold for check-then-insert so a concurrent /stream
         // (whose check+insert is already atomic) or a second /prefetch can't
@@ -3581,6 +3772,8 @@ async fn start_stream_server(
         cover_dir,
         downloads: Arc::new(Mutex::new(HashMap::new())),
         ytdlp_bin,
+        proxies: stream_proxy::new_proxy_map(),
+        http: stream_proxy::new_http_client(),
     };
 
     // Per-launch token as an unguessable path prefix. Baked into the base

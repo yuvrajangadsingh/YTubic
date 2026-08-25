@@ -45,6 +45,9 @@ tauri-plugin-shell = "2"
 reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
 urlencoding = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "process", "sync", "net"] }
+# ReceiverStream bridges an mpsc receiver to a hyper Body for the
+# range-proxy's tail-following 200 responses (stream_proxy.rs).
+tokio-stream = "0.1"
 axum = "0.7"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 tower = "0.5"
