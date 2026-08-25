@@ -808,6 +808,24 @@ export function PlayerBar({
             transition={{ duration: 0.07 }}
             className="flex min-h-0 flex-1 flex-col"
           >
+            {/* Opening the queue used to unmount the cover branch and
+                take the video with it. Keep a compact surface docked
+                above the list while a video is playing — the singleton
+                element reparents here on mount and back to the cover
+                when the queue closes (mode="wait" serializes the two
+                mounts). Same gating as the cover-branch surface. */}
+            {track && streamKind === "video" && variant === "right" && !fullscreen ? (
+              <div className="shrink-0 px-3 pt-3">
+                <div className="relative aspect-video w-full">
+                  <VideoSurface className="size-full overflow-hidden rounded-md border border-hairline bg-black" />
+                  {videoBuffering ? (
+                    <div className="absolute inset-0 flex items-center justify-center rounded-md bg-black/25">
+                      <Loader2Icon className="size-6 animate-spin text-white/85" />
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
             <QueueBody onClose={() => setQueueOpen(false)} />
           </motion.div>
         ) : (
