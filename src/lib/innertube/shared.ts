@@ -396,11 +396,20 @@ export function mapPlaylistPanelVideo(raw: YtNode): ShelfItem | null {
       ? "video"
       : "song";
 
+  // Show/UGC content often ships artist names as PLAIN byline runs (no
+  // channel browse endpoints), leaving `artists` empty — fall back to
+  // the byline text before the first "•" so the player still shows an
+  // artist line ("Badshah, ... • Hustle 5 • 2024" → "Badshah, ...").
+  const bylineFallback = readRuns(raw.longBylineText ?? raw.shortBylineText)
+    .split("•")[0]
+    ?.trim();
+
   return {
     kind,
     id: videoId,
     title,
-    subtitle: artists.map((a) => a.name).join(", ") || undefined,
+    subtitle:
+      artists.map((a) => a.name).join(", ") || bylineFallback || undefined,
     thumbnails,
     artists: artists.length ? artists : undefined,
     album,
