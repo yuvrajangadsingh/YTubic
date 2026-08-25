@@ -3313,6 +3313,13 @@ async fn proxy_ensure(
     };
     let state = cell
         .get_or_try_init(|| async {
+            // Fast-fail BEFORE the multi-second resolve when a legacy
+            // yt-dlp pipe already owns this key — the caller then
+            // attaches to it immediately instead of resolving first and
+            // discovering the conflict a minute later.
+            if srv.downloads.lock().await.contains_key(map_key) {
+                return Err("legacy download already in flight".to_string());
+            }
             let ctx = stream_proxy::ResolveCtx {
                 ytdlp_program: ytdlp::program(&srv.ytdlp_bin),
                 video_id: video_id.to_string(),
@@ -3365,8 +3372,25 @@ async fn proxy_ensure(
             );
             Ok(state)
         })
-        .await?;
-    Ok(state.clone())
+        .await;
+    match state {
+        Ok(s) => Ok(s.clone()),
+        Err(e) => {
+            // A failed init leaves an empty OnceCell behind; without
+            // cleanup every offline/geo-blocked track visited leaks one
+            // map entry for the app's lifetime. Removing only a still-
+            // uninitialized cell keeps a concurrently-succeeding init
+            // reachable; the downloads-slot claim already guarantees a
+            // racing duplicate init can't start a second writer.
+            let mut map = srv.proxies.lock().await;
+            if let Some(c) = map.get(map_key) {
+                if c.get().is_none() {
+                    map.remove(map_key);
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Answer one request against an in-flight proxied download: bounded
@@ -3415,10 +3439,14 @@ async fn proxy_respond(
             let w = stream_proxy::window_span(&span);
             match stream_proxy::serve_span(&srv.http, &state, &part_path, &final_path, &w).await {
                 Ok(bytes) => {
+                    // Label the response from what was ACTUALLY delivered
+                    // — a passthrough may legally return a shorter span
+                    // than requested, and headers must never overpromise
+                    // the body.
+                    let end = w.start + bytes.len() as u64 - 1;
                     eprintln!(
-                        "[proxy] {video_id}: 206 {}-{}/{total} ({} bytes, {:.2}s)",
+                        "[proxy] {video_id}: 206 {}-{end}/{total} ({} bytes, {:.2}s)",
                         w.start,
-                        w.end,
                         bytes.len(),
                         t0.elapsed().as_secs_f32()
                     );
@@ -3426,7 +3454,7 @@ async fn proxy_respond(
                         .status(StatusCode::PARTIAL_CONTENT)
                         .header(header::CONTENT_TYPE, mime)
                         .header(header::CONTENT_LENGTH, bytes.len())
-                        .header(header::CONTENT_RANGE, format!("bytes {}-{}/{total}", w.start, w.end))
+                        .header(header::CONTENT_RANGE, format!("bytes {}-{end}/{total}", w.start))
                         .header(header::ACCEPT_RANGES, "bytes")
                         .body(axum::body::Body::from(bytes))
                         .unwrap()

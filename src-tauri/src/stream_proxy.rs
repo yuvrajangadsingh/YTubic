@@ -35,8 +35,11 @@
 //! got a fresh working URL in the remaining case. The filler and the
 //! passthrough fetches therefore retry the current URL a few times with
 //! backoff, and the filler re-resolves once before declaring failure.
-//! Every error in this module falls back to the legacy blocking path in
-//! the caller, so the worst case is exactly today's behavior.
+//! Errors before a response is committed fall back to the legacy
+//! blocking path in the caller. Mid-body failures on an already-started
+//! response (a tailing 200, a partially-sent window) cannot fall back —
+//! the transfer just breaks and the media element's own error handling
+//! retries the request, which re-enters the normal decision chain.
 
 use std::collections::HashMap;
 use std::io::SeekFrom;
@@ -106,6 +109,10 @@ pub struct ProxyState {
     /// Exact file size, learned from the 1-byte probe.
     pub total: u64,
     pub mime: String,
+    /// yt-dlp format_id of the FIRST extraction. A mid-download
+    /// re-resolve pins -f to this exact format so a selector fallback
+    /// can't splice a different representation onto the written prefix.
+    pub format_id: Option<String>,
     /// Bytes contiguously written to the .part file from offset 0.
     pub filled: AtomicU64,
     /// Final file renamed into place; `filled == total`.
@@ -117,11 +124,12 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
-    fn new(url: String, total: u64, mime: String) -> Self {
+    fn new(url: String, total: u64, mime: String, format_id: Option<String>) -> Self {
         ProxyState {
             url: Mutex::new(url),
             total,
             mime,
+            format_id,
             filled: AtomicU64::new(0),
             complete: AtomicBool::new(false),
             failed: AtomicBool::new(false),
@@ -136,12 +144,17 @@ pub async fn prepare(
     client: &reqwest::Client,
     ctx: &ResolveCtx,
 ) -> Result<Arc<ProxyState>, String> {
-    let (url, mime) = resolve(ctx).await?;
-    let total = probe_total(client, &url).await?;
+    let resolved = resolve(ctx).await?;
+    let total = probe_total(client, &resolved.url).await?;
     if total < MIN_TOTAL {
         return Err(format!("suspiciously small stream ({total} bytes)"));
     }
-    Ok(Arc::new(ProxyState::new(url, total, mime)))
+    Ok(Arc::new(ProxyState::new(
+        resolved.url,
+        total,
+        resolved.mime,
+        resolved.format_id,
+    )))
 }
 
 /// Map of in-flight proxy downloads, keyed like the legacy downloads
@@ -166,8 +179,14 @@ pub fn new_http_client() -> reqwest::Client {
 // Resolve + probe
 // ---------------------------------------------------------------------
 
+struct Resolved {
+    url: String,
+    mime: String,
+    format_id: Option<String>,
+}
+
 /// Direct-URL resolution via `yt-dlp -j -f <format>`.
-async fn resolve(ctx: &ResolveCtx) -> Result<(String, String), String> {
+async fn resolve(ctx: &ResolveCtx) -> Result<Resolved, String> {
     let url = format!("https://www.youtube.com/watch?v={}", ctx.video_id);
     let mut cmd = tokio::process::Command::new(&ctx.ytdlp_program);
     cmd.args([
@@ -183,6 +202,10 @@ async fn resolve(ctx: &ResolveCtx) -> Result<(String, String), String> {
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     cmd.stdin(Stdio::null());
+    // The wrapping timeout (and a skipped track abandoning this future)
+    // drops the child future — without kill_on_drop that leaks a live
+    // yt-dlp process per abandonment.
+    cmd.kill_on_drop(true);
     let out = tokio::time::timeout(Duration::from_secs(30), cmd.output())
         .await
         .map_err(|_| "yt-dlp -j timed out after 30s".to_string())?
@@ -218,7 +241,14 @@ async fn resolve(ctx: &ResolveCtx) -> Result<(String, String), String> {
     let ext = fmt.get("ext").and_then(|v| v.as_str()).unwrap_or("");
     let acodec = fmt.get("acodec").and_then(|v| v.as_str()).unwrap_or("");
     let vcodec = fmt.get("vcodec").and_then(|v| v.as_str()).unwrap_or("");
-    Ok((direct, mime_for(ext, acodec, vcodec, ctx.video).to_string()))
+    Ok(Resolved {
+        url: direct,
+        mime: mime_for(ext, acodec, vcodec, ctx.video).to_string(),
+        format_id: fmt
+            .get("format_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    })
 }
 
 /// Mirror of `sniff_stream_mime`'s mapping, driven by yt-dlp metadata
@@ -269,18 +299,18 @@ async fn probe_total(client: &reqwest::Client, url: &str) -> Result<u64, String>
                     .get(reqwest::header::CONTENT_RANGE)
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
-                match parse_content_range_total(cr) {
-                    Some(total) => return Ok(total),
-                    None => return Err(format!("unparseable Content-Range {cr:?}")),
+                // Require exactly the span we asked for and a concrete
+                // total — a mislabeled or unsatisfied range here would
+                // poison every offset downstream.
+                match parse_content_range(cr) {
+                    Some((0, 0, Some(total))) => return Ok(total),
+                    _ => return Err(format!("bad probe Content-Range {cr:?}")),
                 }
             }
-            // A server that ignores Range answers 200 with the full length.
-            200 => {
-                if let Some(len) = resp.content_length() {
-                    return Ok(len);
-                }
-                return Err("probe 200 without Content-Length".into());
-            }
+            // 200 means the server ignored Range. The whole serving
+            // model needs ranged access (tail probes, passthrough
+            // windows), so this URL is unusable — legacy path instead.
+            200 => return Err("origin ignores Range requests".into()),
             s => {
                 last = format!("probe HTTP {s}");
                 continue;
@@ -290,9 +320,24 @@ async fn probe_total(client: &reqwest::Client, url: &str) -> Result<u64, String>
     Err(last)
 }
 
-/// `bytes 0-0/12345` → 12345
-fn parse_content_range_total(v: &str) -> Option<u64> {
-    v.rsplit('/').next()?.trim().parse::<u64>().ok()
+/// Parse `bytes S-E/T` into (S, E, T). Returns None for any other
+/// shape, including `bytes */T` — an unsatisfied-range form that must
+/// never be combined with cached data (RFC 9110 §14.4). T is None for
+/// `bytes S-E/*`.
+fn parse_content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
+    let rest = v.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let total = match total.trim() {
+        "*" => None,
+        t => Some(t.parse::<u64>().ok()?),
+    };
+    let (s, e) = range.trim().split_once('-')?;
+    let s: u64 = s.trim().parse().ok()?;
+    let e: u64 = e.trim().parse().ok()?;
+    if e < s {
+        return None;
+    }
+    Some((s, e, total))
 }
 
 // ---------------------------------------------------------------------
@@ -367,10 +412,21 @@ async fn fill(
     // (observed live: a 14.5MB 4K WebM stalled at 10.3MB for minutes on
     // the open-ended form while a 5MB audio file finished in 0.33s).
     // Chunking is the same trick yt-dlp's downloader uses.
+    //
+    // EVERY way an attempt can fall short — bad status, mislabeled
+    // Content-Range, body error, stall, or a clean-but-early EOF —
+    // lands in the same ladder: burn a same-URL retry, then one
+    // identity-checked re-resolve, then fail. A clean early EOF MUST
+    // consume budget too, or a server that keeps closing at the same
+    // byte turns the filler into an infinite reconnect loop that owns
+    // the .part forever. Only a fully delivered chunk refills the
+    // budget.
     'outer: while pos < total {
-        let chunk_end = (pos + FILL_CHUNK).min(total) - 1;
+        let chunk_end = pos.saturating_add(FILL_CHUNK).min(total) - 1;
         let url = state.url.lock().await.clone();
-        let resp = tokio::time::timeout(
+        let mut why: Option<String> = None;
+
+        let sent = tokio::time::timeout(
             Duration::from_secs(15),
             client
                 .get(&url)
@@ -378,78 +434,116 @@ async fn fill(
                 .send(),
         )
         .await;
-        let mut resp = match resp {
-            Ok(Ok(r)) if r.status().as_u16() == 206 || (r.status().as_u16() == 200 && pos == 0 && chunk_end == total - 1) => r,
-            other => {
-                let why = match other {
-                    Ok(Ok(r)) => format!("HTTP {}", r.status()),
-                    Ok(Err(e)) => format!("{e}"),
-                    Err(_) => "connect timeout".into(),
-                };
-                if url_retries_left > 0 {
-                    url_retries_left -= 1;
-                    eprintln!("[proxy] {} fill@{pos}: {why}; retrying same url", ctx.video_id);
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    continue 'outer;
-                }
-                if reresolves_left > 0 {
-                    reresolves_left -= 1;
-                    url_retries_left = URL_RETRIES;
-                    eprintln!("[proxy] {} fill@{pos}: {why}; re-resolving url", ctx.video_id);
-                    match resolve(ctx).await {
-                        Ok((fresh, _mime)) => {
-                            *state.url.lock().await = fresh;
-                            continue 'outer;
-                        }
-                        Err(e) => {
-                            eprintln!("[proxy] {} re-resolve failed: {e}", ctx.video_id);
-                            return false;
+        match sent {
+            Ok(Ok(mut resp)) if resp.status().as_u16() == 206 => {
+                let cr = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                match parse_content_range(&cr) {
+                    Some((s, _e, t)) if s == pos && t.map_or(true, |t| t == total) => {
+                        // Header checks out — drain the body into the file.
+                        loop {
+                            match tokio::time::timeout(Duration::from_secs(30), resp.chunk()).await
+                            {
+                                Err(_) => {
+                                    why = Some(format!("body stalled at {pos}"));
+                                    break;
+                                }
+                                Ok(Err(e)) => {
+                                    why = Some(format!("body error at {pos}: {e}"));
+                                    break;
+                                }
+                                Ok(Ok(None)) => {
+                                    if pos <= chunk_end {
+                                        why = Some(format!(
+                                            "early EOF at {pos} (chunk end {chunk_end})"
+                                        ));
+                                    }
+                                    break;
+                                }
+                                Ok(Ok(Some(chunk))) => {
+                                    // Never write past the requested chunk
+                                    // end: surplus bytes would corrupt the
+                                    // offset math for readers.
+                                    let take =
+                                        chunk.len().min((chunk_end + 1 - pos) as usize);
+                                    if let Err(e) = file.write_all(&chunk[..take]).await {
+                                        eprintln!(
+                                            "[proxy] {} write .part: {e}",
+                                            ctx.video_id
+                                        );
+                                        return false;
+                                    }
+                                    pos += take as u64;
+                                    state.filled.store(pos, Ordering::Release);
+                                    state.notify.notify_waiters();
+                                    if pos > chunk_end {
+                                        url_retries_left = URL_RETRIES;
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
+                    _ => why = Some(format!("bad Content-Range {cr:?} for offset {pos}")),
                 }
-                eprintln!("[proxy] {} fill@{pos}: {why}; giving up", ctx.video_id);
-                return false;
             }
-        };
-        loop {
-            match tokio::time::timeout(Duration::from_secs(30), resp.chunk()).await {
-                Err(_) | Ok(Err(_)) => {
-                    // Stalled or errored mid-body: reconnect from current
-                    // offset via the retry ladder above.
-                    if url_retries_left == 0 && reresolves_left == 0 {
-                        eprintln!("[proxy] {} fill@{pos}: body stalled; giving up", ctx.video_id);
-                        return false;
-                    }
-                    url_retries_left = url_retries_left.saturating_sub(1);
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    continue 'outer;
-                }
-                Ok(Ok(None)) => {
-                    // Body ended: at the chunk boundary this is normal —
-                    // the outer loop requests the next chunk; short of it
-                    // the outer loop resumes from pos either way.
-                    continue 'outer;
-                }
-                Ok(Ok(Some(chunk))) => {
-                    // Never write past the requested chunk end: a surplus
-                    // body would corrupt the offset math for readers.
-                    let take = chunk.len().min((chunk_end + 1 - pos) as usize);
-                    if let Err(e) = file.write_all(&chunk[..take]).await {
-                        eprintln!("[proxy] {} write .part: {e}", ctx.video_id);
-                        return false;
-                    }
-                    pos += take as u64;
-                    state.filled.store(pos, Ordering::Release);
-                    state.notify.notify_waiters();
-                    if pos > chunk_end {
-                        // Chunk done: refill the retry budget so long
-                        // files don't exhaust it on scattered blips.
-                        url_retries_left = URL_RETRIES;
+            Ok(Ok(r)) => why = Some(format!("HTTP {}", r.status())),
+            Ok(Err(e)) => why = Some(format!("{e}")),
+            Err(_) => why = Some("connect timeout".into()),
+        }
+
+        let Some(why) = why else { continue 'outer };
+        if url_retries_left > 0 {
+            url_retries_left -= 1;
+            eprintln!("[proxy] {} fill: {why}; retrying same url", ctx.video_id);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue 'outer;
+        }
+        if reresolves_left > 0 {
+            reresolves_left -= 1;
+            url_retries_left = URL_RETRIES;
+            eprintln!("[proxy] {} fill: {why}; re-resolving url", ctx.video_id);
+            // Pin the exact format of the first extraction: the selector
+            // has fallbacks, and splicing a different representation onto
+            // the written prefix would cache a corrupt file. The probe
+            // must agree on the byte count for the same reason.
+            let pinned = ResolveCtx {
+                format: state
+                    .format_id
+                    .clone()
+                    .unwrap_or_else(|| ctx.format.clone()),
+                ..ctx.clone()
+            };
+            match resolve(&pinned).await {
+                Ok(fresh) => match probe_total(client, &fresh.url).await {
+                    Ok(t2) if t2 == total => {
+                        *state.url.lock().await = fresh.url;
                         continue 'outer;
                     }
+                    Ok(t2) => {
+                        eprintln!(
+                            "[proxy] {} re-resolve changed size ({t2} vs {total}); aborting",
+                            ctx.video_id
+                        );
+                        return false;
+                    }
+                    Err(e) => {
+                        eprintln!("[proxy] {} re-resolve probe failed: {e}", ctx.video_id);
+                        return false;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[proxy] {} re-resolve failed: {e}", ctx.video_id);
+                    return false;
                 }
             }
         }
+        eprintln!("[proxy] {} fill: {why}; giving up", ctx.video_id);
+        return false;
     }
 
     if let Err(e) = file.flush().await {
@@ -512,12 +606,17 @@ pub fn parse_range(header: Option<&str>, total: u64) -> Result<Option<Span>, ()>
         let start = total.saturating_sub(n);
         return Ok(Some(Span { start, end: total - 1 }));
     }
-    let mut it = first.splitn(2, '-');
-    let start: u64 = it.next().unwrap_or("").parse().map_err(|_| ())?;
+    // RFC 9110 grammar requires the hyphen ("500-", "0-99", "-100");
+    // a bare "bytes=500" is malformed, and a malformed Range header is
+    // ignored (serve 200), not answered with 416.
+    let Some((start_part, end_part)) = first.split_once('-') else {
+        return Ok(None);
+    };
+    let start: u64 = start_part.trim().parse().map_err(|_| ())?;
     if start >= total {
         return Err(());
     }
-    let end_part = it.next().unwrap_or("").trim();
+    let end_part = end_part.trim();
     let end = if end_part.is_empty() {
         total - 1
     } else {
@@ -529,11 +628,12 @@ pub fn parse_range(header: Option<&str>, total: u64) -> Result<Option<Span>, ()>
     Ok(Some(Span { start, end }))
 }
 
-/// Clamp a span to the serving window.
+/// Clamp a span to the serving window. Saturating: HTTP range numerals
+/// can legally be enormous and must not overflow (RFC 9110 §14.1.1).
 pub fn window_span(s: &Span) -> Span {
     Span {
         start: s.start,
-        end: s.end.min(s.start + WINDOW - 1),
+        end: s.end.min(s.start.saturating_add(WINDOW - 1)),
     }
 }
 
@@ -594,13 +694,35 @@ async fn fetch_span(
             last = format!("HTTP {}", resp.status());
             continue;
         }
-        let mut buf = Vec::with_capacity(want);
+        // A 206 whose Content-Range names a different offset would hand
+        // the caller mislabeled bytes — validate before reading. A
+        // server MAY legally answer with a shorter span than requested;
+        // deliver exactly what it declared and let the caller label the
+        // response from the actual byte count.
+        let cr = resp
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let promised = match parse_content_range(&cr) {
+            Some((s, e2, t))
+                if s == start && e2 <= end && t.map_or(true, |t| t == state.total) =>
+            {
+                (e2 - start + 1) as usize
+            }
+            _ => {
+                last = format!("bad Content-Range {cr:?}");
+                continue;
+            }
+        };
+        let mut buf = Vec::with_capacity(promised.min(want));
         let mut resp = resp;
         let mut ok = true;
-        while buf.len() < want {
+        while buf.len() < promised {
             match tokio::time::timeout(Duration::from_secs(30), resp.chunk()).await {
                 Ok(Ok(Some(c))) => {
-                    let take = c.len().min(want - buf.len());
+                    let take = c.len().min(promised - buf.len());
                     buf.extend_from_slice(&c[..take]);
                 }
                 Ok(Ok(None)) => break,
@@ -610,10 +732,10 @@ async fn fetch_span(
                 }
             }
         }
-        if ok && buf.len() == want {
+        if ok && buf.len() == promised {
             return Ok(buf);
         }
-        last = format!("short body {}/{want}", buf.len());
+        last = format!("short body {}/{promised}", buf.len());
     }
     Err(last)
 }
@@ -657,7 +779,19 @@ pub async fn serve_span(
             || last_progress.elapsed() > STALL
             || tokio::time::Instant::now() >= deadline
         {
-            return fetch_span(client, state, span.start, span.end).await;
+            match fetch_span(client, state, span.start, span.end).await {
+                Ok(b) => return Ok(b),
+                Err(e) => {
+                    // The filler may have finished while the passthrough
+                    // was failing — the file is then authoritative.
+                    if state.complete.load(Ordering::Acquire) {
+                        return read_span(part_path, final_path, span.start, len)
+                            .await
+                            .map_err(|e2| format!("disk read after passthrough: {e2}"));
+                    }
+                    return Err(e);
+                }
+            }
         }
         let notified = state.notify.notified();
         tokio::pin!(notified);
@@ -780,6 +914,12 @@ mod tests {
     }
 
     #[test]
+    fn range_missing_hyphen_is_ignored() {
+        // Malformed per RFC 9110 grammar — ignore the header, don't 416.
+        assert_eq!(parse_range(Some("bytes=500"), 1000), Ok(None));
+    }
+
+    #[test]
     fn window_caps() {
         let s = window_span(&Span { start: 0, end: 100 * 1024 * 1024 });
         assert_eq!(s.end, WINDOW - 1);
@@ -788,10 +928,20 @@ mod tests {
     }
 
     #[test]
-    fn content_range_total() {
-        assert_eq!(parse_content_range_total("bytes 0-0/12345"), Some(12345));
-        assert_eq!(parse_content_range_total("bytes */999"), Some(999));
-        assert_eq!(parse_content_range_total("bytes 0-0/*"), None);
+    fn content_range_parsing() {
+        assert_eq!(
+            parse_content_range("bytes 0-0/12345"),
+            Some((0, 0, Some(12345)))
+        );
+        assert_eq!(
+            parse_content_range("bytes 100-199/5000"),
+            Some((100, 199, Some(5000)))
+        );
+        assert_eq!(parse_content_range("bytes 5-9/*"), Some((5, 9, None)));
+        // Unsatisfied-range form must never be treated as data.
+        assert_eq!(parse_content_range("bytes */999"), None);
+        assert_eq!(parse_content_range("bytes 9-5/100"), None);
+        assert_eq!(parse_content_range("chunks 0-0/1"), None);
     }
 
     #[test]
