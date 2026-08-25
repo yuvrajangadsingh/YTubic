@@ -526,7 +526,7 @@ function TopResultHero({
     );
 
   const card = (
-    <div className="relative flex items-center gap-3 rounded-xl border bg-card/40 p-4 pr-5 transition-colors hover:bg-white/[0.06]">
+    <div className="group relative flex items-center gap-3 rounded-xl border bg-card/40 p-4 pr-5 transition-colors hover:bg-white/[0.06]">
       {overlay}
 
       <div className="pointer-events-none relative flex min-w-0 flex-1 items-center gap-5">
@@ -546,6 +546,22 @@ function TopResultHero({
               radius,
             )}
           />
+          {/* Clicking a song/video hero card plays it, but nothing used
+              to SAY so — with album artwork on a song top result the
+              card reads as "open the album" and the play comes as a
+              surprise. A hover play glyph makes the behavior visible
+              before the click; entity cards keep their chevron. */}
+          {!isEntity ? (
+            <div
+              aria-hidden="true"
+              className={cn(
+                "absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition-opacity group-hover:bg-black/35 group-hover:opacity-100",
+                radius,
+              )}
+            >
+              <PlayIcon className="size-9 fill-white text-white drop-shadow" />
+            </div>
+          ) : null}
         </div>
         <div className="flex min-w-0 flex-col gap-1">
           <span className="truncate text-3xl font-bold tracking-tight">
