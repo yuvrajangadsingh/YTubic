@@ -25,20 +25,32 @@
 //! and not `inactiveSchedulingPolicy` either — that is set to
 //! `disabled` in tauri.conf.json and the symptom survived it.
 //!
-//! The fix is to stop AppKit reporting occlusion at all, so the webview
-//! never learns it is hidden and its media session stays permitted.
+//! NO FIX FOUND. Four theories tried and all dead:
+//!
+//!   1. App Nap (this module's `set_active`) - wrong layer, no effect.
+//!   2. Throttled timers - there is no timer in the audio start path at
+//!      all; it is a promise microtask.
+//!   3. `inactiveSchedulingPolicy` - set to `disabled` in
+//!      tauri.conf.json, correctly plumbed through tauri-runtime and
+//!      wry, symptom survived.
+//!   4. Disabling AppKit occlusion detection via
+//!      `_setWindowOcclusionDetectionEnabled:` - the selector no longer
+//!      exists (macOS 26.6 NSApplication exposes only the read-only
+//!      `occlusionState`). Verified by respondsToSelector at runtime and
+//!      by introspection; the code was removed rather than left looking
+//!      like a fix.
+//!
+//! Untried idea, recorded so it is not re-derived from scratch: keep a
+//! silent audio element or AudioContext alive so the page always counts
+//! as media-playing, on the theory that WebKit's restriction is on
+//! STARTING playback rather than continuing it. Hacky, may fight the
+//! Now Playing integration, unproven.
 
 #[cfg(target_os = "macos")]
 pub use imp::set_active;
 
 #[cfg(not(target_os = "macos"))]
 pub fn set_active(_active: bool) {}
-
-#[cfg(target_os = "macos")]
-pub use occlusion::keep_webview_visible;
-
-#[cfg(not(target_os = "macos"))]
-pub fn keep_webview_visible() {}
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -79,45 +91,6 @@ mod imp {
             // this same process-info object and is ended exactly once
             // (`take()` above empties the slot).
             unsafe { info.endActivity(&token.0) };
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-mod occlusion {
-    use objc2::runtime::AnyClass;
-    use objc2::{msg_send, sel};
-
-    /// Stop AppKit reporting window occlusion, so WKWebView keeps
-    /// treating its page as visible on another Space and WebKit's media
-    /// session keeps permitting playback to start.
-    ///
-    /// `_setWindowOcclusionDetectionEnabled:` is private, so this is
-    /// guarded on `respondsToSelector:` and is a silent no-op if a
-    /// future macOS drops it — playback then behaves exactly as it does
-    /// today rather than crashing.
-    ///
-    /// The cost is real: occlusion detection is also what lets AppKit
-    /// stop drawing fully hidden windows. For a player whose job is to
-    /// keep working in the background that is the right trade, but it
-    /// is a trade.
-    pub fn keep_webview_visible() {
-        let Some(cls) = AnyClass::get(c"NSApplication") else {
-            return;
-        };
-        unsafe {
-            let app: *mut objc2::runtime::AnyObject = msg_send![cls, sharedApplication];
-            if app.is_null() {
-                return;
-            }
-            let sel = sel!(_setWindowOcclusionDetectionEnabled:);
-            let responds: bool = msg_send![app, respondsToSelector: sel];
-            if !responds {
-                eprintln!("[occlusion] _setWindowOcclusionDetectionEnabled: unavailable");
-                return;
-            }
-            let _: () = msg_send![app, _setWindowOcclusionDetectionEnabled: false];
-            eprintln!("[occlusion] window occlusion detection disabled");
         }
     }
 }
