@@ -524,6 +524,52 @@ async fn read_cookies_plain(app: &tauri::AppHandle) -> Option<String> {
     String::from_utf8(plain).ok()
 }
 
+/// Write the decrypted cookie jar somewhere yt-dlp can read it, and
+/// return that path.
+///
+/// The jar is already stored in Netscape format, so this is a decrypt
+/// and a write, not a conversion. It buys two things, both measured on
+/// 2026-08-26 against this account:
+///
+///   * Premium-only tracks. Anonymous yt-dlp gets `UNPLAYABLE: only
+///     available to Music Premium members` and the handler 502s.
+///   * Bitrate. Anonymous tops out at itag 140 (130k AAC). Authenticated
+///     exposes itag 141 (258k AAC) and 774 (271k Opus) — roughly double,
+///     on every track, not just gated ones.
+///
+/// The old warning that authenticating yt-dlp trips bot detection and
+/// strips every real format was retested and did not reproduce: an
+/// ordinary track authenticated returned the full ladder and downloaded
+/// real bytes.
+///
+/// Returns None when signed out, and every caller treats that as "spawn
+/// anonymously" rather than an error — a cookie problem must never be
+/// able to take playback down with it.
+async fn ytdlp_cookie_file(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let jar = read_cookies_plain(app).await?;
+    if !jar.contains("SAPISID") {
+        // A jar without an auth cookie buys nothing and would only add a
+        // failure mode.
+        return None;
+    }
+    let dir = app
+        .path()
+        .app_data_dir()
+        .ok()?
+        .join("ytdlp-cookies");
+    tokio::fs::create_dir_all(&dir).await.ok()?;
+    let path = dir.join("cookies.txt");
+    // yt-dlp rewrites this file when YouTube rotates a cookie mid-run, so
+    // it has to be our own copy and never the real jar.
+    tokio::fs::write(&path, jar.as_bytes()).await.ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await;
+    }
+    Some(path)
+}
+
 /// Serialize a list of cookies into the Netscape cookie-jar format that
 /// yt-dlp and our reader expect. Only keeps cookies for google/youtube
 /// domains — that's all the auth flow touches.
@@ -2233,7 +2279,21 @@ async fn ensure_ytdlp(app: tauri::AppHandle) {
 /// WebView2 / WebKitGTK decode Opus fine and the extra ladder isn't
 /// needed there.
 #[cfg(target_os = "macos")]
-const AUDIO_FORMAT: &str = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=webm]/bestaudio/b[ext=mp4][acodec!=none]";
+// Quality ladder, best first. Both top rungs are Premium-only and need
+// cookies (see ytdlp_cookie_file); signed out, selection falls through to
+// itag 140 exactly as before.
+//
+//   774  Opus  271k 48kHz  <- the platform ceiling
+//   141  AAC   258k 44.1k
+//   140  AAC   130k        <- what anonymous playback gets
+//
+// 774 is Opus in WebM and WebKit will not range-request WebM: it issues a
+// single non-ranged GET for the whole file. At ~10MB served from the local
+// cache that is cheap (the same behaviour cost 205MB on a 4K video), but
+// seeking is the open question, which is why 141 sits right behind it as a
+// same-quality-class fallback in the container everything already works
+// with. Neither is lossless; YouTube Music has no lossless tier at all.
+const AUDIO_FORMAT: &str = "774/141/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=webm]/bestaudio/b[ext=mp4][acodec!=none]";
 #[cfg(not(target_os = "macos"))]
 const AUDIO_FORMAT: &str = "bestaudio[ext=webm]/bestaudio";
 
@@ -2278,6 +2338,9 @@ fn resolve_stream_ytdlp(app: tauri::AppHandle, video_id: String) -> Result<Strin
         return Err(format!("invalid videoId: {video_id}"));
     }
     let url = format!("https://www.youtube.com/watch?v={video_id}");
+    // Same jar the InnerTube pipeline uses. Without it YouTube refuses
+    // Premium-only tracks outright and caps everything else at 130k.
+    let cookies = tauri::async_runtime::block_on(ytdlp_cookie_file(&app));
     let mut command = std::process::Command::new(ytdlp::program(&ytdlp::managed_path(&app)));
     command.args([
         "-j",
@@ -2285,8 +2348,11 @@ fn resolve_stream_ytdlp(app: tauri::AppHandle, video_id: String) -> Result<Strin
         AUDIO_FORMAT,
         "--no-playlist",
         "--no-warnings",
-        &url,
     ]);
+    if let Some(path) = cookies.as_ref() {
+        command.arg("--cookies").arg(path);
+    }
+    command.arg(&url);
     // Windows: a console-less GUI process spawning the console-subsystem
     // yt-dlp.exe with default flags makes Windows flash a console window
     // on every resolve. CREATE_NO_WINDOW suppresses it.
@@ -2392,6 +2458,10 @@ struct StreamServer {
     /// `ytdlp::program` so a mid-session download takes effect
     /// immediately.
     ytdlp_bin: PathBuf,
+    /// Needed to decrypt the cookie jar before each yt-dlp spawn, so
+    /// downloads run as the signed-in (Premium) user rather than
+    /// anonymously. See `ytdlp_cookie_file`.
+    app: tauri::AppHandle,
 }
 
 /// Read a boolean query flag (`?name=1` / `?name=true`) off a stream/
@@ -3249,6 +3319,12 @@ fn spawn_downloader(
             "-o",
             "-",
         ]);
+        // Authenticated download: Premium-only tracks are refused without
+        // this, and everything else is capped at 130k. Absent (signed
+        // out) it spawns anonymously exactly as before.
+        if let Some(path) = ytdlp_cookie_file(&srv.app).await {
+            cmd.arg("--cookies").arg(path);
+        }
         cmd.arg(&url);
         // Windows: suppress the console window for the child yt-dlp.exe
         // (see resolve_stream_ytdlp for rationale).
@@ -3656,6 +3732,7 @@ async fn start_stream_server(
     ephemeral_dir: PathBuf,
     cover_dir: PathBuf,
     ytdlp_bin: PathBuf,
+    app: tauri::AppHandle,
 ) {
     if let Err(e) = tokio::fs::create_dir_all(&cache_dir).await {
         eprintln!("[stream-server] mkdir {cache_dir:?}: {e}");
@@ -3692,6 +3769,7 @@ async fn start_stream_server(
         cover_dir,
         downloads: Arc::new(Mutex::new(HashMap::new())),
         ytdlp_bin,
+        app: app.clone(),
     };
 
     // Per-launch token as an unguessable path prefix. Baked into the base
@@ -4052,6 +4130,7 @@ pub fn run() {
                     ephemeral_dir,
                     cover_dir,
                     ytdlp_bin,
+                    handle.clone(),
                 )
                 .await;
             });
