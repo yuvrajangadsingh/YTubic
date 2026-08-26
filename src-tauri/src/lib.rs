@@ -4091,6 +4091,12 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            // Playback will not START while the window is on another
+            // Space unless AppKit stops reporting the window occluded:
+            // WebKit refuses to begin media on a page it considers not
+            // visible. See app_nap for the evidence. Main thread, before
+            // any window work.
+            app_nap::keep_webview_visible();
             let port = port_handle.clone();
             let token = token_handle.clone();
             let router = router_handle.clone();
