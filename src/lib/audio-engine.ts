@@ -103,6 +103,13 @@ export function useAudioEngine() {
   // Raw element-reported duration (pre-correction) so the end guard can
   // recognise the doubled-header case even after the store was clamped.
   const rawElDurationRef = useRef(0);
+  // Authoritative length OF THE FILE CURRENTLY LOADED, which in video
+  // mode is not the queue row: a 5:30 song pairs with a 6:15 music
+  // video. Everything that reasons about "is the element lying about
+  // its length" has to measure against this, not against the row.
+  // `undefined` means we don't have a trustworthy reference yet and
+  // those checks must stand down rather than guess.
+  const metaReferenceRef = useRef<number | undefined>(undefined);
   // corrected-end advance latch; re-armed when the playhead returns
   // before the corrected end (see onTimeUpdate)
   const endGuardFiredRef = useRef<boolean>(false);
@@ -238,9 +245,9 @@ export function useAudioEngine() {
       if (Number.isFinite(el.duration) && el.duration > 0) {
         rawElDurationRef.current = el.duration;
         const cur = store();
-        const meta =
-          cur.index >= 0 ? cur.queue[cur.index]?.duration : undefined;
-        cur.setDuration(correctedDuration(meta, el.duration));
+        cur.setDuration(
+          correctedDuration(metaReferenceRef.current, el.duration),
+        );
       } else if (el.duration === Infinity) {
         // Streaming containers (progressively served webm) report
         // Infinity until fully buffered, which left the bar showing the
@@ -258,9 +265,7 @@ export function useAudioEngine() {
       const cur = store();
       if (end > cur.duration + 0.5) {
         rawElDurationRef.current = end;
-        const meta =
-          cur.index >= 0 ? cur.queue[cur.index]?.duration : undefined;
-        cur.setDuration(correctedDuration(meta, end));
+        cur.setDuration(correctedDuration(metaReferenceRef.current, end));
       }
     };
     const onProgress = () => syncSeekableDuration();
@@ -420,6 +425,36 @@ export function useAudioEngine() {
     videoId ? resolveStreamId(videoId, s.byVideoId) : undefined,
   );
 
+  // The stream's own length when it isn't the queue row's file.
+  //
+  // Song and video versions are different lengths by nature (intro,
+  // outro, an extra verse). Measuring the video against the song's
+  // metadata is what made a 6:15 video display as 12:29: its header
+  // reports double (a known YT quirk), and 750/330 = 2.27 falls outside
+  // the 1.8-2.2 doubled-header window, so the clamp never recognised it.
+  // Against its own 375s it is exactly 2.0 and clamps correctly.
+  const [streamMetaDuration, setStreamMetaDuration] = useState<
+    number | undefined
+  >(undefined);
+  useEffect(() => {
+    if (!streamVideoId || streamVideoId === videoId) {
+      setStreamMetaDuration(undefined);
+      return;
+    }
+    let cancelled = false;
+    setStreamMetaDuration(undefined);
+    fetchPanelDuration(streamVideoId)
+      .then((secs) => {
+        if (!cancelled && secs) setStreamMetaDuration(secs);
+      })
+      .catch(() => {
+        /* no reference is better than the wrong one */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [streamVideoId, videoId]);
+
   // True only when the user explicitly switched this track to its video
   // source — then the stream request carries ?video=1 and the element
   // has real frames to show.
@@ -453,17 +488,23 @@ export function useAudioEngine() {
 
   // Re-apply the header clamp when the metadata length lands AFTER the
   // element already reported durationchange (the late-fetch above).
-  const liveMetaDuration = usePlaybackStore((s) =>
+  const rowMetaDuration = usePlaybackStore((s) =>
     s.index >= 0 ? s.queue[s.index]?.duration : undefined,
   );
+  // Whichever file is loaded, that file's own length is the reference.
+  const metaReference =
+    streamVideoId && streamVideoId !== videoId
+      ? streamMetaDuration
+      : rowMetaDuration;
   useEffect(() => {
-    if (!liveMetaDuration || !rawElDurationRef.current) return;
+    metaReferenceRef.current = metaReference;
+  }, [metaReference]);
+  useEffect(() => {
+    if (!metaReference || !rawElDurationRef.current) return;
     usePlaybackStore
       .getState()
-      .setDuration(
-        correctedDuration(liveMetaDuration, rawElDurationRef.current),
-      );
-  }, [liveMetaDuration]);
+      .setDuration(correctedDuration(metaReference, rawElDurationRef.current));
+  }, [metaReference]);
 
   // Reactive Premium check for the gate below. Subscribing (rather than
   // calling isPremium() inside the effect) makes the resolve effect
@@ -1385,7 +1426,14 @@ export function useAudioEngine() {
   // the element believes in a much longer file, move on. Seeking past
   // the listed end disables it for that track (same suppression as the
   // outro skip — a deliberate listen wins).
-  const metaDuration = track?.duration ?? 0;
+  // Reference for THIS guard is the loaded file's own length. Using the
+  // queue row's instead is what cut music videos off mid-play: a 6:15
+  // video against a 5:30 song satisfied "element is 1.5x the metadata"
+  // and then fired next() the moment playback passed 5:32. `?? 0`
+  // disables the guard whenever we have no trustworthy reference, which
+  // is the correct default — advancing on a guess is worse than not
+  // advancing at all.
+  const metaDuration = metaReference ?? 0;
   useEffect(() => {
     if (!playing || !videoId) return;
     if (outroSkippedRef.current === videoId) return;

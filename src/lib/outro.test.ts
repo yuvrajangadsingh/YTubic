@@ -36,3 +36,28 @@ describe("correctedDuration", () => {
     expect(correctedDuration(10, 21)).toBe(21);
   });
 });
+
+// A song and its music video are different lengths by nature (intro,
+// outro, an extra verse). Measuring one against the other is what made
+// Pyar Encore — a 5:30 song paired with its own 6:15 video whose header
+// reports double — display as 12:29 and get cut off mid-play.
+describe("correctedDuration across a song/video pair", () => {
+  const SONG = 330; // 5:30, the queue row
+  const VIDEO = 375; // 6:15, the file actually loaded
+  const DOUBLED = 750; // what the element reports for that video
+
+  it("misses the doubled header when measured against the song", () => {
+    // 750/330 = 2.27, outside the 1.8-2.2 window: no correction, and the
+    // UI shows 12:29 for a 6:15 video.
+    expect(correctedDuration(SONG, DOUBLED)).toBe(DOUBLED);
+  });
+
+  it("catches it when measured against the video's own length", () => {
+    // 750/375 = 2.0 exactly.
+    expect(correctedDuration(VIDEO, DOUBLED)).toBe(VIDEO);
+  });
+
+  it("leaves the element alone when there is no reference", () => {
+    expect(correctedDuration(undefined, DOUBLED)).toBe(DOUBLED);
+  });
+});
