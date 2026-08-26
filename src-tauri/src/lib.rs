@@ -2842,44 +2842,155 @@ fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
     )
 }
 
-/// Downscale the art and pick a vibrant dominant color. Pixels outside a
-/// legible lightness band or below a saturation floor are dropped so the
-/// accent reads as white-on-color over the dark ambient backdrop; the
-/// survivors are bucketed by hue and the saturation-weighted average of
-/// the heaviest bucket wins. Returns `None` for near-monochrome art so
-/// the caller can fall back to the brand red.
+/// Pick the accent color for a cover.
+///
+/// Three rungs, in order:
+///
+/// 1. VIVID — a saturated hue that also *covers* enough of the art. The
+///    coverage floor is the whole point: without it the most saturated
+///    hue wins by default, so a cover that is 95% steel-grey with two
+///    small gold record-label logos got a brass accent off 0.15% of its
+///    pixels. Measured over the local cover cache, 15 of 284 covers were
+///    being themed by under 1% of the image. The 1% floor is Google's
+///    Material `CUTOFF_EXCITED_PROPORTION`, tuned there against real
+///    wallpapers and matching our corpus well.
+/// 2. MUTED — nothing vivid is big enough, so tint from the art's own
+///    overall color instead of a speck. A desaturated cover gets a
+///    quiet version of what it actually looks like.
+/// 3. NEUTRAL — genuinely monochrome art: `None`, and the caller uses
+///    ACCENT_FALLBACK.
+///
+/// Ranking within the vivid rung stays saturation-weighted mass rather
+/// than Material's population-weighted score: scored that way on the
+/// same corpus, covers dominated by a person swung to skin tone (Lungi
+/// Dance traded its blue plaid for tan). Coverage as a *filter* fixes
+/// the speck bug without letting area outvote color identity.
 fn accent_from_bytes(bytes: &[u8]) -> Option<String> {
     let img = image::load_from_memory(bytes).ok()?;
     let small = img.thumbnail(64, 64).to_rgb8();
-    let mut sum = [[0f64; 3]; 12];
-    let mut weight = [0f64; 12];
-    for p in small.pixels() {
-        let (h, s, l) = rgb_to_hsl(p[0], p[1], p[2]);
-        if !(0.20..=0.75).contains(&l) || s < 0.35 {
-            continue;
-        }
-        let bucket = ((h / 30.0).floor() as usize) % 12;
-        sum[bucket][0] += p[0] as f64 * s;
-        sum[bucket][1] += p[1] as f64 * s;
-        sum[bucket][2] += p[2] as f64 * s;
-        weight[bucket] += s;
-    }
-    let best = weight
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i)?;
-    if weight[best] <= 0.0 {
+    let total = small.pixels().len() as f64;
+    if total <= 0.0 {
         return None;
     }
-    let r = (sum[best][0] / weight[best]).round() as u8;
-    let g = (sum[best][1] / weight[best]).round() as u8;
-    let b = (sum[best][2] / weight[best]).round() as u8;
-    // Force the winner into the legible band: floor the saturation so a
-    // muted average still shows as a color, and clamp lightness so it's
-    // neither lost on black nor washed out under white text.
-    let (h, s, l) = rgb_to_hsl(r, g, b);
-    let (rr, gg, bb) = hsl_to_rgb(h, s.max(0.5), l.clamp(0.45, 0.70));
+    /// Winner must cover at least this share of ALL sampled pixels.
+    const MIN_COVERAGE: f64 = 0.01;
+
+    // Two hue grids, the second offset by half a bucket. A single fixed
+    // grid splits a hue that straddles a boundary (a red spread across
+    // 355 deg and 10 deg lands in two buckets), which would let a
+    // genuinely dominant color fail the coverage floor on a technicality
+    // — 9 of the low-coverage covers in the corpus were exactly this.
+    let mut best: Option<(f64, f64, f64, f64)> = None; // (mass, r, g, b)
+    for offset in [0.0f64, 15.0] {
+        let mut sum = [[0f64; 3]; 12];
+        let mut weight = [0f64; 12];
+        let mut count = [0u32; 12];
+        for p in small.pixels() {
+            let (h, s, l) = rgb_to_hsl(p[0], p[1], p[2]);
+            if !(0.20..=0.75).contains(&l) || s < 0.35 {
+                continue;
+            }
+            let bucket = ((((h - offset).rem_euclid(360.0)) / 30.0).floor() as usize) % 12;
+            sum[bucket][0] += p[0] as f64 * s;
+            sum[bucket][1] += p[1] as f64 * s;
+            sum[bucket][2] += p[2] as f64 * s;
+            weight[bucket] += s;
+            count[bucket] += 1;
+        }
+        for i in 0..12 {
+            if weight[i] <= 0.0 || (count[i] as f64) / total < MIN_COVERAGE {
+                continue;
+            }
+            if best.map_or(true, |(m, ..)| weight[i] > m) {
+                best = Some((
+                    weight[i],
+                    sum[i][0] / weight[i],
+                    sum[i][1] / weight[i],
+                    sum[i][2] / weight[i],
+                ));
+            }
+        }
+    }
+
+    if let Some((_, r, g, b)) = best {
+        // Force the winner into the legible band: floor the saturation so
+        // a muted average still shows as a color, and clamp lightness so
+        // it's neither lost on black nor washed out under white text.
+        let (h, s, l) = rgb_to_hsl(r.round() as u8, g.round() as u8, b.round() as u8);
+        let (rr, gg, bb) = hsl_to_rgb(h, s.max(0.5), l.clamp(0.45, 0.70));
+        return Some(format!("#{rr:02X}{gg:02X}{bb:02X}"));
+    }
+
+    muted_accent(&small, total)
+}
+
+/// Rung 2: tint derived from the art as a whole.
+///
+/// Hue is summed as a circular vector so opposing colors cancel instead
+/// of averaging into a false middle, and each pixel's pull is capped so a
+/// tiny ultra-saturated logo cannot outvote a large quiet field — the
+/// same failure the coverage floor exists to stop.
+///
+/// Two independent tests must pass, because hue is numerically unstable
+/// near grey and boosting noise would invent a color the art never had:
+/// `evidence` (is there enough color at all) and `focus` (does it agree
+/// on one hue).
+fn muted_accent(small: &image::RgbImage, total: f64) -> Option<String> {
+    /// Per-pixel cap on hue pull.
+    const CHROMA_CAP: f64 = 0.15;
+    /// Minimum color mass over the whole image.
+    const MIN_EVIDENCE: f64 = 0.015;
+    /// Minimum agreement among the pixels that carry color.
+    const MIN_FOCUS: f64 = 0.40;
+
+    let (mut vx, mut vy, mut wsum) = (0f64, 0f64, 0f64);
+    let mut lights: Vec<f64> = Vec::new();
+    for p in small.pixels() {
+        let (h, _, l) = rgb_to_hsl(p[0], p[1], p[2]);
+        if !(0.15..=0.85).contains(&l) {
+            continue;
+        }
+        let max = p[0].max(p[1]).max(p[2]) as f64;
+        let min = p[0].min(p[1]).min(p[2]) as f64;
+        let w = ((max - min) / 255.0).min(CHROMA_CAP);
+        let rad = h.to_radians();
+        vx += w * rad.cos();
+        vy += w * rad.sin();
+        wsum += w;
+        lights.push(l);
+    }
+    if lights.is_empty() || wsum <= 0.0 {
+        return None;
+    }
+    let mag = vx.hypot(vy);
+    let evidence = mag / total;
+    let focus = mag / wsum;
+    if evidence < MIN_EVIDENCE || focus < MIN_FOCUS {
+        return None;
+    }
+
+    let h = vy.atan2(vx).to_degrees().rem_euclid(360.0);
+    // Saturation floor is not cosmetic: the frontend's `legibleAccent()`
+    // replaces anything under 0.22 with plain white, which would throw
+    // away the tint we just derived.
+    let s = (4.0 * evidence).clamp(0.25, 0.40);
+    lights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut l = lights[lights.len() / 2].clamp(0.56, 0.70);
+
+    // `legibleAccent()` also force-saturates any accent whose gamma-space
+    // luma is below 0.5 (a rule meant for dark vivid accents on their own
+    // backdrop). A quiet tint would come back neon, so lift it just past
+    // that line here instead.
+    while l < 0.80 {
+        let (r, g, b) = hsl_to_rgb(h, s, l);
+        let luma =
+            0.2126 * (r as f64 / 255.0) + 0.7152 * (g as f64 / 255.0) + 0.0722 * (b as f64 / 255.0);
+        if luma >= 0.50 {
+            break;
+        }
+        l += 0.01;
+    }
+    let (rr, gg, bb) = hsl_to_rgb(h, s, l);
     Some(format!("#{rr:02X}{gg:02X}{bb:02X}"))
 }
 
@@ -4018,6 +4129,91 @@ pub fn run() {
                 show_main_window(_app);
             }
         });
+}
+
+#[cfg(test)]
+mod accent_tests {
+    use super::{accent_from_bytes, rgb_to_hsl};
+
+    /// Encode a solid-background image with an optional patch, as PNG.
+    fn art(bg: [u8; 3], patch: Option<([u8; 3], u32)>) -> Vec<u8> {
+        let mut img = image::RgbImage::from_pixel(64, 64, image::Rgb(bg));
+        if let Some((color, side)) = patch {
+            for y in 0..side {
+                for x in 0..side {
+                    img.put_pixel(x, y, image::Rgb(color));
+                }
+            }
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .expect("encode");
+        out.into_inner()
+    }
+
+    fn hue_of(hex: &str) -> f64 {
+        let n = u32::from_str_radix(&hex[1..], 16).unwrap();
+        let (h, _, _) = rgb_to_hsl((n >> 16) as u8, (n >> 8) as u8, n as u8);
+        h
+    }
+
+    /// The bug this rung exists for: a steel-grey cover with a tiny gold
+    /// logo must not come out gold. 4x4 of 64x64 is 0.39%, under the 1%
+    /// coverage floor.
+    #[test]
+    fn a_tiny_saturated_speck_does_not_win() {
+        let hex = accent_from_bytes(&art([100, 112, 150], Some(([212, 175, 55], 4))))
+            .expect("steel art should still yield a tint");
+        let h = hue_of(&hex);
+        assert!(
+            (180.0..300.0).contains(&h),
+            "expected a blue-ish tint from the field, got {hex} (hue {h:.0})"
+        );
+    }
+
+    /// The same gold, given real presence (32x32 = 25%), is allowed to win.
+    #[test]
+    fn a_large_saturated_region_still_wins() {
+        let hex = accent_from_bytes(&art([100, 112, 150], Some(([212, 175, 55], 32))))
+            .expect("some accent");
+        let h = hue_of(&hex);
+        assert!(
+            (30.0..70.0).contains(&h),
+            "expected gold to win on coverage, got {hex} (hue {h:.0})"
+        );
+    }
+
+    /// Truly monochrome art has no honest tint to offer.
+    #[test]
+    fn monochrome_art_yields_no_accent() {
+        assert_eq!(accent_from_bytes(&art([128, 128, 128], None)), None);
+    }
+
+    /// Whatever the muted rung returns must survive the frontend's
+    /// `legibleAccent()`, which whitens anything under 0.22 saturation and
+    /// force-saturates anything with luma below 0.5.
+    #[test]
+    fn muted_output_survives_the_frontend_transform() {
+        let hex = accent_from_bytes(&art([100, 112, 150], Some(([212, 175, 55], 4)))).unwrap();
+        let n = u32::from_str_radix(&hex[1..], 16).unwrap();
+        let (r, g, b) = ((n >> 16) as u8, (n >> 8) as u8, n as u8);
+        let (_, s, _) = rgb_to_hsl(r, g, b);
+        let luma =
+            0.2126 * (r as f64 / 255.0) + 0.7152 * (g as f64 / 255.0) + 0.0722 * (b as f64 / 255.0);
+        assert!(s >= 0.22, "{hex} would be whitened (s={s:.3})");
+        assert!(luma >= 0.50, "{hex} would be force-saturated (luma={luma:.3})");
+    }
+
+    /// Parity probe against the tuning corpus. Ignored by default; run with
+    /// `YTUBIC_TEST_COVER=<path> cargo test -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn print_accent_for_cover() {
+        let path = std::env::var("YTUBIC_TEST_COVER").expect("set YTUBIC_TEST_COVER");
+        let bytes = std::fs::read(&path).expect("read cover");
+        println!("{path} -> {:?}", accent_from_bytes(&bytes));
+    }
 }
 
 #[cfg(test)]
