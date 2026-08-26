@@ -55,6 +55,18 @@ export type WhatsNewEntry = {
  */
 export const WHATS_NEW: WhatsNewEntry[] = [
   {
+    version: "0.4.3",
+    date: "August 27, 2026",
+    summary: "Collapsed sidebar tells you what things are",
+    changes: [
+      {
+        type: "fixed",
+        title: "Tooltips in the collapsed sidebar",
+        text: "With the sidebar collapsed, every row is a bare icon or a cover thumbnail and the name only appeared after holding still for most of a second, so running your eye down the list showed nothing. Names now appear as soon as you hover.",
+      },
+    ],
+  },
+  {
     version: "0.4.2",
     date: "August 26, 2026",
     summary: "Your Premium audio quality, finally",
