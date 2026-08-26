@@ -178,36 +178,44 @@ function RecentSearches({ filter }: { filter: SearchFilter }) {
   const pushHistory = useSearchHistory((s) => s.push);
   if (history.length === 0) return null;
   return (
-    <section className="flex max-w-xl flex-col gap-0.5">
+    <section className="flex flex-col gap-0.5">
       <h2 className="px-1 pb-2 text-sm font-semibold text-muted-foreground">
         Recent searches
       </h2>
-      {history.slice(0, 10).map((h) => (
-        <div
-          key={h}
-          className="group flex items-center gap-1 rounded-md transition-colors hover:bg-accent"
-        >
-          <button
-            type="button"
-            className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 px-2 py-2 text-left text-sm"
-            onClick={() => {
-              pushHistory(h);
-              navigate({ to: "/search", search: { q: h, filter } });
-            }}
+      {/* Flows into columns instead of a fixed 576px rail. This was the
+          only hard width cap on the page, so on a wide window the input
+          and chips ran the full width while the history sat in a narrow
+          strip with dead space beside it. Same auto-fill idiom the
+          library and browse grids use, so it collapses to one column on
+          a narrow window. */}
+      <div className="grid w-full gap-0.5 grid-cols-[repeat(auto-fill,minmax(min(100%,28rem),1fr))]">
+        {history.slice(0, 10).map((h) => (
+          <div
+            key={h}
+            className="group flex items-center gap-1 rounded-md transition-colors hover:bg-accent"
           >
-            <HistoryIcon className="size-4 shrink-0 text-muted-foreground" />
-            <span className="truncate">{h}</span>
-          </button>
-          <button
-            type="button"
-            aria-label={`Remove "${h}" from search history`}
-            className="mr-1 flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-muted-foreground opacity-0 transition-opacity hover:bg-white/10 hover:text-foreground group-hover:opacity-100"
-            onClick={() => remove(h)}
-          >
-            <XIcon className="size-4" />
-          </button>
-        </div>
-      ))}
+            <button
+              type="button"
+              className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 px-2 py-2 text-left text-sm"
+              onClick={() => {
+                pushHistory(h);
+                navigate({ to: "/search", search: { q: h, filter } });
+              }}
+            >
+              <HistoryIcon className="size-4 shrink-0 text-muted-foreground" />
+              <span className="truncate">{h}</span>
+            </button>
+            <button
+              type="button"
+              aria-label={`Remove "${h}" from search history`}
+              className="mr-1 flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-muted-foreground opacity-0 transition-opacity hover:bg-white/10 hover:text-foreground group-hover:opacity-100"
+              onClick={() => remove(h)}
+            >
+              <XIcon className="size-4" />
+            </button>
+          </div>
+        ))}
+      </div>
     </section>
   );
 }
