@@ -55,6 +55,63 @@ export type WhatsNewEntry = {
  */
 export const WHATS_NEW: WhatsNewEntry[] = [
   {
+    version: "0.4.1",
+    date: "August 26, 2026",
+    summary: "Playback fixes, album play counts, and a calmer accent color",
+    changes: [
+      {
+        type: "fixed",
+        title: "Songs skipping one after another",
+        text: "YouTube retired the download client YTubic was pinned to, so every track failed and the queue raced to the end. Playback no longer pins a client and follows yt-dlp's own rotation, which keeps up with YouTube's changes.",
+      },
+      {
+        type: "fixed",
+        title: "Music videos cut off partway",
+        text: "A song and its video are different lengths, but the video was being measured against the song's runtime. That made a 6:15 video report 12:29 and get skipped at 5:32. Every length check now uses the file that is actually playing.",
+      },
+      {
+        type: "fixed",
+        title: "Video mode turning itself on",
+        text: "Watching one music video used to switch video on for good, so later launches held every song behind a loading spinner while a 4K file downloaded in the background. Video now lasts for the session and every launch starts on song.",
+      },
+      {
+        type: "new",
+        title: "Go to album",
+        text: "Right click any track to open its album. Works from search and home cards too, where YouTube hides the album behind the track's own menu.",
+      },
+      {
+        type: "new",
+        title: "Video stays put with the queue open",
+        text: "Opening the queue used to swap the video back to album art. It now stays docked above the list.",
+      },
+      {
+        type: "improved",
+        title: "Album play counts and runtimes",
+        text: "Album track lists show YouTube Music's play counts alongside each track's length, in their own columns.",
+      },
+      {
+        type: "improved",
+        title: "Accent colors that match the cover",
+        text: "The player used to take its color from the most vivid thing in the artwork, even a tiny logo, so a steel grey cover came out brass. A color now has to cover enough of the art to win, and quiet covers get a tint drawn from the whole image.",
+      },
+      {
+        type: "improved",
+        title: "Faster first play",
+        text: "The downloader now unpacks once instead of on every launch, which takes seconds off starting a track that is not cached yet.",
+      },
+      {
+        type: "improved",
+        title: "Undo for destructive clicks",
+        text: "Clearing the queue and other one click actions can be undone, signing out asks first, and links can be copied from the track menu.",
+      },
+      {
+        type: "fixed",
+        title: "Search history on wide windows",
+        text: "Recent searches sat in a narrow strip while everything above ran the full width. It now uses the space.",
+      },
+    ],
+  },
+  {
     version: "0.4.0",
     date: "July 23, 2026",
     summary: "YTubic comes to Linux and macOS",
