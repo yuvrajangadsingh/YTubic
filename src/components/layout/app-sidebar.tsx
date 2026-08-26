@@ -36,6 +36,7 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@/components/ui/sidebar";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import {
   Dialog,
@@ -105,6 +106,14 @@ export function AppSidebar() {
     location.pathname === `/playlist/${id}`;
 
   return (
+    // Collapsed, every row is a bare icon or a cover thumbnail, so the
+    // tooltip IS the label and has to arrive at hover speed. The app
+    // wide provider waits 800ms, which is right for decorative tooltips
+    // and useless here: running your eye down the rail never dwells on
+    // one row that long, so nothing ever appeared. Nested provider, so
+    // only the sidebar gets the fast delay; skipDelay keeps the rest of
+    // a scan instant once the first tooltip has shown.
+    <TooltipProvider delayDuration={120} skipDelayDuration={400}>
     <Sidebar
       variant="floating"
       collapsible="icon"
@@ -180,6 +189,7 @@ export function AppSidebar() {
         <UserProfile />
       </SidebarFooter>
     </Sidebar>
+    </TooltipProvider>
   );
 }
 
