@@ -55,6 +55,24 @@ export type WhatsNewEntry = {
  */
 export const WHATS_NEW: WhatsNewEntry[] = [
   {
+    version: "0.4.2",
+    date: "August 26, 2026",
+    summary: "Your Premium audio quality, finally",
+    changes: [
+      {
+        type: "new",
+        title: "Top tier audio",
+        text: "Playback used to run signed out, which capped every track at 130 kbps whatever your subscription said. It now uses your account and pulls the best tier YouTube Music offers: 271 kbps Opus at 48 kHz, roughly double what you were hearing, on every track.",
+      },
+      {
+        type: "fixed",
+        title: "Premium only tracks refusing to play",
+        text: "Some tracks failed with a playback error that looked like a codec problem. YouTube was refusing them because the download was anonymous. They play now.",
+      },
+    ],
+    note: "Tracks already in your cache were downloaded at the old quality and would keep being served from disk, so the audio cache is cleared once on this update. Everything re-downloads at full quality the next time you play it.",
+  },
+  {
     version: "0.4.1",
     date: "August 26, 2026",
     summary: "Playback fixes, album play counts, and a calmer accent color",
