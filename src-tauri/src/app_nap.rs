@@ -1,7 +1,8 @@
 //! Keeping playback alive while the window is not visible.
 //!
-//! Two separate macOS mechanisms stop a hidden music player, and only
-//! the second one turned out to matter here.
+//! Two separate macOS mechanisms stop a hidden music player. App Nap is
+//! handled below; the second (WebKit media policy) is diagnosed but
+//! UNFIXED.
 //!
 //! ## App Nap (`set_active`)
 //!
@@ -10,7 +11,7 @@
 //! the symptom survived it untouched. Kept because the assertion is
 //! correct on its own terms, not because it solves anything observed.
 //!
-//! ## Window occlusion (`keep_webview_visible`) — the actual cause
+//! ## WebKit media policy on hidden pages, the actual cause (unfixed)
 //!
 //! When a window moves to another Space, AppKit marks it occluded and
 //! WKWebView drops its page to "not visible". WebKit then refuses to
