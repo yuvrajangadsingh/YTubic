@@ -2288,11 +2288,16 @@ async fn ensure_ytdlp(app: tauri::AppHandle) {
 //   140  AAC   130k        <- what anonymous playback gets
 //
 // 774 is Opus in WebM and WebKit will not range-request WebM: it issues a
-// single non-ranged GET for the whole file. At ~10MB served from the local
-// cache that is cheap (the same behaviour cost 205MB on a 4K video), but
-// seeking is the open question, which is why 141 sits right behind it as a
-// same-quality-class fallback in the container everything already works
-// with. Neither is lossless; YouTube Music has no lossless tier at all.
+// single non-ranged GET for the whole file. That cost 205MB on a 4K video,
+// but at ~6-10MB from the local cache it is cheap, and seeking was VERIFIED
+// working on 2026-08-26 (scrubbing jumps cleanly on 267-271k Opus). 141
+// stays behind it as a same-quality-class fallback in the container
+// everything else uses, not because 774 is known to be a problem.
+//
+// Non-catalogue uploads (fan reuploads and the like) carry no Premium tier
+// at all and correctly fall through to 140 - that is the source, not a bug.
+//
+// Neither rung is lossless; YouTube Music has no lossless tier at all.
 const AUDIO_FORMAT: &str = "774/141/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=webm]/bestaudio/b[ext=mp4][acodec!=none]";
 #[cfg(not(target_os = "macos"))]
 const AUDIO_FORMAT: &str = "bestaudio[ext=webm]/bestaudio";
