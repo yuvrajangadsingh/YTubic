@@ -165,3 +165,96 @@ describe("cleanAudioSwapOk", () => {
     expect(cleanAudioSwapOk("song", 465, 45)).toBe(false);
   });
 });
+
+// Real-world uploads: label/fan channels title the video
+// "Song (Official Video) | Artist | Album | Year" and the byline is the
+// CHANNEL, not the artist. Strings below are live payloads (Aug 2026).
+describe("alternateCandidateOk on channel uploads", () => {
+  const zaalmaSong = {
+    videoId: "x27KMVtjgeI",
+    title: "Zaalma",
+    artists: [{ name: "Pukhraj Bhalla" }],
+    duration: 255, // 4:15
+  };
+
+  it("accepts the official upload with a packaged title and channel byline", () => {
+    expect(
+      alternateCandidateOk(
+        zaalmaSong,
+        {
+          kind: "video",
+          id: "VnEJ86-9a38",
+          title:
+            "Zaalma (Full Song) | Pukhraj Bhalla ft JT Bhatti & Kru172 | YJKD | New Punjabi Song 2018",
+          subtitle: "Troll Punjabi • 10M views • 4:15",
+          duration: 255,
+        },
+        "video",
+      ),
+    ).toBe(true);
+  });
+
+  it("still rejects a different song that merely names the artist", () => {
+    expect(
+      alternateCandidateOk(
+        zaalmaSong,
+        {
+          kind: "video",
+          id: "EbUq23paEjM",
+          title: "Dil Haare - Pukhraj Bhalla | JT Beats",
+          subtitle: "Troll Punjabi • 4.8M views • 3:59",
+          duration: 239,
+        },
+        "video",
+      ),
+    ).toBe(false);
+  });
+
+  it("still rejects when the duration is in a different league", () => {
+    expect(
+      alternateCandidateOk(
+        zaalmaSong,
+        {
+          kind: "video",
+          id: "longmix",
+          title: "Zaalma | Pukhraj Bhalla nonstop mix",
+          subtitle: "Some Channel • 1M views • 32:10",
+          duration: 1930,
+        },
+        "video",
+      ),
+    ).toBe(false);
+  });
+
+  it("still rejects a candidate with no duration to check", () => {
+    expect(
+      alternateCandidateOk(
+        zaalmaSong,
+        {
+          kind: "video",
+          id: "-Chif1XK2e8",
+          title: "Pukhraj Bhalla - Zaalma (Lyrics)",
+          subtitle: "Lyrics Hub",
+          duration: undefined,
+        },
+        "video",
+      ),
+    ).toBe(false);
+  });
+
+  it("short titles cannot ride containment past the length guard", () => {
+    expect(
+      alternateCandidateOk(
+        { videoId: "a", title: "Om", artists: [{ name: "Karan Aujla" }], duration: 180 },
+        {
+          kind: "video",
+          id: "b",
+          title: "Om Shanti Om full movie Karan Aujla reaction",
+          subtitle: "Some Channel • 3:05",
+          duration: 185,
+        },
+        "video",
+      ),
+    ).toBe(false);
+  });
+});
