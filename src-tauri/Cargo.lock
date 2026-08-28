@@ -7191,6 +7191,7 @@ dependencies = [
  "discord-rich-presence",
  "image",
  "keyring",
+ "libc",
  "md5",
  "mdns-sd",
  "objc2",

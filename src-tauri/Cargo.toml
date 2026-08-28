@@ -86,6 +86,9 @@ md5 = "0.7"
 mdns-sd = "0.20"
 # NB: the package is `rust_cast` with an underscore, not a hyphen.
 rust_cast = "0.21"
+# stderr redirection for the always-on app log (see applog.rs): pipe/dup2
+# and localtime_r. Already in the tree transitively.
+libc = "0.2"
 # Not used directly for TLS — declared only so we can name a crypto provider
 # at startup. rustls arrives transitively with BOTH `ring` and `aws-lc-rs`
 # enabled (feature unification across reqwest and rust_cast), and in that state
