@@ -194,23 +194,25 @@ struct Resolved {
 
 /// Direct-URL resolution via `yt-dlp -j -f <format>`.
 ///
-/// Authenticated first, then one anonymous retry when YouTube answers the
-/// signed-in identity with NO formats. That is what "Requested format is
-/// not available" means here: the selector ends in bare `bestaudio`, which
-/// matches anything with audio, so it only fails when the extraction came
-/// back with storyboards alone. Measured 2026-08-28 15:06-15:13: two public,
-/// unrestricted videos returned nothing to the authenticated session for
-/// seven minutes and 27 formats each ten minutes later. The old warning that
-/// authenticated yt-dlp gets stripped to storyboards was not stale after
-/// all, just intermittent. Anonymous is what shipped before 0.4.2 (130k,
-/// no Premium tracks) - a downgrade, not a failure - so it is the right
-/// floor to fall to for one track rather than a 502.
+/// Authenticated first, then one anonymous retry when the signed-in
+/// extraction comes back with NO formats. That is what "Requested format
+/// is not available" means here: the selector ends in bare `bestaudio`,
+/// which matches anything with audio, so it only fails when yt-dlp dropped
+/// every format. The one cause seen so far (2026-08-28) was a missing JS
+/// runtime, since handled by `ytdlp::js_runtime_args`: unsolved player
+/// challenges drop every ciphered format, the signed-in clients are all
+/// ciphered, and the anonymous ios client hands out plain URLs, which is
+/// why the retry always worked and hid the problem for a day. It first
+/// read as YouTube intermittently stripping the session; it was the launch
+/// environment. The retry stays as the floor for the next cause: anonymous
+/// is what shipped before 0.4.2 (130k, no Premium tracks), a downgrade
+/// rather than a 502, and the reason now goes into the log with it.
 async fn resolve(ctx: &ResolveCtx) -> Result<Resolved, String> {
     match resolve_with(ctx, ctx.cookies.as_deref()).await {
         Ok(r) => Ok(r),
         Err(e) if ctx.cookies.is_some() && e.contains("Requested format is not available") => {
             eprintln!(
-                "[proxy] {}: authenticated extraction returned no formats; retrying anonymously",
+                "[proxy] {}: signed-in extraction returned no formats; retrying anonymously ({e})",
                 ctx.video_id
             );
             resolve_with(ctx, None).await
@@ -222,13 +224,11 @@ async fn resolve(ctx: &ResolveCtx) -> Result<Resolved, String> {
 async fn resolve_with(ctx: &ResolveCtx, cookies: Option<&Path>) -> Result<Resolved, String> {
     let url = format!("https://www.youtube.com/watch?v={}", ctx.video_id);
     let mut cmd = tokio::process::Command::new(&ctx.ytdlp_program);
-    cmd.args([
-        "-j",
-        "-f",
-        &ctx.format,
-        "--no-playlist",
-        "--no-warnings",
-    ]);
+    // No --no-warnings here: stderr is captured, not inherited, so on
+    // success the warnings go nowhere, and on failure the first one is
+    // usually the reason (see the error path below).
+    cmd.args(["-j", "-f", &ctx.format, "--no-playlist"]);
+    cmd.args(crate::ytdlp::js_runtime_args());
     if let Some(path) = cookies {
         cmd.arg("--cookies").arg(path);
     }
@@ -248,11 +248,18 @@ async fn resolve_with(ctx: &ResolveCtx, cookies: Option<&Path>) -> Result<Resolv
         .map_err(|e| format!("spawn yt-dlp: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!(
-            "yt-dlp -j exit {}: {}",
-            out.status,
-            stderr.chars().take(300).collect::<String>()
-        ));
+        // The ERROR line is the verdict and the first WARNING is usually
+        // the reason ("n challenge solving failed"); keep those two and
+        // drop the rest rather than the first 300 bytes of whatever came.
+        let mut kept: Vec<String> = ["WARNING:", "ERROR:"]
+            .iter()
+            .filter_map(|prefix| stderr.lines().find(|l| l.starts_with(prefix)))
+            .map(|l| l.chars().take(200).collect())
+            .collect();
+        if kept.is_empty() {
+            kept.push(stderr.chars().take(300).collect());
+        }
+        return Err(format!("yt-dlp -j exit {}: {}", out.status, kept.join(" | ")));
     }
     let json: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(|e| format!("yt-dlp -j parse: {e}"))?;

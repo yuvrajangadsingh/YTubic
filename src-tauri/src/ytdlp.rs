@@ -113,6 +113,77 @@ pub fn program(managed: &Path) -> PathBuf {
     }
 }
 
+/// `--js-runtimes` arguments handing yt-dlp a JavaScript runtime.
+///
+/// YouTube's player challenges (the `n` transform and the signature
+/// cipher) are solved by running the player's own JS, and yt-dlp does
+/// that through an external runtime, deno by default, found on PATH. The
+/// app does not have a PATH worth speaking of: a Dock launch gets
+/// launchd's `/usr/bin:/bin:/usr/sbin:/sbin`, so no Homebrew, no nvm,
+/// nothing the user installed. Without a runtime the signed-in clients
+/// (web_creator, tv) lose every format ("n challenge solving failed ...
+/// Only images are available") and each resolve falls to the anonymous
+/// retry, whose ios client hands out plain URLs but caps audio at 130k.
+/// So the Premium bitrate only ever worked from a terminal launch.
+/// Measured 2026-08-28: 11 of ~20 signed-in resolves in 30 minutes failed
+/// this way from a launchd-launched build; the same tracks resolved with
+/// all six audio formats, 774 included, once given a deno path.
+///
+/// deno is the only runtime yt-dlp tests against and the only one that
+/// solved the challenge here (node 20 pointed at explicitly still failed),
+/// so it is the only one looked for. Resolved once per process: runtimes
+/// get installed by hand, not mid-session.
+pub fn js_runtime_args() -> &'static [String] {
+    static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ARGS.get_or_init(|| match find_deno() {
+        Some(deno) => {
+            eprintln!("[ytdlp] JS runtime: deno at {}", deno.display());
+            vec!["--js-runtimes".into(), format!("deno:{}", deno.display())]
+        }
+        None => {
+            eprintln!(
+                "[ytdlp] no deno found: signed-in extraction will fail on ciphered \
+                 tracks and fall back to anonymous 130k. Install it (brew install deno)"
+            );
+            Vec::new()
+        }
+    })
+}
+
+/// deno, in the places it actually gets installed. PATH comes last: a
+/// terminal launch has the user's PATH and a Dock launch does not, and
+/// either way an install we did not know about should still win over
+/// nothing.
+fn find_deno() -> Option<PathBuf> {
+    #[cfg(windows)]
+    const DENO: &str = "deno.exe";
+    #[cfg(not(windows))]
+    const DENO: &str = "deno";
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+    {
+        candidates.push(home.join(".deno").join("bin").join(DENO));
+    }
+    #[cfg(not(windows))]
+    candidates.extend(
+        [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/home/linuxbrew/.linuxbrew/bin",
+            "/usr/bin",
+        ]
+        .into_iter()
+        .map(|dir| Path::new(dir).join(DENO)),
+    );
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join(DENO)));
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
 fn emit_state(app: &tauri::AppHandle, phase: &str, message: Option<String>) {
     let _ = app.emit(
         "ytdlp-state",
@@ -130,6 +201,10 @@ pub async fn ensure(app: tauri::AppHandle) {
     // Serialize concurrent calls (StrictMode double-mount, retry spam).
     static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _guard = LOCK.lock().await;
+
+    // Resolve the runtime now so the launch log says which one every
+    // later spawn will use, instead of leaving it to the first track.
+    let _ = js_runtime_args();
 
     let managed = managed_path(&app);
 

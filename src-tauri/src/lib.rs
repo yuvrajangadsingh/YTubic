@@ -2356,6 +2356,7 @@ fn resolve_stream_ytdlp(app: tauri::AppHandle, video_id: String) -> Result<Strin
         "--no-playlist",
         "--no-warnings",
     ]);
+    command.args(ytdlp::js_runtime_args());
     if let Some(path) = cookies.as_ref() {
         command.arg("--cookies").arg(path);
     }
@@ -2403,8 +2404,9 @@ fn resolve_hls_stream(app: tauri::AppHandle, video_id: String) -> Result<String,
         "--no-warnings",
         "--extractor-args",
         "youtube:player_client=ios",
-        &url,
     ]);
+    command.args(ytdlp::js_runtime_args());
+    command.arg(&url);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -3332,6 +3334,7 @@ fn spawn_downloader(
             "-o",
             "-",
         ]);
+        cmd.args(ytdlp::js_runtime_args());
         // Authenticated download: Premium-only tracks are refused without
         // this, and everything else is capped at 130k. Absent (signed
         // out) it spawns anonymously exactly as before.
