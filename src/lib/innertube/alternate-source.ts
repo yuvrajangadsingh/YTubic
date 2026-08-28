@@ -129,15 +129,39 @@ export function alternateCandidateOk(
       normalizeKeepingQualifiers(item.title ?? "") ===
       normalizeKeepingQualifiers(track.title);
   }
-  if (!titleExact && tokenOverlap(reqTitle, hitTitle) < 0.6) return false;
+  // Symmetric overlap alone punishes the dominant real-world shape: the
+  // official upload titled "Song X (Official Video) | Artist | Album |
+  // 2024". One shared token against ten of packaging scores ~0.1 and a
+  // genuine video is rejected ("Zaalma" scored 0.08 against its own
+  // video). The song's title appearing whole inside the upload's title
+  // is equally strong evidence, so accept phrase containment too —
+  // length-guarded so a two-letter title can't match everything, and
+  // with the duration window below still doing the real gatekeeping.
+  const titleContained =
+    reqTitle.length >= 5 && ` ${hitTitle} `.includes(` ${reqTitle} `);
+  if (!titleExact && !titleContained && tokenOverlap(reqTitle, hitTitle) < 0.6)
+    return false;
 
-  // The artist has to be named on BOTH sides and has to overlap. Treating an
-  // unnamed artist as "nothing to disagree with" is what let a title
-  // collision through — silence is not agreement.
+  // The artist has to be named on BOTH sides. Treating an unnamed artist
+  // as "nothing to disagree with" is what let a title collision through —
+  // silence is not agreement.
   const reqArtists = normalizeForMatch(artistSignal(track));
+  if (!reqArtists) return false;
   const hitArtists = normalizeForMatch(artistSignal(item));
-  if (!reqArtists || !hitArtists) return false;
-  if (tokenOverlap(reqArtists, hitArtists) === 0) return false;
+  const bylineAgrees =
+    !!hitArtists && tokenOverlap(reqArtists, hitArtists) > 0;
+  // Label and fan channels put the artist in the TITLE, not the byline:
+  // the byline is the uploading channel ("Troll Punjabi"), which never
+  // overlaps the artist and used to fail every such upload. When the
+  // byline disagrees or is missing, accept the artist named whole inside
+  // the video's title instead — per artist, so one credited name is
+  // enough ("Pukhraj Bhalla" inside "Zaalma (Full Song) | Pukhraj
+  // Bhalla ft JT Bhatti…").
+  const namedInTitle = (track.artists ?? [])
+    .map((a) => normalizeForMatch(a.name))
+    .concat(reqArtists)
+    .some((name) => name.length >= 3 && ` ${hitTitle} `.includes(` ${name} `));
+  if (!bylineAgrees && !namedInTitle) return false;
 
   // Duration window: a music video runs a little longer than the album
   // audio (intro/outro), the song side a little shorter. Never accept a
