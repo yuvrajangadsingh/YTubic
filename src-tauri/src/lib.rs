@@ -26,6 +26,7 @@ use tower_http::services::ServeFile;
 
 mod now_playing;
 mod app_nap;
+mod applog;
 mod appid;
 mod cast;
 mod discord;
@@ -4091,6 +4092,10 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            // First thing, before anything can eprintln: from here on
+            // stderr lands in ~/Library/Logs/YTubic/ytubic.log with
+            // timestamps, however the app was launched.
+            applog::init(app.handle());
             let port = port_handle.clone();
             let token = token_handle.clone();
             let router = router_handle.clone();
