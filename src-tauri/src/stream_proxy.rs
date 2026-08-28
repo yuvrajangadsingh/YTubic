@@ -193,7 +193,33 @@ struct Resolved {
 }
 
 /// Direct-URL resolution via `yt-dlp -j -f <format>`.
+///
+/// Authenticated first, then one anonymous retry when YouTube answers the
+/// signed-in identity with NO formats. That is what "Requested format is
+/// not available" means here: the selector ends in bare `bestaudio`, which
+/// matches anything with audio, so it only fails when the extraction came
+/// back with storyboards alone. Measured 2026-08-28 15:06-15:13: two public,
+/// unrestricted videos returned nothing to the authenticated session for
+/// seven minutes and 27 formats each ten minutes later. The old warning that
+/// authenticated yt-dlp gets stripped to storyboards was not stale after
+/// all, just intermittent. Anonymous is what shipped before 0.4.2 (130k,
+/// no Premium tracks) - a downgrade, not a failure - so it is the right
+/// floor to fall to for one track rather than a 502.
 async fn resolve(ctx: &ResolveCtx) -> Result<Resolved, String> {
+    match resolve_with(ctx, ctx.cookies.as_deref()).await {
+        Ok(r) => Ok(r),
+        Err(e) if ctx.cookies.is_some() && e.contains("Requested format is not available") => {
+            eprintln!(
+                "[proxy] {}: authenticated extraction returned no formats; retrying anonymously",
+                ctx.video_id
+            );
+            resolve_with(ctx, None).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn resolve_with(ctx: &ResolveCtx, cookies: Option<&Path>) -> Result<Resolved, String> {
     let url = format!("https://www.youtube.com/watch?v={}", ctx.video_id);
     let mut cmd = tokio::process::Command::new(&ctx.ytdlp_program);
     cmd.args([
@@ -203,7 +229,7 @@ async fn resolve(ctx: &ResolveCtx) -> Result<Resolved, String> {
         "--no-playlist",
         "--no-warnings",
     ]);
-    if let Some(path) = ctx.cookies.as_ref() {
+    if let Some(path) = cookies {
         cmd.arg("--cookies").arg(path);
     }
     cmd.arg(&url);
