@@ -1,3 +1,4 @@
+import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import type { Lyrics, TimedLine } from "@/lib/lyrics/types";
 import { parseLRC } from "@/lib/lyrics/parse-lrc";
 import {
@@ -9,9 +10,23 @@ import {
 
 /**
  * LRCLIB (https://lrclib.net) — free, open lyrics database with synced
- * LRC-format lyrics. CORS is wide-open so we use the webview's plain
- * fetch, no Rust HTTP capability needed.
+ * LRC-format lyrics.
+ *
+ * Goes through Tauri's HTTP plugin, like the other two sources. LRCLIB's
+ * CORS is wide open, which is what the old comment here claimed made the
+ * webview's plain `fetch()` enough — but CORS was never the constraint.
+ * Our own CSP is: `connect-src` lists only self and the local stream
+ * server, so every request to lrclib.net was blocked in packaged builds.
+ * Tauri applies that CSP to the bundled app and not to the `pnpm dev`
+ * server, so this source worked in development and had never once worked
+ * for a real user (found 2026-08-31, present since the source was added).
+ *
+ * `https://lrclib.net/*` must therefore stay in the http allow-list in
+ * `src-tauri/capabilities/default.json`. The User-Agent is what LRCLIB's
+ * API docs ask clients to identify themselves with.
  */
+
+const USER_AGENT = "YTubic (https://github.com/yuvrajangadsingh/YTubic)";
 
 type LrclibParams = {
   title: string;
@@ -92,7 +107,11 @@ async function lrclibGet(
   // them instead of caching a transient failure as a permanent "no
   // lyrics" for an hour. A 404 is a genuine miss and correctly resolves
   // to null.
-  const r = await fetch(url.toString(), { signal });
+  const r = await tauriFetch(url.toString(), {
+    method: "GET",
+    headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+    signal,
+  });
   if (r.status === 404) return null;
   if (!r.ok) throw new Error(`LRCLIB /get ${r.status}`);
   return (await r.json()) as LrclibRecord;
@@ -107,7 +126,11 @@ async function lrclibSearch(
   if (p.artist) url.searchParams.set("artist_name", p.artist);
   // As in lrclibGet: propagate transient failures for retry; only an empty
   // result set is a genuine "not found".
-  const r = await fetch(url.toString(), { signal });
+  const r = await tauriFetch(url.toString(), {
+    method: "GET",
+    headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+    signal,
+  });
   if (!r.ok) throw new Error(`LRCLIB /search ${r.status}`);
   const results = (await r.json()) as LrclibRecord[];
   if (!Array.isArray(results) || results.length === 0) return null;
@@ -204,4 +227,3 @@ function mapRecord(r: LrclibRecord, targetDuration?: number): Lyrics | null {
   }
   return null;
 }
-
