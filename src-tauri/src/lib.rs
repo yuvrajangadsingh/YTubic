@@ -162,9 +162,16 @@ mod secure_store {
                 // we look and find nothing. Reading the old item shows
                 // the keychain dialog once more — its ACL names the old
                 // app identity — and never again after the move.
+                //
+                // If the old item EXISTS but cannot be read (the dialog
+                // denied, an ACL failure), minting a fresh key here
+                // would shadow the one the jar is encrypted with — on
+                // 2026-08-31 15:40 exactly that made an intact jar read
+                // as signed-out. Fail this run instead; the next launch
+                // asks again with nothing lost.
                 if let Ok(old) = Entry::new(crate::identity::OLD_ID, KEYRING_USER) {
-                    if let Ok(secret) = old.get_secret() {
-                        if secret.len() == KEYRING_KEY_LEN {
+                    match old.get_secret() {
+                        Ok(secret) if secret.len() == KEYRING_KEY_LEN => {
                             entry.set_secret(&secret).map_err(|error| {
                                 format!("failed to save key in system credential store: {error}")
                             })?;
@@ -173,6 +180,18 @@ mod secure_store {
                             return secret
                                 .try_into()
                                 .map_err(|_| "unreachable: length checked above".to_string());
+                        }
+                        Ok(secret) => {
+                            eprintln!(
+                                "[identity] old cookie key is {} bytes, not {KEYRING_KEY_LEN}; ignoring it",
+                                secret.len()
+                            );
+                        }
+                        Err(Error::NoEntry) => {}
+                        Err(error) => {
+                            return Err(format!(
+                                "cookie key exists under the old identifier but could not be read ({error}); not minting a replacement"
+                            ));
                         }
                     }
                 }

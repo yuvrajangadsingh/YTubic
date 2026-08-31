@@ -48,20 +48,40 @@ pub fn migrate(app: &tauri::AppHandle) -> Vec<String> {
     // macOS keeps more per-identifier state than the derived five: the
     // WKWebView website-data store and network storage, the defaults
     // plist, and the window-restoration state.
+    //
+    // Granularity matters. macOS pre-creates `Library/WebKit/<id>/` and
+    // `Library/Caches/<id>/` for the NEW identifier during process
+    // startup, before this runs — measured 2026-08-31 15:39: both
+    // existed by setup time, so a directory-level pair tripped the
+    // never-overwrite guard and stranded the localStorage (queue,
+    // settings, the refresh keeper's session). The real payload is one
+    // level down (`WebsiteData`), which nothing creates until a webview
+    // stores something, so pair at that level. HTTPStorages is a flat
+    // FILE named `<id>.binarycookies`, not a directory.
     #[cfg(target_os = "macos")]
     if let Ok(home) = paths.home_dir() {
         let id = app.config().identifier.clone();
-        for (dir, suffix) in [
-            ("Library/WebKit", ""),
-            ("Library/HTTPStorages", ""),
-            ("Library/Preferences", ".plist"),
-            ("Library/Saved Application State", ".savedState"),
-        ] {
-            pairs.push((
-                home.join(dir).join(format!("{OLD_ID}{suffix}")),
-                home.join(dir).join(format!("{id}{suffix}")),
-            ));
-        }
+        pairs.push((
+            home.join("Library/WebKit").join(OLD_ID).join("WebsiteData"),
+            home.join("Library/WebKit").join(&id).join("WebsiteData"),
+        ));
+        pairs.push((
+            home.join("Library/HTTPStorages")
+                .join(format!("{OLD_ID}.binarycookies")),
+            home.join("Library/HTTPStorages")
+                .join(format!("{id}.binarycookies")),
+        ));
+        pairs.push((
+            home.join("Library/Preferences")
+                .join(format!("{OLD_ID}.plist")),
+            home.join("Library/Preferences").join(format!("{id}.plist")),
+        ));
+        pairs.push((
+            home.join("Library/Saved Application State")
+                .join(format!("{OLD_ID}.savedState")),
+            home.join("Library/Saved Application State")
+                .join(format!("{id}.savedState")),
+        ));
     }
 
     pairs.sort();
@@ -80,6 +100,11 @@ fn migrate_pairs(pairs: &[(PathBuf, PathBuf)]) -> Vec<String> {
                 "both {old:?} and {new:?} exist; left the old one untouched"
             ));
             continue;
+        }
+        // The WebsiteData pair sits one level inside a directory macOS
+        // may not have created yet on a genuinely fresh machine.
+        if let Some(parent) = new.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
         match std::fs::rename(old, new) {
             Ok(()) => report.push(format!("migrated {old:?} -> {new:?}")),
@@ -127,6 +152,18 @@ mod tests {
         migrate_pairs(&[(old.clone(), new.clone())]);
         assert!(old.exists());
         assert_eq!(std::fs::read_to_string(new.join("marker")).unwrap(), "keep");
+    }
+
+    #[test]
+    fn destination_parent_is_created_when_missing() {
+        let root = scratch("parent");
+        let old = root.join(OLD_ID).join("WebsiteData");
+        let new = root.join("com.example.new").join("WebsiteData");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("marker"), "x").unwrap();
+
+        migrate_pairs(&[(old.clone(), new.clone())]);
+        assert!(new.join("marker").exists());
     }
 
     #[test]
