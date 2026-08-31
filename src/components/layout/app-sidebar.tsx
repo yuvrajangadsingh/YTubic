@@ -71,10 +71,15 @@ import { IS_BETA_PLATFORM } from "@/lib/platform";
 import { openChannelPicker } from "@/lib/store/channel-picker";
 import { openSettings } from "@/lib/store/settings-dialog";
 import { UpdateBanner } from "@/components/layout/update-banner";
-import { fetchAccountInfo } from "@/lib/innertube/account";
 import { fetchLibraryPlaylists } from "@/lib/innertube/library";
 import type { ShelfItem } from "@/lib/innertube/types";
 import { resetInnertube } from "@/lib/innertube/client";
+import {
+  accountSlot,
+  credentialState,
+  liveAccountState,
+} from "@/lib/auth-presence";
+import { accountInfoQuery, authLoggedInQuery } from "@/lib/store/auth-queries";
 import { usePremiumStore } from "@/lib/store/premium";
 import {
   removeAccount,
@@ -221,11 +226,7 @@ function SidebarPlaylists({
 }: {
   isPlaylistOn: (id: string) => boolean;
 }) {
-  const loggedIn = useQuery({
-    queryKey: ["auth-logged-in"],
-    queryFn: () => invoke<boolean>("is_logged_in"),
-    staleTime: 30_000,
-  });
+  const loggedIn = useQuery(authLoggedInQuery);
   const library = useQuery({
     queryKey: ["library", "playlists"],
     queryFn: fetchLibraryPlaylists,
@@ -456,44 +457,32 @@ function UserProfile() {
   // Sign out drops the session cookies and empties library state - it
   // fired straight off a menu row one slot below "Manage subscription",
   // so a slipped click logged the user out. Gate it behind a dialog.
-  // MUST be declared before the isLoading early-returns below: a hook
-  // after a conditional return crashes the whole tree on the second
-  // render ("rendered more hooks than during the previous render").
+  // MUST be declared before the early returns below: a hook after a
+  // conditional return crashes the whole tree on the second render
+  // ("rendered more hooks than during the previous render").
   const [confirmSignOut, setConfirmSignOut] = useState(false);
-  const loggedIn = useQuery({
-    queryKey: ["auth-logged-in"],
-    queryFn: () => invoke<boolean>("is_logged_in"),
-    staleTime: 30_000,
-  });
-  const account = useQuery({
-    queryKey: ["account-info"],
-    queryFn: () => fetchAccountInfo(),
-    enabled: !!loggedIn.data,
-    staleTime: 5 * 60_000,
-    retry: false,
-  });
+  const loggedIn = useQuery(authLoggedInQuery);
+  const credentials = credentialState(loggedIn.data, loggedIn.isError);
+  const account = useQuery(accountInfoQuery(credentials === "authenticated"));
   const accounts = useAccounts();
   const premiumStatus = usePremiumStore((s) => s.status);
 
   const allAccounts = accounts.data ?? [];
   const activeAccount = allAccounts.find((a) => a.isActive) ?? allAccounts[0];
 
-  // Auth check still resolving: render nothing to avoid a flash.
-  if (loggedIn.isLoading) return null;
-
-  // No live profile: signed out, or `is_logged_in` reports a session (a
-  // SAPISID cookie exists) whose `/account_menu` never loads (expired
-  // session). With one stored account or none, the primary sign-in
-  // button is the way back in; a re-login merges into the existing row
-  // via identity dedup, so no duplicate appears. With several stored
-  // accounts, collapsing to a sign-in button would strand the user away
-  // from the healthy ones (no way to switch or to sign the broken one
-  // out), so keep the menu and render it from the stored meta instead.
-  if (!account.data) {
-    // Give a genuine first paint a moment before falling back.
-    if (loggedIn.data === true && account.isLoading) return null;
-    if (allAccounts.length < 2) return <SidebarSignInButton />;
-  }
+  // Which of the three footer states we're in, and why, lives in
+  // auth-presence.ts. The rule that matters here: a Sign in button only
+  // ever appears on an authoritative answer, so a keychain miss or a
+  // dead NIC keeps the account row up instead of telling the user they
+  // signed out.
+  const slot = accountSlot({
+    credentials,
+    liveAccount: liveAccountState(account.data, account.isError),
+    accountsPending: accounts.isPending,
+    storedCount: allAccounts.length,
+  });
+  if (slot === "wait") return null;
+  if (slot === "sign-in") return <SidebarSignInButton />;
 
   const live = account.data;
   const name =
@@ -502,7 +491,10 @@ function UserProfile() {
     activeAccount?.name ||
     activeAccount?.email ||
     "Account";
-  const email = live?.email ?? activeAccount?.email ?? "";
+  // `||`, not `??`: an authenticated menu whose labels we couldn't parse
+  // now comes back with empty strings rather than as a null "signed
+  // out", and an empty string must still fall through to the stored row.
+  const email = live?.email || activeAccount?.email || "";
   const photoUrl =
     live?.photoUrl ??
     activeAccount?.channelPhotoUrl ??

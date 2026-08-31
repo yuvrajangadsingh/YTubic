@@ -1,7 +1,6 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import {
   AlertCircleIcon,
   ChevronRightIcon,
@@ -32,6 +31,7 @@ import { Thumbnail } from "@/components/shared/thumbnail";
 import { TrackContextMenu } from "@/components/shared/track-context-menu";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Input } from "@/components/ui/input";
+import { authLoggedInQuery } from "@/lib/store/auth-queries";
 import { useSearchHistory } from "@/lib/store/search-history";
 import { usePlaybackStore } from "@/lib/store/playback";
 import { openSettings } from "@/lib/store/settings-dialog";
@@ -679,11 +679,7 @@ type LibrarySearchState = {
  * share one query/computation.
  */
 function useLibrarySearch(query: string, enabled: boolean): LibrarySearchState {
-  const loggedIn = useQuery({
-    queryKey: ["auth-logged-in"],
-    queryFn: () => invoke<boolean>("is_logged_in"),
-    staleTime: 30_000,
-  });
+  const loggedIn = useQuery(authLoggedInQuery);
 
   const lib = useQuery({
     queryKey: ["library", "liked-songs-all"],

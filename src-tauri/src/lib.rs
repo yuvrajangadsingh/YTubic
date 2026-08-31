@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,12 +27,14 @@ use tower_http::services::ServeFile;
 mod now_playing;
 mod app_nap;
 mod applog;
+mod authfs;
 mod identity;
 mod appid;
 mod cast;
 mod discord;
 mod lastfm;
 mod media;
+mod session;
 mod stream_proxy;
 mod ytdlp;
 
@@ -408,6 +410,31 @@ fn account_webview_dir(app: &tauri::AppHandle, id: &str) -> PathBuf {
     accounts_dir(app).join(id).join("webview")
 }
 
+/// Wall-clock second of the last refresh that actually committed a jar for
+/// this account, as decimal text.
+///
+/// This is scheduling state, not a log line: the refresh deadline is derived
+/// from it and nothing else, so it has to survive a restart. It lives beside
+/// the jar rather than inside it because `dedup_accounts_by_identity` ranks
+/// accounts by `cookies.enc`'s mtime, and stamping a timestamp into the jar
+/// itself would make a metadata rewrite look like fresher cookies.
+fn last_refresh_path(app: &tauri::AppHandle, id: &str) -> PathBuf {
+    accounts_dir(app).join(id).join("last-refresh")
+}
+
+async fn read_last_refresh(app: &tauri::AppHandle, id: &str) -> Option<i64> {
+    tokio::fs::read_to_string(last_refresh_path(app, id))
+        .await
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+async fn write_last_refresh(app: &tauri::AppHandle, id: &str, at: i64) -> Result<(), String> {
+    authfs::write_atomic(last_refresh_path(app, id), at.to_string().into_bytes(), 0o600).await
+}
+
 /// Browser UA the login and refresh WebViews both present to Google. Kept
 /// identical so the session Google issues to the login window is the
 /// same one the refresh window later renews. The claimed browser must match
@@ -448,33 +475,164 @@ fn legacy_cookies_enc_path(app: &tauri::AppHandle) -> PathBuf {
         .join("cookies.enc")
 }
 
-async fn read_index(app: &tauri::AppHandle) -> AccountsIndex {
+/// Why `accounts.json` did not produce an index. "Not there" and "there but
+/// unreadable" used to collapse into the same empty default, which reads as
+/// signed out AND lets the next sign-in commit its single row over the top
+/// of a file that still held every other account.
+///
+/// The two failures are kept apart because only one of them can be repaired.
+/// Bytes that are not an index will never become one; a read that failed
+/// says nothing at all about the content and must not be acted on.
+enum IndexRead {
+    /// No file yet: a genuinely signed-out install.
+    Absent,
+    Loaded(AccountsIndex),
+    /// Present, readable, and not an index. Rebuildable — see
+    /// [`rebuild_index_from_disk`].
+    Corrupt(String),
+    /// Could not be read at all right now (IO, permissions). Never signed
+    /// out, and never a reason to rewrite the file.
+    Unavailable(String),
+}
+
+async fn read_index_checked(app: &tauri::AppHandle) -> IndexRead {
     let path = accounts_index_path(app);
-    let Ok(bytes) = tokio::fs::read(&path).await else {
-        return AccountsIndex::default();
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return IndexRead::Absent,
+        Err(e) => return IndexRead::Unavailable(format!("read accounts.json: {e}")),
     };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    match serde_json::from_slice(&bytes) {
+        Ok(idx) => IndexRead::Loaded(idx),
+        Err(e) => IndexRead::Corrupt(format!("parse accounts.json ({} bytes): {e}", bytes.len())),
+    }
+}
+
+/// Read-only view for callers that only need the account list. An
+/// unreadable index degrades to empty here, which is what every read path
+/// already did — the auth answer goes through [`auth_state`] instead, so a
+/// corrupt file cannot claim the user is signed out.
+async fn read_index(app: &tauri::AppHandle) -> AccountsIndex {
+    match read_index_checked(app).await {
+        IndexRead::Loaded(idx) => idx,
+        IndexRead::Absent => AccountsIndex::default(),
+        IndexRead::Corrupt(e) | IndexRead::Unavailable(e) => {
+            eprintln!("[accounts] {e}");
+            AccountsIndex::default()
+        }
+    }
+}
+
+/// Rebuild `accounts.json` from the account directories on disk.
+///
+/// Only ever reached for a file that is PRESENT, readable, and not an index
+/// — a torn write from before the atomic-write fix, or a truncated restore.
+/// Refusing to touch it (the right answer for a transient IO error) is a
+/// trap here: every mutation reads through [`read_index_for_update`], sign-in
+/// included, so the user would be left with a Sign in button that silently
+/// deletes its own result and no way back inside the app.
+///
+/// The rows come from `accounts/<id>/cookies.enc`, so the other accounts'
+/// sessions survive; only their meta is lost, and the frontend backfills the
+/// active one on its next `/account_menu`. Active is the account with the
+/// newest refresh stamp, because the loop only ever refreshes the active one.
+/// The unparseable bytes are set aside, never deleted.
+async fn rebuild_index_from_disk(app: &tauri::AppHandle) -> Result<AccountsIndex, String> {
+    let path = accounts_index_path(app);
+    let quarantine = path.with_extension(format!("json.unreadable-{}", now_ts()));
+    tokio::fs::rename(&path, &quarantine)
+        .await
+        .map_err(|e| format!("set the unreadable accounts.json aside: {e}"))?;
+
+    let mut rows: Vec<(Account, Option<i64>)> = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(accounts_dir(app)).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Some(id) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let jar = account_cookies_path(app, &id);
+            let Ok(meta) = tokio::fs::metadata(&jar).await else {
+                continue; // a webview profile with no jar is not an account
+            };
+            let added_at = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or_else(now_ts, |d| d.as_secs() as i64);
+            let last = read_last_refresh(app, &id).await;
+            rows.push((
+                Account {
+                    id,
+                    added_at,
+                    ..Default::default()
+                },
+                last,
+            ));
+        }
+    }
+    // Oldest first: `added_at` is what dedup ranks by, and pinned-playlist
+    // buckets are keyed to the id it keeps.
+    rows.sort_by_key(|(a, _)| a.added_at);
+    let active = rows
+        .iter()
+        .filter(|(_, last)| last.is_some())
+        .max_by_key(|(_, last)| last.unwrap_or(0))
+        .or_else(|| rows.first())
+        .map(|(a, _)| a.id.clone());
+    let idx = AccountsIndex {
+        active,
+        accounts: rows.into_iter().map(|(a, _)| a).collect(),
+    };
+    write_index(app, &idx).await?;
+    eprintln!(
+        "[accounts] accounts.json was not readable as an index; rebuilt {} row(s) from disk \
+         (the previous file is at {})",
+        idx.accounts.len(),
+        quarantine.display()
+    );
+    Ok(idx)
+}
+
+/// Read for a read-modify-write. Callers hold the index lock across this and
+/// the matching `write_index`.
+async fn read_index_for_update(app: &tauri::AppHandle) -> Result<AccountsIndex, String> {
+    match read_index_checked(app).await {
+        IndexRead::Loaded(idx) => Ok(idx),
+        IndexRead::Absent => Ok(AccountsIndex::default()),
+        IndexRead::Corrupt(e) => {
+            eprintln!("[accounts] {e}");
+            rebuild_index_from_disk(app).await
+        }
+        // Overwriting on this would delete every account row over a
+        // transient IO error, which is the failure the split exists for.
+        IndexRead::Unavailable(e) => Err(format!("{e}; refusing to overwrite it")),
+    }
+}
+
+/// Every account id with state on disk: the rows in the index plus any
+/// `accounts/<id>/` directory, so an unreadable index still names everything
+/// a wipe has to lock.
+async fn account_ids_on_disk(app: &tauri::AppHandle) -> Vec<String> {
+    let mut ids: Vec<String> = match read_index_checked(app).await {
+        IndexRead::Loaded(idx) => idx.accounts.into_iter().map(|a| a.id).collect(),
+        _ => Vec::new(),
+    };
+    if let Ok(mut entries) = tokio::fs::read_dir(accounts_dir(app)).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Some(name) = entry.file_name().to_str() {
+                if !ids.iter().any(|i| i == name) {
+                    ids.push(name.to_string());
+                }
+            }
+        }
+    }
+    ids
 }
 
 async fn write_index(app: &tauri::AppHandle, idx: &AccountsIndex) -> Result<(), String> {
     let path = accounts_index_path(app);
-    if let Some(dir) = path.parent() {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .map_err(|e| format!("mkdir accounts dir: {e}"))?;
-    }
     let bytes = serde_json::to_vec_pretty(idx).map_err(|e| format!("serialize: {e}"))?;
-    tokio::fs::write(&path, bytes)
-        .await
-        .map_err(|e| format!("write index: {e}"))
-}
-
-/// Resolve the cookie jar path for the active account, or `None` when
-/// nobody is signed in.
-async fn active_cookies_path(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let idx = read_index(app).await;
-    let id = idx.active?;
-    Some(account_cookies_path(app, &id))
+    authfs::write_atomic(path, bytes, 0o600).await
 }
 
 /// One-time migration: if a plaintext `cookies.txt` from a previous
@@ -491,7 +649,10 @@ async fn migrate_plaintext_cookies(app: &tauri::AppHandle) {
     };
     match secure_store::encrypt(&plain) {
         Ok(enc) => {
-            if let Err(e) = tokio::fs::write(&enc_path, enc).await {
+            // Atomic like every other jar write: the plaintext original is
+            // deleted right after, so a torn write here would be the one
+            // that has nothing to fall back to.
+            if let Err(e) = authfs::write_atomic(enc_path.clone(), enc, 0o600).await {
                 eprintln!("[auth] migration write failed: {e}");
                 return;
             }
@@ -529,20 +690,33 @@ async fn migrate_to_accounts_layout(app: &tauri::AppHandle) {
         eprintln!("[auth] migrate accounts: rename failed: {e}");
         return;
     }
-    let now_s = time::OffsetDateTime::now_utc().unix_timestamp();
     let idx = AccountsIndex {
         active: Some(new_id.clone()),
         accounts: vec![Account {
             id: new_id.clone(),
-            added_at: now_s,
+            added_at: now_ts(),
             ..Default::default()
         }],
     };
+    let locks = app.state::<authfs::MutationLocks>();
+    let _index = locks.inner().index().await;
     if let Err(e) = write_index(app, &idx).await {
         eprintln!("[auth] migrate accounts: write index failed: {e}");
         return;
     }
     eprintln!("[auth] migrated single cookies.enc into accounts/{new_id}/");
+}
+
+/// Wall-clock seconds. The refresh deadline and every cookie expiry are
+/// wall time on purpose: a monotonic clock does not advance while the
+/// machine sleeps, and Google's leash on an extracted cookie does.
+fn now_ts() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+/// Wall-clock nanoseconds, used only as a jitter seed.
+fn jitter_seed() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64
 }
 
 fn generate_account_id() -> String {
@@ -552,17 +726,69 @@ fn generate_account_id() -> String {
     format!("acct-{:x}", nanos)
 }
 
-/// Read the encrypted cookie jar for the active account and decrypt
-/// it in memory. Returns `None` when nobody is signed in or
-/// decryption fails (treat as logged-out).
+/// Why an account's jar did not decrypt. Collapsing these into `None` is
+/// how a dark wake used to report a signed-in user as signed out: on macOS
+/// the jar's AES key lives in the login keychain, and reading it needs a UI
+/// session, so decrypt fails while the session itself is perfectly fine.
+enum JarRead {
+    /// No jar on disk for this account.
+    Absent,
+    Loaded(String),
+    /// The jar exists but we could not read it right now. Never signed out.
+    Unavailable(String),
+}
+
+/// The one question every part of the auth path asks: can this jar
+/// authenticate an InnerTube request? Going through a single helper is the
+/// point — the capture gate, the commit's continuity check, `is_logged_in`
+/// and the yt-dlp export all used to test different things, so a jar could
+/// be captured, committed, and then reported as signed out.
+fn jar_credentials(jar: &str) -> session::Credentials {
+    session::inspect_jar(jar, "music.youtube.com", session::INNERTUBE_PATH, now_ts())
+}
+
+async fn read_jar(app: &tauri::AppHandle, id: &str) -> JarRead {
+    let path = account_cookies_path(app, id);
+    let encrypted = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return JarRead::Absent,
+        Err(e) => return JarRead::Unavailable(format!("read cookie jar: {e}")),
+    };
+    let plain = match tokio::task::spawn_blocking(move || secure_store::decrypt(&encrypted)).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return JarRead::Unavailable(format!("decrypt cookie jar: {e}")),
+        Err(e) => return JarRead::Unavailable(format!("decrypt task: {e}")),
+    };
+    match String::from_utf8(plain) {
+        Ok(s) => JarRead::Loaded(s),
+        Err(_) => JarRead::Unavailable("cookie jar is not valid UTF-8".into()),
+    }
+}
+
+async fn read_active_jar(app: &tauri::AppHandle) -> JarRead {
+    match read_index_checked(app).await {
+        IndexRead::Corrupt(e) | IndexRead::Unavailable(e) => JarRead::Unavailable(e),
+        IndexRead::Absent => JarRead::Absent,
+        IndexRead::Loaded(idx) => match idx.active {
+            None => JarRead::Absent,
+            Some(id) => read_jar(app, &id).await,
+        },
+    }
+}
+
+/// Decrypted jar for the active account, or `None` when there is nothing to
+/// read. Kept for the callers that genuinely have no better answer than
+/// "carry on anonymously"; anything that decides what the UI shows must use
+/// [`read_active_jar`] so an unavailable jar stays distinguishable.
 async fn read_cookies_plain(app: &tauri::AppHandle) -> Option<String> {
-    let path = active_cookies_path(app).await?;
-    let encrypted = tokio::fs::read(&path).await.ok()?;
-    let plain = tokio::task::spawn_blocking(move || secure_store::decrypt(&encrypted))
-        .await
-        .ok()?
-        .ok()?;
-    String::from_utf8(plain).ok()
+    match read_active_jar(app).await {
+        JarRead::Loaded(jar) => Some(jar),
+        JarRead::Absent => None,
+        JarRead::Unavailable(e) => {
+            eprintln!("[auth] {e}");
+            None
+        }
+    }
 }
 
 /// Write the decrypted cookie jar somewhere yt-dlp can read it, and
@@ -587,26 +813,41 @@ async fn read_cookies_plain(app: &tauri::AppHandle) -> Option<String> {
 /// anonymously" rather than an error — a cookie problem must never be
 /// able to take playback down with it.
 async fn ytdlp_cookie_file(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let jar = read_cookies_plain(app).await?;
-    if !jar.contains("SAPISID") {
-        // A jar without an auth cookie buys nothing and would only add a
+    let id = read_index(app).await.active?;
+    let JarRead::Loaded(jar) = read_jar(app, &id).await else {
+        return None;
+    };
+    // Same exact-name predicate the rest of the app uses. The old test here
+    // was `jar.contains("SAPISID")`, a substring search of a tab-delimited
+    // FILE: it matched a cookie value, matched a google.com-only SAPISID
+    // that music.youtube.com never sees, and missed a jar holding only
+    // __Secure-3PAPISID — which the frontend signs with happily.
+    //
+    // `signable` and not the full set: yt-dlp builds its SAPISIDHASH from
+    // the same signing cookies we do and never looks at LOGIN_INFO, so
+    // withholding the file over a missing marker would cost Premium tracks
+    // and drop every other track from 258k/271k to 130k for nothing.
+    if !jar_credentials(&jar).signable() {
+        // A jar with no signing cookie buys nothing and would only add a
         // failure mode.
         return None;
     }
-    let dir = app
-        .path()
-        .app_data_dir()
-        .ok()?
-        .join("ytdlp-cookies");
-    tokio::fs::create_dir_all(&dir).await.ok()?;
+    let dir = app.path().app_data_dir().ok()?.join("ytdlp-cookies");
     let path = dir.join("cookies.txt");
     // yt-dlp rewrites this file when YouTube rotates a cookie mid-run, so
     // it has to be our own copy and never the real jar.
-    tokio::fs::write(&path, jar.as_bytes()).await.ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await;
+    //
+    // 0600 from creation, not a chmod afterwards: this is the decrypted
+    // session, and the old order left it world-readable for the length of
+    // the write. FOLLOW-UP (not in this change): all three callers share
+    // this one path, so two concurrent tracks still overwrite each other's
+    // copy — harmless today because they write the same jar, and yt-dlp's
+    // own mid-run rewrites are already discarded rather than merged back.
+    let locks = app.state::<authfs::MutationLocks>();
+    let _guard = locks.inner().account(&id).await;
+    if let Err(e) = authfs::write_atomic(path.clone(), jar.into_bytes(), 0o600).await {
+        eprintln!("[auth] yt-dlp cookie export: {e}");
+        return None;
     }
     Some(path)
 }
@@ -728,6 +969,16 @@ fn merge_set_cookies_into_jar(
         if !allowed {
             continue;
         }
+        // RFC 6265 §5.3.5: a response may only set a cookie on its own host
+        // or on a domain that host sits under. The allowlist above is not
+        // that check — it accepts any google/youtube domain from any
+        // google/youtube host, so a music.youtube.com response could plant a
+        // cookie on accounts.google.com and we would then replay it to
+        // Google as though Google had issued it.
+        let host_bare = host.trim_start_matches('.').to_ascii_lowercase();
+        if host_bare != bare && !host_bare.ends_with(&format!(".{bare}")) {
+            continue;
+        }
 
         // Max-Age wins over Expires (RFC 6265 §4.1.2.2); either in the
         // past is a deletion.
@@ -741,6 +992,12 @@ fn merge_set_cookies_into_jar(
             (false, 0) // session cookie
         };
 
+        // Stored cookies are keyed by name + domain here, not name + domain
+        // + path as RFC 6265 §5.3 has it. Every Google auth cookie is issued
+        // at the site root, so the two agree in practice — and where they
+        // would not, the session predicate path-matches properly anyway
+        // (see session::JarCookie::matches_path), so a path-scoped
+        // look-alike can never stand in for a credential.
         let pos = entries
             .iter()
             .position(|e| e.name == c.name() && e.domain.trim_start_matches('.') == bare);
@@ -837,7 +1094,15 @@ fn meta_identity(email: &str, photo_url: Option<&str>) -> Option<String> {
 /// Does not emit `accounts-changed`: callers either run it before the
 /// UI reads the list (startup) or emit the event themselves.
 async fn dedup_accounts_by_identity(app: &tauri::AppHandle) {
-    let mut idx = read_index(app).await;
+    let locks = app.state::<authfs::MutationLocks>();
+    let _index = locks.inner().index().await;
+    let mut idx = match read_index_for_update(app).await {
+        Ok(idx) => idx,
+        Err(e) => {
+            eprintln!("[accounts] dedup: {e}");
+            return;
+        }
+    };
     if idx.accounts.len() < 2 {
         return;
     }
@@ -915,9 +1180,21 @@ async fn dedup_accounts_by_identity(app: &tauri::AppHandle) {
     for (from_id, keeper_id) in &fresh_copies {
         let from_path = account_cookies_path(app, from_id);
         let keep_path = account_cookies_path(app, keeper_id);
-        if let Ok(bytes) = tokio::fs::read(&from_path).await {
-            let _ = tokio::fs::write(&keep_path, bytes).await;
+        let Ok(bytes) = tokio::fs::read(&from_path).await else {
+            eprintln!("[accounts] dedup: could not read {from_id}'s jar; keeping {keeper_id}'s");
+            continue;
+        };
+        // Lock order: the index lock is already held, and an account lock is
+        // taken under it. Never the reverse (see authfs::MutationLocks).
+        let _jar = locks.inner().account(keeper_id).await;
+        if let Err(e) = authfs::write_atomic(keep_path, bytes, 0o600).await {
+            eprintln!("[accounts] dedup: copy jar {from_id} -> {keeper_id}: {e}");
         }
+        // The refresh stamp deliberately does NOT move with the jar: an
+        // account that just absorbed someone else's snapshot should renew it
+        // once, promptly, rather than trust a deadline set for the row that
+        // is about to be deleted.
+        let _ = tokio::fs::remove_file(last_refresh_path(app, keeper_id)).await;
     }
 
     if let Some(active) = idx.active.clone() {
@@ -938,6 +1215,9 @@ async fn dedup_accounts_by_identity(app: &tauri::AppHandle) {
         return;
     }
     for rid in remap.keys() {
+        // Same reason as the other deletion paths: a refresh committing
+        // under this lock re-creates whatever directory it writes into.
+        let _jar = locks.inner().account(rid).await;
         let _ = tokio::fs::remove_dir_all(accounts_dir(app).join(rid)).await;
     }
     eprintln!("[accounts] collapsed {removed} duplicate account row(s) by identity");
@@ -964,6 +1244,17 @@ async fn cleanup_login_artifacts(app: &tauri::AppHandle) {
         }
     }
     let _ = tokio::fs::remove_file(cache.join(".cookies")).await;
+
+    // Temp files from a run that died mid-write (see authfs). Inert — a
+    // temp is nothing's destination — this just stops them accumulating.
+    if let Some(root) = accounts_index_path(app).parent() {
+        authfs::sweep_stale_temps(root).await;
+    }
+    if let Ok(mut accounts) = tokio::fs::read_dir(accounts_dir(app)).await {
+        while let Ok(Some(entry)) = accounts.next_entry().await {
+            authfs::sweep_stale_temps(&entry.path()).await;
+        }
+    }
 }
 
 /// Open an in-app Google sign-in window in an isolated WebView profile
@@ -1026,17 +1317,11 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
         .min_inner_size(420.0, 560.0)
         .center()
         .data_directory(webview_data.clone())
-        .user_agent(
-            // Windows UA fools Google under WebView2, but on macOS the engine
-            // is WKWebView: a Safari UA matches the real engine fingerprint,
-            // which consumer-account risk checks care about.
-            if cfg!(target_os = "macos") {
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
-                 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
-            } else {
-                YT_LOGIN_UA
-            },
-        )
+        // The constant, not a literal. It used to carry its own macOS
+        // branch pinned to Safari 17.4 while the keeper sent 17.6, so the
+        // session was minted under one browser and renewed under another —
+        // exactly the login/refresh divergence Google reads as replay.
+        .user_agent(YT_LOGIN_UA)
         // Must match the session-keeper's args (shared profile folder).
         .additional_browser_args(YT_WEBVIEW_ARGS)
         // Surface the current origin in the title so the user can spot
@@ -1077,16 +1362,18 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
                 }
             };
 
-            let has_yt_auth = cookies.iter().any(|c| {
-                let name = c.name();
-                (name == "__Secure-1PSID" || name == "SAPISID")
-                    && c.domain()
-                        .map(|d| d.trim_start_matches('.').ends_with("youtube.com"))
-                        .unwrap_or(false)
-            });
+            // The same predicate `is_logged_in` will answer with, over the
+            // same serialization we are about to commit. It used to be an
+            // ad-hoc `__Secure-1PSID || SAPISID` test, and `__Secure-1PSID`
+            // is not a cookie this client can sign with: a jar captured on
+            // it alone committed happily and then read back as signed out,
+            // showing a Sign in button to a user who had just signed in.
+            let netscape = cookies_to_netscape(&cookies);
+            let creds = jar_credentials(&netscape);
 
-            if !has_yt_auth {
-                // YT cookies aren't set yet. Two ways to land here:
+            if !creds.signable() {
+                // No signing cookie on youtube.com yet. Two ways to land
+                // here:
                 //   1) User hasn't completed Google sign-in. Keep waiting.
                 //   2) Google sign-in succeeded but Google parked the
                 //      webview on `myaccount.google.com` (first-time
@@ -1129,14 +1416,10 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
             // VISITOR_INFO1_LIVE / YSC. Those make our replayed traffic
             // look like the browser session Google issued it to, so
             // give the handshake a few ticks to complete. Capture
-            // anyway after ~6 s in case the cookie set changes shape.
-            let has_login_info = cookies.iter().any(|c| {
-                c.name() == "LOGIN_INFO"
-                    && c.domain()
-                        .map(|d| d.trim_start_matches('.').ends_with("youtube.com"))
-                        .unwrap_or(false)
-            });
-            if !has_login_info && full_set_grace < 4 {
+            // anyway after ~6 s in case the cookie set changes shape —
+            // the jar is already signable by this point, which is what
+            // decides whether the app can authenticate with it.
+            if !creds.complete() && full_set_grace < 4 {
                 full_set_grace += 1;
                 continue;
             }
@@ -1145,38 +1428,61 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
             // the account row and its live session profile stay paired.
             let new_id = account_id.clone();
             let cookies_path = account_cookies_path(&app_poll, &new_id);
-            if let Some(dir) = cookies_path.parent() {
-                let _ = tokio::fs::create_dir_all(dir).await;
-            }
-            let plain = cookies_to_netscape(&cookies).into_bytes();
+            let plain = netscape.into_bytes();
             let encrypted =
                 match tokio::task::spawn_blocking(move || secure_store::encrypt(&plain)).await {
                     Ok(Ok(e)) => e,
+                    // Both bail-outs emit `login-cancelled`: it is the only
+                    // event that clears the Sign in spinner, and without it
+                    // a failed encrypt left the button spinning forever.
                     Ok(Err(e)) => {
                         eprintln!("[login] encrypt cookies: {e}");
+                        let _ = app_poll.emit("login-cancelled", ());
                         let _ = win.close();
                         let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
                         return;
                     }
                     Err(e) => {
                         eprintln!("[login] encrypt join: {e}");
+                        let _ = app_poll.emit("login-cancelled", ());
                         let _ = win.close();
                         let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
                         return;
                     }
                 };
-            if let Err(e) = tokio::fs::write(&cookies_path, &encrypted).await {
+            let locks = app_poll.state::<authfs::MutationLocks>();
+            // Scoped: the index lock is taken below, and an account lock is
+            // never held across that (see authfs::MutationLocks).
+            let jar_written = {
+                let _jar = locks.inner().account(&new_id).await;
+                authfs::write_atomic(cookies_path.clone(), encrypted, 0o600).await
+            };
+            if let Err(e) = jar_written {
                 eprintln!("[login] write account cookies: {e}");
                 let _ = win.close();
                 let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
+                let _ = app_poll.emit("login-cancelled", ());
                 return;
             }
+            // Cookies straight out of the login window ARE a fresh snapshot,
+            // so start the refresh deadline here rather than making the
+            // keeper reload 20 seconds after a sign-in.
+            let _ = write_last_refresh(&app_poll, &new_id, now_ts()).await;
 
-            let mut idx = read_index(&app_poll).await;
-            let now_s = time::OffsetDateTime::now_utc().unix_timestamp();
+            let _index = locks.inner().index().await;
+            let mut idx = match read_index_for_update(&app_poll).await {
+                Ok(idx) => idx,
+                Err(e) => {
+                    eprintln!("[login] read index: {e}");
+                    let _ = app_poll.emit("login-cancelled", ());
+                    let _ = win.close();
+                    let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
+                    return;
+                }
+            };
             idx.accounts.push(Account {
                 id: new_id.clone(),
-                added_at: now_s,
+                added_at: now_ts(),
                 ..Default::default()
             });
             idx.active = Some(new_id.clone());
@@ -1217,6 +1523,16 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
     let _ = win;
     Ok(())
 }
+
+/// Page loads the session-keeper has finished, process-wide.
+///
+/// The refresh has no other evidence that the keeper reached Google:
+/// `WebviewWindow::navigate` is fire-and-forget, so with no network it
+/// returns `Ok` and the page never loads, while the keeper's persisted
+/// cookie store keeps answering with whatever it already held. On macOS
+/// this counter follows `webView:didFinishNavigation:`, which a failed
+/// provisional navigation never reaches.
+static KEEPER_PAGE_LOADS: AtomicU64 = AtomicU64::new(0);
 
 /// The live "session-keeper" WebView for `id`: a hidden window on
 /// music.youtube.com that reuses the account's persisted profile. As a
@@ -1264,6 +1580,14 @@ async fn ensure_session_keeper(
         .data_directory(account_webview_dir(app, id))
         .user_agent(YT_LOGIN_UA)
         .additional_browser_args(YT_WEBVIEW_ARGS)
+        // Registered on the webview, so it fires for every later
+        // `navigate()` too — which is what lets a refresh tell "reloaded
+        // and Google answered" from "offline, nothing happened".
+        .on_page_load(|_win, payload| {
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                KEEPER_PAGE_LOADS.fetch_add(1, Ordering::Relaxed);
+            }
+        })
         .build()
         .map_err(|e| format!("build session-keeper: {e}"))?;
     // Force-hide on top of visible(false): if WebView2 shows the host window
@@ -1281,16 +1605,36 @@ async fn ensure_session_keeper(
 ///
 /// This is what survives Google's ~2h leash on *extracted* cookies: the
 /// bound browser session behind the keeper stays live, so the snapshot we
-/// replay never goes stale. Errors (leaving the existing snapshot
-/// untouched) when the account has no persisted profile or its session is
-/// logged out, so we never clobber a usable jar with an empty one.
-async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
+/// replay never goes stale.
+///
+/// Every path that is not [`RefreshOutcome::Committed`] leaves the existing
+/// jar and its success stamp exactly as they were, so we never clobber a
+/// usable jar with an empty one and never let a failed attempt look like a
+/// completed refresh.
+async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOutcome {
     // Serialize refreshes so the periodic timer and a manual trigger can't
     // reload the keeper / rewrite the jar on top of each other.
     let guard = app.state::<RefreshGuard>();
     let _lock = guard.inner().0.lock().await;
 
-    let (win, created) = ensure_session_keeper(app, id).await?;
+    // Probe the credential store BEFORE building a window or reloading the
+    // keeper. On macOS the jar's AES key lives in the login keychain and
+    // reading it needs a UI session, so in a dark wake this is the first
+    // thing that fails — and finding out here costs one keychain read
+    // instead of eighteen seconds of polling a webview that cannot load.
+    if let Err(e) = credential_store_ready().await {
+        return RefreshOutcome::Deferred(e);
+    }
+
+    // Read before the keeper exists, so a just-built one's first load counts.
+    let loads_before = KEEPER_PAGE_LOADS.load(Ordering::Relaxed);
+    let (win, created) = match ensure_session_keeper(app, id).await {
+        Ok(v) => v,
+        Err(e) if session::is_environment_unavailable(&e) => {
+            return RefreshOutcome::Deferred(e)
+        }
+        Err(e) => return RefreshOutcome::Failed(e),
+    };
     // A reused keeper is reloaded to force fresh authenticated traffic; a
     // just-created one is already loading the URL from the builder.
     if !created {
@@ -1300,51 +1644,197 @@ async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> Result<(),
     }
 
     // Poll the keeper's cookie store until the full authed set is present
-    // (LOGIN_INFO lands last, as at login), then snapshot it. The keeper
-    // window stays open for the next cycle.
-    let mut captured: Option<Vec<u8>> = None;
+    // (LOGIN_INFO lands last, as at login), then snapshot it. The gate is
+    // the same predicate `is_logged_in` uses, so a snapshot can never be
+    // captured, committed, and then reported as signed out.
+    let mut captured: Option<String> = None;
     for tick in 0..12u8 {
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let Ok(cookies) = win.cookies() else { continue };
-        let has_yt_auth = cookies.iter().any(|c| {
-            let n = c.name();
-            (n == "__Secure-1PSID" || n == "SAPISID")
-                && c.domain()
-                    .map(|d| d.trim_start_matches('.').ends_with("youtube.com"))
-                    .unwrap_or(false)
-        });
-        if !has_yt_auth {
+        let netscape = cookies_to_netscape(&cookies);
+        let creds = jar_credentials(&netscape);
+        if !creds.identity {
+            continue; // the keeper hasn't loaded a session yet
+        }
+        // Give the handshake a few ticks to finish, then take what we have:
+        // the continuity check below decides whether it is good enough to
+        // replace what is already on disk, so a missing LOGIN_INFO can stall
+        // this loop without stalling the refresh forever.
+        if !creds.complete() && tick < 4 {
             continue;
         }
-        let has_login_info = cookies.iter().any(|c| {
-            c.name() == "LOGIN_INFO"
-                && c.domain()
-                    .map(|d| d.trim_start_matches('.').ends_with("youtube.com"))
-                    .unwrap_or(false)
-        });
-        // Give the handshake a few ticks to complete, then take what we
-        // have so a missing LOGIN_INFO can't stall the refresh forever.
-        if !has_login_info && tick < 4 {
-            continue;
-        }
-        captured = Some(cookies_to_netscape(&cookies).into_bytes());
+        captured = Some(netscape);
         break;
     }
-    let Some(plain) = captured else {
-        return Err("no auth cookies after reload (profile logged out?)".into());
+    let Some(snapshot) = captured else {
+        return RefreshOutcome::Failed("no auth cookies after reload (profile logged out?)".into());
     };
-    let encrypted = tokio::task::spawn_blocking(move || secure_store::encrypt(&plain))
-        .await
-        .map_err(|e| format!("encrypt join: {e}"))?
-        .map_err(|e| format!("encrypt: {e}"))?;
-    let path = account_cookies_path(app, id);
-    if let Some(dir) = path.parent() {
-        let _ = tokio::fs::create_dir_all(dir).await;
+    let plain = snapshot.clone().into_bytes();
+    let encrypted = match tokio::task::spawn_blocking(move || secure_store::encrypt(&plain)).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            let e = format!("encrypt: {e}");
+            return if session::is_environment_unavailable(&e) {
+                RefreshOutcome::Deferred(e)
+            } else {
+                RefreshOutcome::Failed(e)
+            };
+        }
+        Err(e) => return RefreshOutcome::Failed(format!("encrypt join: {e}")),
+    };
+
+    // Only the commit is serialized against the other jar writers, not the
+    // capture above: a `Set-Cookie` merge runs inside every InnerTube
+    // response, and holding the lock for the whole eighteen-second poll
+    // would stall the UI once per cycle. The cost is that a rotation merged
+    // DURING the poll is replaced by the snapshot — which is the live
+    // WebKit store for this account, so it is the more authoritative of the
+    // two. Anything the snapshot drops is logged rather than silently lost.
+    let locks = app.state::<authfs::MutationLocks>();
+    let _jar = locks.inner().account(id).await;
+
+    // Under the lock, confirm the account still exists. Sign out and account
+    // removal delete the whole `accounts/<id>/` tree while this poll is
+    // running, and `write_atomic` re-creates any directory it needs — so
+    // without this check the jar the user just asked the app to forget gets
+    // written back, live, and invisible to a UI that no longer lists it.
+    // Both deletion paths take this same lock, so one of the two orders
+    // always holds: either we see the row gone, or they wait and then delete
+    // what we wrote.
+    match read_index_checked(app).await {
+        IndexRead::Loaded(idx) if idx.accounts.iter().any(|a| a.id == id) => {}
+        IndexRead::Loaded(_) | IndexRead::Absent => {
+            return RefreshOutcome::Failed("account was removed while refreshing".into())
+        }
+        IndexRead::Corrupt(e) | IndexRead::Unavailable(e) => {
+            return RefreshOutcome::Failed(format!("cannot confirm the account still exists: {e}"))
+        }
     }
-    tokio::fs::write(&path, encrypted)
-        .await
-        .map_err(|e| format!("write refreshed cookies: {e}"))?;
+
+    let previous = match read_jar(app, id).await {
+        JarRead::Loaded(jar) => Some(jar),
+        _ => None,
+    };
+
+    // Continuity. The snapshot replaces the jar wholesale, so a capture the
+    // client could not authenticate with must never overwrite one it could:
+    // every other part of a refresh can be retried, this cannot. Committing
+    // over a jar that is already unsignable is fine — there is nothing to
+    // lose and the fresher cookies may be what heals it.
+    //
+    // The test is `signable`, not the full set, on purpose. Refusing a
+    // capture that merely lost LOGIN_INFO would pin the old jar in place
+    // forever after a real server-side logout, which is how "protected"
+    // cookies turn immortal. A lost marker is logged below instead.
+    if !jar_credentials(&snapshot).signable() {
+        if let Some(previous) = &previous {
+            if jar_credentials(previous).signable() {
+                return RefreshOutcome::Failed(format!(
+                    "captured snapshot cannot sign requests ({}); keeping the previous jar",
+                    jar_credentials(&snapshot).missing()
+                ));
+            }
+        }
+    }
+
+    // Liveness. A snapshot identical to the jar it would replace renewed
+    // nothing, and neither did a keeper that never finished a page load:
+    // offline, `navigate()` still returns Ok and the persisted WebKit store
+    // still answers with the old set. Committing that would stamp the
+    // success deadline and leave the app replaying an hours-old snapshot for
+    // another twenty minutes, which is exactly the live-versus-replayed
+    // divergence Google reads as a stolen cookie. Either signal is enough;
+    // requiring both would fail a legitimate cycle in which Google happened
+    // to rotate nothing.
+    let reloaded = KEEPER_PAGE_LOADS.load(Ordering::Relaxed) > loads_before;
+    let renewed = previous
+        .as_deref()
+        .is_none_or(|p| session::jars_differ(p, &snapshot));
+    if !reloaded && !renewed {
+        return RefreshOutcome::Failed(
+            "keeper finished no page load and the cookie set is unchanged (offline?)".into(),
+        );
+    }
+
+    if let Some(previous) = &previous {
+        log_snapshot_regressions(previous, &snapshot);
+    }
+
+    if let Err(e) = authfs::write_atomic(account_cookies_path(app, id), encrypted, 0o600).await {
+        // A storage failure keeps the previous jar, so the session is
+        // intact; it is the attempt that failed, and it must never reach
+        // the UI as "signed out".
+        return RefreshOutcome::Failed(format!("write refreshed cookies: {e}"));
+    }
+    // The success deadline derives from this stamp and nothing else, so an
+    // unwritable stamp means the refresh did not fully commit: leave the
+    // deadline where it was and let the loop back off and try again.
+    if let Err(e) = write_last_refresh(app, id, now_ts()).await {
+        return RefreshOutcome::Failed(format!("write refresh stamp: {e}"));
+    }
+    RefreshOutcome::Committed
+}
+
+/// How a refresh attempt ended. Three outcomes, not two: an attempt that
+/// could not run because the desktop session was unavailable is not the
+/// same as one that ran and found the account logged out, and treating them
+/// alike is what turned a dark wake into a re-login prompt.
+enum RefreshOutcome {
+    /// The jar and its success stamp are both on disk.
+    Committed,
+    /// Nothing was written and nothing was learned. Does not advance the
+    /// success deadline and does not count as a session failure.
+    Deferred(String),
+    /// The attempt ran and failed. The previous jar is untouched.
+    Failed(String),
+}
+
+/// Can the platform credential store be read right now?
+///
+/// Only Linux and macOS keep the jar's key outside the process (Secret
+/// Service / Keychain); Windows DPAPI needs no UI session, so there is
+/// nothing to probe there.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn credential_store_ready() -> Result<(), String> {
+    match tokio::task::spawn_blocking(|| secure_store::encrypt(b"probe")).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(format!("credential store: {e}")),
+        Err(e) => Err(format!("credential store probe: {e}")),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+async fn credential_store_ready() -> Result<(), String> {
     Ok(())
+}
+
+/// Log the cookies the new snapshot would drop or roll back relative to the
+/// jar it replaces. The keeper snapshot overwrites wholesale, so anything a
+/// `Set-Cookie` merge learned since the last cycle disappears here; that has
+/// never been visible, and it is one of the ways a replayed jar drifts from
+/// what Google last issued. Values are never logged, only names.
+fn log_snapshot_regressions(previous: &str, fresh: &str) {
+    let names: HashMap<(&str, &str), &str> = session::parse_jar(fresh)
+        .map(|c| ((c.domain, c.name), c.value))
+        .collect();
+    let mut dropped: Vec<String> = Vec::new();
+    let mut rolled_back: Vec<String> = Vec::new();
+    for c in session::parse_jar(previous) {
+        match names.get(&(c.domain, c.name)) {
+            None => dropped.push(format!("{} {}", c.domain, c.name)),
+            Some(v) if *v != c.value => rolled_back.push(format!("{} {}", c.domain, c.name)),
+            Some(_) => {}
+        }
+    }
+    if !dropped.is_empty() {
+        eprintln!("[refresh] snapshot drops cookie(s): {}", dropped.join(", "));
+    }
+    if !rolled_back.is_empty() {
+        eprintln!(
+            "[refresh] snapshot replaces value(s) the merge had echoed: {}",
+            rolled_back.join(", ")
+        );
+    }
 }
 
 /// Force an immediate snapshot refresh for the active account. Exposed
@@ -1358,10 +1848,163 @@ async fn refresh_active_session(app: tauri::AppHandle) -> Result<bool, String> {
         return Ok(false);
     };
     match refresh_account_cookies(&app, &active).await {
-        Ok(()) => Ok(true),
-        Err(e) => {
+        RefreshOutcome::Committed => {
+            let _ = app.emit("session-refreshed", &active);
+            Ok(true)
+        }
+        // Both reject, because in neither case is the snapshot any newer
+        // than it was — but a defer says "ask again shortly", not "this
+        // account needs attention", so the caller can tell them apart.
+        RefreshOutcome::Deferred(e) => {
+            eprintln!("[refresh] {active}: deferred: {e}");
+            Err(format!("deferred: {e}"))
+        }
+        RefreshOutcome::Failed(e) => {
             eprintln!("[refresh] {active}: {e}");
             Err(e)
+        }
+    }
+}
+
+/// Keep the active account's replayed cookie snapshot fresh.
+///
+/// Google leashes *extracted* cookies to roughly two hours; reloading the
+/// hidden session-keeper every 20 minutes renews the bound session well
+/// inside that window, so the library never silently empties mid-session.
+/// Accounts with no persisted profile (added before the keeper shipped) are
+/// skipped until the user signs in again.
+///
+/// The deadline is WALL CLOCK and persisted, because a tokio timer does not
+/// advance while macOS sleeps: with `sleep(20 min)` two consecutive
+/// refreshes in this app's own timestamped log landed 142 and 177 minutes
+/// apart, each firing the instant the Mac woke, while Google kept rotating.
+/// A short tick over a wall-clock deadline notices that within a minute
+/// whether or not the wake notification arrives.
+///
+/// Two clocks, never one. `due_at` moves only when a refresh actually
+/// commits; the retry clock is separate. A failed attempt that pushed the
+/// success deadline out is how a snapshot ages for hours while the loop
+/// believes it is on schedule.
+async fn run_refresh_loop(app: tauri::AppHandle) {
+    let wake = session::wake::signal();
+    let mut retry = session::RetryState::default();
+    let mut interval =
+        session::REFRESH_INTERVAL_SECS + session::jitter(session::REFRESH_JITTER_SECS, jitter_seed());
+    // Both conditions can hold for hours, so they log the transition and
+    // then stay quiet.
+    let mut warned_profileless: Option<String> = None;
+    let mut warned_deferred = false;
+    let mut warned_index = false;
+
+    loop {
+        let now = now_ts();
+        // Read the index directly rather than through `read_index`: an
+        // unreadable one would otherwise log on every tick, and this is the
+        // one condition nothing in the app can heal by itself.
+        let active = match read_index_checked(&app).await {
+            IndexRead::Loaded(idx) => {
+                warned_index = false;
+                idx.active
+            }
+            IndexRead::Absent => None,
+            IndexRead::Corrupt(e) | IndexRead::Unavailable(e) => {
+                if !warned_index {
+                    warned_index = true;
+                    eprintln!("[refresh] {e}; session refresh is paused until it is readable");
+                }
+                None
+            }
+        };
+        // Nothing to wait for unless an account is due; overwritten below.
+        let mut due = now.saturating_add(session::REFRESH_TICK_SECS as i64);
+        let mut attempted = false;
+        let mut refreshable = false;
+        if let Some(active) = active {
+            if !account_webview_dir(&app, &active).exists() {
+                if warned_profileless.as_deref() != Some(active.as_str()) {
+                    eprintln!(
+                        "[refresh] {active} has no persisted profile; sign in again to re-arm \
+                         session refresh"
+                    );
+                    warned_profileless = Some(active);
+                }
+            } else {
+                warned_profileless = None;
+                refreshable = true;
+                let last = read_last_refresh(&app, &active).await;
+                due = session::due_at(last, now, interval);
+                // A wake pulls the deadline in, but only as far as the point
+                // where the snapshot is old enough to be worth renewing. A
+                // lid opened a dozen times in an hour must not cost a dozen
+                // authenticated keeper reloads.
+                if retry.forced_due() {
+                    due = due.min(session::due_at(last, now, session::WAKE_MIN_AGE_SECS));
+                }
+                if session::should_attempt(now, due, retry.next_attempt_at()) {
+                    attempted = true;
+                    retry.on_attempt();
+                    match refresh_account_cookies(&app, &active).await {
+                        RefreshOutcome::Committed => {
+                            retry.on_committed();
+                            interval = session::REFRESH_INTERVAL_SECS
+                                + session::jitter(session::REFRESH_JITTER_SECS, jitter_seed());
+                            if warned_deferred {
+                                warned_deferred = false;
+                                eprintln!("[refresh] desktop session is available again");
+                            }
+                            eprintln!("[refresh] renewed snapshot for {active}");
+                            // Emitted only on a committed jar, never on an
+                            // attempt: the frontend uses it to re-ask an auth
+                            // question it may have answered wrongly while the
+                            // session was unreadable.
+                            let _ = app.emit("session-refreshed", &active);
+                        }
+                        // Nothing was written and nothing was learned: the
+                        // deadline stands, the failure count stands, and we
+                        // wait a little rather than hammering the keychain.
+                        RefreshOutcome::Deferred(reason) => {
+                            retry.on_deferred(now_ts(), jitter_seed());
+                            if !warned_deferred {
+                                warned_deferred = true;
+                                eprintln!(
+                                    "[refresh] deferred, desktop session unavailable \
+                                     (dark wake?): {reason}"
+                                );
+                            }
+                        }
+                        RefreshOutcome::Failed(e) => {
+                            retry.on_failed(now_ts(), jitter_seed());
+                            eprintln!("[refresh] {active}: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        if !refreshable {
+            // Signed out, or on an account with no persisted profile: the
+            // branch above is the only one that reaches `on_attempt`, so
+            // without this a single lid-open would leave every later pass
+            // permanently forced.
+            retry.on_nothing_to_refresh();
+        }
+
+        // A pass that attempted has just changed the state it would sleep
+        // on, and every backoff is longer than a few seconds, so a full tick
+        // is right. A pass that held off sleeps only until the moment it
+        // could act — which is what makes the wake's settle delay a real ten
+        // seconds instead of "some time in the next minute".
+        let delay = if attempted {
+            session::REFRESH_TICK_SECS
+        } else {
+            session::sleep_secs(now_ts(), due, retry.next_attempt_at())
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
+            // A wake only marks the refresh DUE. It cannot prove a UI
+            // session exists, so it never bypasses the keychain probe — a
+            // dark wake still defers and backs off.
+            _ = wake.notified() => retry.on_wake(now_ts()),
         }
     }
 }
@@ -1373,25 +2016,7 @@ async fn read_cookie_header(app: &tauri::AppHandle, host: &str) -> String {
     let Some(content) = read_cookies_plain(app).await else {
         return String::new();
     };
-    let mut parts: Vec<String> = Vec::new();
-    for line in content.lines() {
-        if line.starts_with('#') || line.trim().is_empty() {
-            continue;
-        }
-        // domain \t include_subdomains \t path \t secure \t expiry \t name \t value
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 7 {
-            continue;
-        }
-        let domain = fields[0].trim_start_matches('.');
-        let include_sub = fields[1] == "TRUE";
-        let matches = host == domain || (include_sub && host.ends_with(&format!(".{domain}")));
-        if !matches {
-            continue;
-        }
-        parts.push(format!("{}={}", fields[5], fields[6]));
-    }
-    parts.join("; ")
+    session::cookie_header(&content, host, session::INNERTUBE_PATH, now_ts())
 }
 
 #[tauri::command]
@@ -1399,10 +2024,62 @@ async fn get_cookie_header(app: tauri::AppHandle, host: String) -> Result<String
     Ok(read_cookie_header(&app, &host).await)
 }
 
+/// The honest answer about the stored session for `host`: usable, unknown,
+/// or signed out. Everything the UI shows about auth derives from this, and
+/// only `signed_out` may render a sign-in button.
+async fn auth_state(app: &tauri::AppHandle, host: &str) -> session::AuthStatus {
+    let idx = match read_index_checked(app).await {
+        IndexRead::Corrupt(e) | IndexRead::Unavailable(e) => {
+            return session::AuthStatus::unknown(e)
+        }
+        IndexRead::Absent => return session::AuthStatus::signed_out("no accounts file"),
+        IndexRead::Loaded(idx) => idx,
+    };
+    let Some(id) = idx.active else {
+        return session::AuthStatus::signed_out("no active account");
+    };
+    match read_jar(app, &id).await {
+        JarRead::Absent => session::AuthStatus::signed_out("no cookie jar for the active account"),
+        // Decrypt failures land here, including the macOS dark-wake case
+        // where the login keychain will not open. The session on disk is
+        // fine; we simply cannot read it this second.
+        JarRead::Unavailable(e) => session::AuthStatus::unknown(e),
+        JarRead::Loaded(jar) => {
+            let creds = session::inspect_jar(&jar, host, session::INNERTUBE_PATH, now_ts());
+            // `signable`, not the stricter full set: a jar this client can
+            // sign requests with IS authenticated as far as anything here
+            // can tell, and answering an authoritative "signed out" for it
+            // gates off the `/account_menu` probe that is the only thing
+            // able to disagree. `/account_menu` still gets the last word in
+            // the other direction, so the strictness belongs there.
+            if creds.signable() {
+                session::AuthStatus::usable()
+            } else {
+                session::AuthStatus::signed_out(creds.missing())
+            }
+        }
+    }
+}
+
+/// Tri-state auth answer for the UI. `is_logged_in` keeps its boolean shape
+/// for the callers that only branch two ways; this is what a caller uses to
+/// tell "Google says you are anonymous" from "we could not look".
+#[tauri::command]
+async fn auth_status(app: tauri::AppHandle) -> Result<session::AuthStatus, String> {
+    Ok(auth_state(&app, "music.youtube.com").await)
+}
+
 #[tauri::command]
 async fn is_logged_in(app: tauri::AppHandle) -> Result<bool, String> {
-    let header = read_cookie_header(&app, "music.youtube.com").await;
-    Ok(header.contains("SAPISID") || header.contains("__Secure-1PSID"))
+    let status = auth_state(&app, "music.youtube.com").await;
+    // Rejecting is the whole point: `Ok(false)` is an authoritative "you are
+    // signed out" and the sidebar renders a sign-in button for it. An
+    // unreadable jar is not that answer, and returning `false` for it is
+    // what showed a signed-in user the sign-in button after a dark wake.
+    if status.is_unknown() {
+        return Err(status.reason);
+    }
+    Ok(status.is_usable())
 }
 
 /// Hard-exit the process. The window's close button hides into the tray
@@ -1573,6 +2250,26 @@ async fn close_player_window(app: tauri::AppHandle) -> Result<(), String> {
 /// world.
 #[tauri::command]
 async fn clear_cookies(app: tauri::AppHandle) -> Result<(), String> {
+    let locks = app.state::<authfs::MutationLocks>();
+    let _index = locks.inner().index().await;
+    // Hold every account's jar lock across the delete. A refresh commits
+    // under that lock and `write_atomic` re-creates the directory tree it
+    // writes into, so without this the account the user just asked the app
+    // to forget can reappear on disk seconds later, with live credentials
+    // and no row in the index to make it visible. Lock order is
+    // index-then-account (see authfs::MutationLocks).
+    let mut _jars = Vec::new();
+    for id in account_ids_on_disk(&app).await {
+        _jars.push(locks.inner().account(&id).await);
+    }
+    // And close any running keeper, as `remove_account` does, so no webview
+    // is still holding (or re-creating) a profile directory that is about to
+    // be deleted. A keeper's profile is a signed-in Google session on disk.
+    for (label, w) in app.webview_windows() {
+        if label.starts_with("keeper-") {
+            let _ = w.close();
+        }
+    }
     let dir = accounts_dir(&app);
     if dir.exists() {
         tokio::fs::remove_dir_all(&dir)
@@ -1623,7 +2320,9 @@ async fn list_accounts(app: tauri::AppHandle) -> Result<Vec<AccountSummary>, Str
 /// invalidates its query cache on the `accounts-changed` event.
 #[tauri::command]
 async fn switch_account(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    let mut idx = read_index(&app).await;
+    let locks = app.state::<authfs::MutationLocks>();
+    let _index = locks.inner().index().await;
+    let mut idx = read_index_for_update(&app).await?;
     if !idx.accounts.iter().any(|a| a.id == id) {
         return Err(format!("no such account: {id}"));
     }
@@ -1642,7 +2341,9 @@ async fn switch_account(app: tauri::AppHandle, id: String) -> Result<(), String>
 /// directory off disk in the same call.
 #[tauri::command]
 async fn remove_account(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    let mut idx = read_index(&app).await;
+    let locks = app.state::<authfs::MutationLocks>();
+    let _index = locks.inner().index().await;
+    let mut idx = read_index_for_update(&app).await?;
     let pos = idx
         .accounts
         .iter()
@@ -1654,6 +2355,11 @@ async fn remove_account(app: tauri::AppHandle, id: String) -> Result<(), String>
     if let Some(w) = app.get_webview_window(&format!("keeper-{id}")) {
         let _ = w.close();
     }
+    // Held across the delete AND the index write: a refresh already
+    // mid-capture commits under this lock and re-creates whatever directory
+    // it writes into, so the removed account's jar would come straight back.
+    // Lock order is index-then-account (see authfs::MutationLocks).
+    let _jar = locks.inner().account(&id).await;
     let dir = accounts_dir(&app).join(&id);
     if dir.exists() {
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -1684,7 +2390,9 @@ async fn update_account_meta(
     #[allow(non_snake_case)] photoUrl: Option<String>,
 ) -> Result<(), String> {
     let photo_url = photoUrl;
-    let mut idx = read_index(&app).await;
+    let locks = app.state::<authfs::MutationLocks>();
+    let _index = locks.inner().index().await;
+    let mut idx = read_index_for_update(&app).await?;
 
     // Meta from /account_menu always describes the ACTIVE account: the
     // fetch runs with the active jar. A caller that pairs a stale id
@@ -1695,6 +2403,15 @@ async fn update_account_meta(
     if idx.active.as_deref() != Some(id.as_str()) {
         return Ok(());
     }
+
+    // The dedup branch below deletes this row's whole directory, and the
+    // row stays in the index until the write at the end of the function.
+    // Held across both, a refresh of this account cannot slip in between
+    // and re-create the jar it just deleted (`write_atomic` re-creates any
+    // directory it writes into). Lock order is index-then-account, and an
+    // account lock is never held while taking the index one, so holding
+    // two of them here is safe (see authfs::MutationLocks).
+    let _this_jar = locks.inner().account(&id).await;
 
     // When the account acts as a brand channel, /account_menu describes
     // the channel, not the Google account, so its meta can't identify a
@@ -1746,13 +2463,20 @@ async fn update_account_meta(
         let other_id = idx.accounts[other_pos].id.clone();
         let this_cookies = account_cookies_path(&app, &id);
         let other_cookies = account_cookies_path(&app, &other_id);
-        if let Some(parent) = other_cookies.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-        if let Ok(bytes) = tokio::fs::read(&this_cookies).await {
-            if let Err(e) = tokio::fs::write(&other_cookies, bytes).await {
-                eprintln!("[accounts] copy cookies on dedup: {e}");
+        match tokio::fs::read(&this_cookies).await {
+            Ok(bytes) => {
+                // Lock order: the index lock is already held and an account
+                // lock is taken under it, never the reverse.
+                let _jar = locks.inner().account(&other_id).await;
+                if let Err(e) = authfs::write_atomic(other_cookies, bytes, 0o600).await {
+                    eprintln!("[accounts] copy cookies on dedup: {e}");
+                } else {
+                    // The row just took on a jar captured seconds ago at
+                    // login, so its refresh deadline restarts from here.
+                    let _ = write_last_refresh(&app, &other_id, now_ts()).await;
+                }
             }
+            Err(e) => eprintln!("[accounts] read cookies on dedup: {e}"),
         }
         // Re-login replaces the older row's session with the freshly
         // captured one, so its live WebView profile has to move over too.
@@ -1863,7 +2587,9 @@ async fn set_account_channel(
     #[allow(non_snake_case)] channelName: Option<String>,
     #[allow(non_snake_case)] channelPhotoUrl: Option<String>,
 ) -> Result<(), String> {
-    let mut idx = read_index(&app).await;
+    let locks = app.state::<authfs::MutationLocks>();
+    let _index = locks.inner().index().await;
+    let mut idx = read_index_for_update(&app).await?;
     let is_active = idx.active.as_deref() == Some(id.as_str());
     let acct = idx
         .accounts
@@ -1895,7 +2621,15 @@ struct AuthContext {
 
 #[tauri::command]
 async fn get_auth_context(app: tauri::AppHandle, host: String) -> Result<AuthContext, String> {
-    let cookie = read_cookie_header(&app, &host).await;
+    // Reject rather than hand back an empty context when the jar exists but
+    // cannot be read: an empty context means "this user is anonymous", and
+    // the caller caches it. One dark-wake keychain miss used to make every
+    // InnerTube request for the next five minutes go out signed out.
+    let cookie = match read_active_jar(&app).await {
+        JarRead::Loaded(jar) => session::cookie_header(&jar, &host, session::INNERTUBE_PATH, now_ts()),
+        JarRead::Absent => String::new(),
+        JarRead::Unavailable(e) => return Err(format!("auth unavailable: {e}")),
+    };
     let page_id = if cookie.is_empty() {
         None
     } else {
@@ -1908,14 +2642,10 @@ async fn get_auth_context(app: tauri::AppHandle, host: String) -> Result<AuthCon
     Ok(AuthContext { cookie, page_id })
 }
 
-/// Serializes read-modify-write cycles on the active cookie jar.
-/// Parallel InnerTube responses can each carry Set-Cookie rotations;
-/// without the lock two merges could interleave and drop one.
-#[derive(Default)]
-struct JarWriteLock(tokio::sync::Mutex<()>);
-
-/// Serializes cookie-refresh runs so the periodic keeper reload / jar
-/// rewrite can't overlap between the timer and a manual trigger.
+/// Singleflight for cookie-refresh runs, so the periodic timer and a manual
+/// trigger can't reload the same keeper at once. The jar itself is guarded
+/// separately by `authfs::MutationLocks` — this one is about the keeper
+/// window, which is a process-wide resource.
 #[derive(Default)]
 struct RefreshGuard(tokio::sync::Mutex<()>);
 
@@ -1935,32 +2665,36 @@ struct RefreshGuard(tokio::sync::Mutex<()>);
 #[tauri::command]
 async fn merge_response_cookies(
     app: tauri::AppHandle,
-    lock: tauri::State<'_, JarWriteLock>,
     host: String,
     set_cookies: Vec<String>,
 ) -> Result<bool, String> {
     if set_cookies.is_empty() {
         return Ok(false);
     }
-    let _guard = lock.0.lock().await;
-    let Some(path) = active_cookies_path(&app).await else {
+    let Some(id) = read_index(&app).await.active else {
         return Ok(false);
     };
-    let Ok(encrypted) = tokio::fs::read(&path).await else {
-        return Ok(false);
-    };
-    let Ok(Ok(plain)) =
-        tokio::task::spawn_blocking(move || secure_store::decrypt(&encrypted)).await
-    else {
-        return Ok(false);
-    };
-    let Ok(jar) = String::from_utf8(plain) else {
-        return Ok(false);
+    // Held across the whole read-modify-write, and shared with the refresh
+    // commit and the login write, so a rotation can no longer be lost to a
+    // snapshot landing between the read and the rename.
+    let locks = app.state::<authfs::MutationLocks>();
+    let _guard = locks.inner().account(&id).await;
+
+    let jar = match read_jar(&app, &id).await {
+        JarRead::Loaded(jar) => jar,
+        JarRead::Absent => return Ok(false),
+        // Echoing a rotation is best-effort and must never fail the data
+        // call that triggered it — but a keychain that would not open is
+        // worth saying out loud, because the rotation Google just issued is
+        // being dropped and that is exactly what drifts the jar out of sync.
+        JarRead::Unavailable(e) => {
+            eprintln!("[auth] dropped a rotation, jar unavailable: {e}");
+            return Ok(false);
+        }
     };
 
-    let now_ts = time::OffsetDateTime::now_utc().unix_timestamp();
     let (merged, value_changed, needs_write) =
-        merge_set_cookies_into_jar(&jar, &set_cookies, &host, now_ts);
+        merge_set_cookies_into_jar(&jar, &set_cookies, &host, now_ts());
     if !needs_write {
         return Ok(false);
     }
@@ -1970,15 +2704,7 @@ async fn merge_response_cookies(
         .await
         .map_err(|e| format!("encrypt join: {e}"))?
         .map_err(|e| format!("encrypt cookies: {e}"))?;
-    // Write-then-rename: this path now runs on live rotations, not just
-    // at login, and a torn cookies.enc reads as "signed out".
-    let tmp = path.with_extension("enc.tmp");
-    tokio::fs::write(&tmp, &encrypted)
-        .await
-        .map_err(|e| format!("write jar tmp: {e}"))?;
-    tokio::fs::rename(&tmp, &path)
-        .await
-        .map_err(|e| format!("swap jar: {e}"))?;
+    authfs::write_atomic(account_cookies_path(&app, &id), encrypted, 0o600).await?;
     if value_changed {
         eprintln!("[auth] echoed rotated session cookie(s) into the active jar");
     }
@@ -4267,7 +4993,7 @@ pub fn run() {
         ))
         .manage(state)
         .manage(CloseBehavior::default())
-        .manage(JarWriteLock::default())
+        .manage(authfs::MutationLocks::default())
         .manage(RefreshGuard::default())
         .manage(discord::spawn())
         .manage(lastfm::LastfmState::default())
@@ -4297,6 +5023,7 @@ pub fn run() {
             get_auth_context,
             merge_response_cookies,
             is_logged_in,
+            auth_status,
             refresh_active_session,
             clear_cookies,
             list_accounts,
@@ -4430,32 +5157,16 @@ pub fn run() {
                 )
                 .await;
             });
-            // Keep the active account's replayed cookie snapshot fresh.
-            // Google leashes *extracted* cookies to ~2h; reloading the
-            // hidden session-keeper every 20 min renews the bound session
-            // well inside that window, so the library never silently
-            // empties mid-session.
-            // Accounts with no persisted profile (added before this
-            // feature) are skipped until the user signs in again.
+            // Subscribed here, after the identity migration and the log
+            // redirect but before the refresh task exists, so a machine
+            // waking during startup is not missed.
+            session::wake::init();
             let refresh_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 // Let migrations + the stream server settle, and give a
                 // just-completed login time to persist its profile.
                 tokio::time::sleep(Duration::from_secs(20)).await;
-                loop {
-                    let idx = read_index(&refresh_handle).await;
-                    if let Some(active) = idx.active {
-                        if account_webview_dir(&refresh_handle, &active).exists() {
-                            match refresh_account_cookies(&refresh_handle, &active).await {
-                                Ok(()) => {
-                                    eprintln!("[refresh] renewed snapshot for {active}")
-                                }
-                                Err(e) => eprintln!("[refresh] {active}: {e}"),
-                            }
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_secs(20 * 60)).await;
-                }
+                run_refresh_loop(refresh_handle).await;
             });
             // Native media controls: the SMTC tile on Windows (Quick Settings /
             // volume flyout) and MPRIS on Linux, plus the hardware media keys.
@@ -4708,6 +5419,42 @@ mod tests {
         let (out, changed, dirty) = merge_set_cookies_into_jar(&jar(), &lines, HOST, NOW);
         assert!(!changed && !dirty);
         assert_eq!(out, jar(), "jar must be untouched");
+    }
+
+    /// RFC 6265 §5.3.5. The google/youtube allowlist alone accepts any
+    /// google-family domain from any google-family host, so without this a
+    /// music.youtube.com response could plant a cookie on
+    /// accounts.google.com and we would replay it to Google as though
+    /// Google had issued it.
+    #[test]
+    fn merge_rejects_a_domain_the_response_host_is_not_under() {
+        let lines = vec![
+            "EVIL=1; Domain=.google.com; Path=/; Secure; Max-Age=1000".to_string(),
+            "ALSO_EVIL=1; Domain=accounts.google.com; Path=/; Secure; Max-Age=1000".to_string(),
+        ];
+        let (out, changed, dirty) = merge_set_cookies_into_jar(&jar(), &lines, HOST, NOW);
+        assert!(!changed && !dirty);
+        assert_eq!(out, jar(), "jar must be untouched");
+    }
+
+    #[test]
+    fn merge_accepts_a_parent_domain_of_the_response_host() {
+        // .youtube.com from music.youtube.com is legitimate, and so is a
+        // host-only cookie from accounts.google.com.
+        let lines = vec![
+            "SIDCC=fresh; Domain=.youtube.com; Path=/; Secure; Max-Age=1000".to_string(),
+        ];
+        let (out, changed, _) = merge_set_cookies_into_jar(&jar(), &lines, HOST, NOW);
+        assert!(changed);
+        assert!(out.contains("SIDCC\tfresh"));
+
+        let google = vec![
+            "SAPISID=g; Domain=.google.com; Path=/; Secure; Max-Age=1000".to_string(),
+        ];
+        let (out, changed, _) =
+            merge_set_cookies_into_jar(&jar(), &google, "accounts.google.com", NOW);
+        assert!(changed);
+        assert!(out.contains(".google.com\tTRUE\t/\tTRUE"));
     }
 
     #[test]

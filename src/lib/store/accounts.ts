@@ -4,8 +4,8 @@ import { useNavigate } from "@tanstack/react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { resetInnertube } from "@/lib/innertube/client";
-import { fetchAccountInfo } from "@/lib/innertube/account";
 import { fetchChannelList } from "@/lib/innertube/channels";
+import { accountInfoQuery, authLoggedInQuery } from "@/lib/store/auth-queries";
 import { clearPrefetchMemo } from "@/lib/stream";
 import { openChannelPicker } from "@/lib/store/channel-picker";
 import { usePlaybackStore } from "@/lib/store/playback";
@@ -24,6 +24,13 @@ export type AccountSummary = {
   channelName: string | null;
   channelPhotoUrl: string | null;
   isActive: boolean;
+  /**
+   * Whether this account still has the webview profile the session
+   * keeper needs to renew its cookie snapshot. Optional because older
+   * builds of the Rust side don't send it; test it as `=== false`, never
+   * as `!canRefresh`, so an absent field doesn't read as broken.
+   */
+  canRefresh?: boolean;
 };
 
 /**
@@ -114,6 +121,44 @@ export function useLoginSuccessListener(): void {
   }, [qc]);
 }
 
+/**
+ * Mount once at the app root. Rust emits `session-refreshed` with the
+ * account id once it has committed a renewed cookie snapshot to disk.
+ *
+ * That event is the only way back for a frontend that already answered
+ * "unknown": a keychain miss during a dark wake, or a launch with no
+ * network, leaves the sidebar rendering stored meta and every auth query
+ * in its error state, and both stay that way for the rest of the session
+ * because nothing re-asks. Dropping the cached auth context and
+ * invalidating the three auth queries turns a restart into a re-render.
+ *
+ * Only committed successes are announced, so this never fires on a
+ * failed refresh.
+ */
+export function useSessionRefreshedListener(): void {
+  const qc = useQueryClient();
+  useEffect(() => {
+    let cancelled = false;
+    let dispose: (() => void) | undefined;
+    void listen("session-refreshed", () => {
+      // Reset first. The queries below read the jar back through the
+      // InnerTube client, so invalidating before the cached Cookie
+      // header is dropped just refetches with the stale one.
+      resetInnertube();
+      void qc.invalidateQueries({ queryKey: ["auth-logged-in"] });
+      void qc.invalidateQueries({ queryKey: ["account-info"] });
+      void qc.invalidateQueries({ queryKey: ["premium-status"] });
+    }).then((un) => {
+      if (cancelled) un();
+      else dispose = un;
+    });
+    return () => {
+      cancelled = true;
+      dispose?.();
+    };
+  }, [qc]);
+}
+
 export function useAccountsChangedListener(): void {
   const qc = useQueryClient();
   const navigate = useNavigate();
@@ -126,10 +171,17 @@ export function useAccountsChangedListener(): void {
       //    flips straight from account A's pins to account B's instead
       //    of flashing through an empty list while the
       //    `["active-account-id"]` query refetches.
+      //    A failed read falls back to `undefined`, not `null`: null is
+      //    a real answer ("signed out, use the shared bucket") and
+      //    applying it empties the pinned rows, which looks exactly like
+      //    the account losing its pins. Skipping the update leaves the
+      //    previous bucket up until the query below re-reads the id.
       const newActiveId = await invoke<string | null>(
         "get_active_account_id",
-      ).catch(() => null);
-      usePinnedPlaylistsStore.getState().setActiveAccount(newActiveId);
+      ).catch(() => undefined);
+      if (newActiveId !== undefined) {
+        usePinnedPlaylistsStore.getState().setActiveAccount(newActiveId);
+      }
 
       // 2. Stop audio so the previous account's track doesn't keep
       //    playing while everything else churns. `clearQueue` sets
@@ -189,19 +241,8 @@ export function useAccountsChangedListener(): void {
 export function useAccountMetaBackfill(): void {
   const qc = useQueryClient();
 
-  const loggedIn = useQuery({
-    queryKey: ["auth-logged-in"],
-    queryFn: () => invoke<boolean>("is_logged_in"),
-    staleTime: 30_000,
-  });
-
-  const account = useQuery({
-    queryKey: ["account-info"],
-    queryFn: () => fetchAccountInfo(),
-    enabled: loggedIn.data === true,
-    staleTime: 5 * 60_000,
-    retry: false,
-  });
+  const loggedIn = useQuery(authLoggedInQuery);
+  const account = useQuery(accountInfoQuery(loggedIn.data === true));
 
   const activeId = useQuery({
     queryKey: ["active-account-id"],

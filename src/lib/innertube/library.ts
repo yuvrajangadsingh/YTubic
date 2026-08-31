@@ -21,8 +21,18 @@ export type LibrarySection = {
   items: ShelfItem[];
 };
 
+/**
+ * Every browse below is account-scoped, so an unreadable jar has to fail
+ * the call rather than downgrade it. Anonymous, YouTube answers the
+ * generic explore page — a 200 with real-looking shelves — and that
+ * answer would be written into the same `["library", ...]` cache entry
+ * the sidebar reads, replacing the user's library with YouTube's front
+ * page until it goes stale.
+ */
+const AUTHED = { auth: "required" } as const;
+
 async function browseSections(browseId: string): Promise<LibrarySection[]> {
-  const json = await rawBrowse(browseId);
+  const json = await rawBrowse(browseId, undefined, AUTHED);
   const tabs: YtNode[] =
     json?.contents?.singleColumnBrowseResultsRenderer?.tabs ?? [];
   const sectionList: YtNode | undefined =
@@ -47,7 +57,7 @@ async function browseSections(browseId: string): Promise<LibrarySection[]> {
       const token =
         readPagingToken(shelf) ??
         (shelfNodes.length === 1 ? readPagingToken(sectionList) : undefined);
-      const rest = await collectContinuationItems(token);
+      const rest = await collectContinuationItems(token, AUTHED);
       return { wrapper, i, rest };
     }),
   );

@@ -41,7 +41,10 @@ export function stripXssiPrefix(text: string): string {
  * Returns [] when signed out.
  */
 export async function fetchChannelList(): Promise<ChannelChoice[]> {
-  const auth = await authHeaders();
+  // "required" so an unreadable jar throws instead of reporting an empty
+  // switcher: [] here means "this account has one channel", which the
+  // post-login picker treats as a decision already made.
+  const auth = await authHeaders("required");
   if (!auth.Cookie) return [];
   const res = await tauriFetch(SWITCHER_URL, {
     method: "GET",
