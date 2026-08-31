@@ -27,6 +27,7 @@ use tower_http::services::ServeFile;
 mod now_playing;
 mod app_nap;
 mod applog;
+mod identity;
 mod appid;
 mod cast;
 mod discord;
@@ -136,7 +137,7 @@ mod secure_store {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     const KEYRING_KEY_LEN: usize = 32;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    const KEYRING_SERVICE: &str = "com.github.ivasy.ytubic";
+    const KEYRING_SERVICE: &str = "com.github.yuvrajangadsingh.ytubic";
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     const KEYRING_USER: &str = "cookie-encryption-key-v1";
 
@@ -156,6 +157,25 @@ mod secure_store {
                 )
             }),
             Err(Error::NoEntry) => {
+                // A pre-rename install kept this key under the upstream
+                // identifier (see identity.rs); move it the first time
+                // we look and find nothing. Reading the old item shows
+                // the keychain dialog once more — its ACL names the old
+                // app identity — and never again after the move.
+                if let Ok(old) = Entry::new(crate::identity::OLD_ID, KEYRING_USER) {
+                    if let Ok(secret) = old.get_secret() {
+                        if secret.len() == KEYRING_KEY_LEN {
+                            entry.set_secret(&secret).map_err(|error| {
+                                format!("failed to save key in system credential store: {error}")
+                            })?;
+                            let _ = old.delete_credential();
+                            eprintln!("[identity] moved the cookie key to the new keychain item");
+                            return secret
+                                .try_into()
+                                .map_err(|_| "unreachable: length checked above".to_string());
+                        }
+                    }
+                }
                 let mut key = [0_u8; KEYRING_KEY_LEN];
                 rand::rngs::OsRng.fill_bytes(&mut key);
                 entry.set_secret(&key).map_err(|error| {
@@ -4321,10 +4341,17 @@ pub fn run() {
             }
         })
         .setup(move |app| {
-            // First thing, before anything can eprintln: from here on
-            // stderr lands in ~/Library/Logs/YTubic/ytubic.log with
-            // timestamps, however the app was launched.
+            // Before anything opens an identifier-derived path (the log
+            // redirect included): carry a pre-rename install's data over
+            // to the new bundle identifier. Returns its report instead
+            // of printing because stderr isn't captured yet.
+            let identity_report = identity::migrate(app.handle());
+            // From here on stderr lands in the app log with timestamps,
+            // however the app was launched.
             applog::init(app.handle());
+            for line in &identity_report {
+                eprintln!("[identity] {line}");
+            }
             let port = port_handle.clone();
             let token = token_handle.clone();
             let router = router_handle.clone();

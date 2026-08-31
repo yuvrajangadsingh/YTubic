@@ -28,9 +28,9 @@ pub fn init() {
         // Debug uses a distinct id so a dev run and an installed release don't
         // collide, and a dev-only Start Menu shortcut can carry it.
         #[cfg(not(debug_assertions))]
-        const AUMID: &str = "com.github.ivasy.ytubic";
+        const AUMID: &str = "com.github.yuvrajangadsingh.ytubic";
         #[cfg(debug_assertions)]
-        const AUMID: &str = "com.github.ivasy.ytubic.dev";
+        const AUMID: &str = "com.github.yuvrajangadsingh.ytubic.dev";
 
         use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
         let wide: Vec<u16> = AUMID.encode_utf16().chain(std::iter::once(0)).collect();
