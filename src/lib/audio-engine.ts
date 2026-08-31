@@ -818,11 +818,32 @@ export function useAudioEngine() {
         }
         if (usePlaybackStore.getState().playing) {
           void playLocal(el).catch((e) => {
-            // AbortError is what we get when a pending play() is
-            // interrupted by a new load (e.g. user clicked the next
-            // track before the current one started). It's harmless
-            // and should never surface to the user.
-            if (e?.name === "AbortError") return;
+            // AbortError from a NEW load (user skipped mid-start) is
+            // harmless: the token is stale and the next resolve owns
+            // playback. But WebKit also aborts a pending play() when
+            // the page goes hidden before playback starts, leaving the
+            // element paused with the store still wanting playback —
+            // proven in the log 2026-08-31 14:18:36: play() rejected
+            // AbortError on the visibility flip, canplay two seconds
+            // later, silence (the desktop-switch stall). The token
+            // still being current tells those cases apart. Starting
+            // while hidden is allowed (queue auto-advance does it), so
+            // retry once the element can play.
+            if (e?.name === "AbortError") {
+              if (token !== resolveTokenRef.current) return;
+              if (!usePlaybackStore.getState().playing) return;
+              appLog(
+                "play() aborted with track still current; retrying at canplay",
+              );
+              const retry = () => {
+                if (token !== resolveTokenRef.current) return;
+                if (!usePlaybackStore.getState().playing) return;
+                void playLocal(el).catch(() => {});
+              };
+              if (el.readyState >= 3) retry();
+              else el.addEventListener("canplay", retry, { once: true });
+              return;
+            }
             if (import.meta.env.DEV) {
               console.error("[audio] play() rejected:", e);
             }
