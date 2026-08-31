@@ -3108,6 +3108,16 @@ fn set_playback_activity(active: bool) {
     app_nap::set_active(active);
 }
 
+/// One line from the webview into the app log, prefixed `[web]`. The
+/// Dock-launched app has no console on that side either, and the
+/// desktop-switch stall (play requested, nothing happens) lives entirely
+/// in the media element, so its timeline has to reach the same
+/// timestamped file as the stream server's.
+#[tauri::command]
+fn frontend_log(line: String) {
+    eprintln!("[web] {}", line.chars().take(400).collect::<String>());
+}
+
 #[derive(Default)]
 struct StreamServerState {
     port: Arc<Mutex<Option<u16>>>,
@@ -4276,6 +4286,7 @@ pub fn run() {
             close_player_window,
             set_now_playing,
             set_playback_activity,
+            frontend_log,
             media::media_update,
             media::media_clear,
             discord::discord_update,

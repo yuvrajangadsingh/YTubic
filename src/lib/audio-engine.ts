@@ -20,6 +20,7 @@ import { fetchPanelDuration } from "@/lib/innertube/radio";
 import { pickThumbnail } from "@/components/shared/thumbnail";
 import { useLyricsSources } from "@/lib/lyrics/sources";
 import { correctedDuration, shouldSkipOutro } from "@/lib/outro";
+import { appLog, mediaState } from "@/lib/app-log";
 
 /**
  * AudioEngine binds the playback store to a singleton HTMLAudioElement and
@@ -76,7 +77,19 @@ function timeInBuffered(b: TimeRanges, t: number): boolean {
 
 function playLocal(el: HTMLMediaElement | null | undefined): Promise<void> {
   if (!el || isCasting()) return Promise.resolve();
-  return el.play();
+  // Every play() and its outcome go to the app log. A play() that neither
+  // resolves nor rejects is the desktop-switch stall's signature: the
+  // promise settles only when WebKit actually starts playback.
+  appLog(`play() ${mediaState(el)}`);
+  const p = el.play();
+  p.then(
+    () => appLog(`play() resolved ${mediaState(el)}`),
+    (e: unknown) => {
+      const err = e as { name?: string; message?: string } | undefined;
+      appLog(`play() rejected ${err?.name}: ${err?.message} ${mediaState(el)}`);
+    },
+  );
+  return p;
 }
 
 export function useAudioEngine() {
@@ -394,6 +407,36 @@ export function useAudioEngine() {
     const onWaiting = () => {
       // buffering — keep status as ready; don't flip to loading on every gap.
     };
+    // Element lifecycle into the app log, with the page's visibility on
+    // every line. The desktop-switch stall (Aug 2026: click play, change
+    // Space, silence) has resisted three fixes made without this
+    // timeline; the question is whether a hidden page ever reaches
+    // canplay, and this answers it.
+    const onLogged = (ev: Event) => {
+      const cur = store().queue[store().index];
+      appLog(`${ev.type} ${cur?.videoId ?? "-"} ${mediaState(el)}`);
+    };
+    const LOGGED = [
+      "playing",
+      "pause",
+      "waiting",
+      "stalled",
+      "suspend",
+      "canplay",
+      "error",
+    ];
+    // When the page comes back, the store may still want playback that
+    // never started while it was hidden. A repeated play() on an element
+    // whose earlier play() is still pending is a no-op, so this is safe
+    // even when WebKit was merely slow rather than blocked.
+    const onVisibility = () => {
+      appLog(`visibility ${document.visibilityState} ${mediaState(el)}`);
+      if (document.visibilityState !== "visible") return;
+      if (store().playing && el.paused && el.src && !videoHoldRef.current) {
+        appLog("resuming after visibility change");
+        void playLocal(el).catch(() => {});
+      }
+    };
 
     el.addEventListener("timeupdate", onTimeUpdate);
     el.addEventListener("durationchange", onDurationChange);
@@ -404,6 +447,8 @@ export function useAudioEngine() {
     el.addEventListener("error", onError);
     el.addEventListener("playing", onPlaying);
     el.addEventListener("waiting", onWaiting);
+    for (const t of LOGGED) el.addEventListener(t, onLogged);
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       el.removeEventListener("timeupdate", onTimeUpdate);
       el.removeEventListener("durationchange", onDurationChange);
@@ -414,6 +459,8 @@ export function useAudioEngine() {
       el.removeEventListener("error", onError);
       el.removeEventListener("playing", onPlaying);
       el.removeEventListener("waiting", onWaiting);
+      for (const t of LOGGED) el.removeEventListener(t, onLogged);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, []);
 
@@ -753,6 +800,7 @@ export function useAudioEngine() {
           );
         }
         el.load();
+        appLog(`src set ${videoId ?? "-"} ${mediaState(el)}`);
         const hold = videoHoldRef.current;
         if (hold && hold.token === token) {
           el.addEventListener(
@@ -770,11 +818,32 @@ export function useAudioEngine() {
         }
         if (usePlaybackStore.getState().playing) {
           void playLocal(el).catch((e) => {
-            // AbortError is what we get when a pending play() is
-            // interrupted by a new load (e.g. user clicked the next
-            // track before the current one started). It's harmless
-            // and should never surface to the user.
-            if (e?.name === "AbortError") return;
+            // AbortError from a NEW load (user skipped mid-start) is
+            // harmless: the token is stale and the next resolve owns
+            // playback. But WebKit also aborts a pending play() when
+            // the page goes hidden before playback starts, leaving the
+            // element paused with the store still wanting playback —
+            // proven in the log 2026-08-31 14:18:36: play() rejected
+            // AbortError on the visibility flip, canplay two seconds
+            // later, silence (the desktop-switch stall). The token
+            // still being current tells those cases apart. Starting
+            // while hidden is allowed (queue auto-advance does it), so
+            // retry once the element can play.
+            if (e?.name === "AbortError") {
+              if (token !== resolveTokenRef.current) return;
+              if (!usePlaybackStore.getState().playing) return;
+              appLog(
+                "play() aborted with track still current; retrying at canplay",
+              );
+              const retry = () => {
+                if (token !== resolveTokenRef.current) return;
+                if (!usePlaybackStore.getState().playing) return;
+                void playLocal(el).catch(() => {});
+              };
+              if (el.readyState >= 3) retry();
+              else el.addEventListener("canplay", retry, { once: true });
+              return;
+            }
             if (import.meta.env.DEV) {
               console.error("[audio] play() rejected:", e);
             }
