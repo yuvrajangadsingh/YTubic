@@ -1,6 +1,10 @@
 import { fetchSearch } from "./search";
 import { fetchRadio } from "./radio";
-import { normalizeForMatch, normalizeKeepingQualifiers, tokenOverlap } from "@/lib/lyrics/match";
+import {
+  normalizeForMatch,
+  normalizeKeepingQualifiers,
+  tokenOverlap,
+} from "@/lib/lyrics/match";
 import type { SourceKind } from "@/lib/store/track-source";
 import type { MinimalArtist, ShelfItemKind } from "./types";
 
@@ -24,7 +28,10 @@ export function artistSignal(track: {
   artists?: MinimalArtist[];
   subtitle?: string;
 }): string {
-  const parsed = track.artists?.map((a) => a.name).join(" ").trim();
+  const parsed = track.artists
+    ?.map((a) => a.name)
+    .join(" ")
+    .trim();
   if (parsed) return parsed;
   const subtitle = track.subtitle?.trim();
   if (!subtitle) return "";
@@ -139,7 +146,22 @@ export function alternateCandidateOk(
   // with the duration window below still doing the real gatekeeping.
   const titleContained =
     reqTitle.length >= 5 && ` ${hitTitle} `.includes(` ${reqTitle} `);
-  if (!titleExact && !titleContained && tokenOverlap(reqTitle, hitTitle) < 0.6)
+  // The overlap fallback compares the SONG part of each title. Mashup and
+  // remix channels name every upload "<song> x <artist> x <channel> Remix",
+  // so two different songs share six of nine tokens and score 0.67 on the
+  // raw titles: "Gori Gall x Surjit Bindrakhia x Bai G Remix" (3:09) took
+  // "Boliyan x Surjit Bindrakhia x Bai G x Remix" (6:15) as its video on
+  // 2026-09-02. The artist gate below already checks the names; the title
+  // gate must not be won by them, so they and the bare connectors come out
+  // before the overlap is scored. Exact and contained matches are untouched.
+  if (
+    !titleExact &&
+    !titleContained &&
+    tokenOverlap(
+      withoutArtistTokens(reqTitle, track, item),
+      withoutArtistTokens(hitTitle, track, item),
+    ) < 0.6
+  )
     return false;
 
   // The artist has to be named on BOTH sides. Treating an unnamed artist
@@ -148,8 +170,7 @@ export function alternateCandidateOk(
   const reqArtists = normalizeForMatch(artistSignal(track));
   if (!reqArtists) return false;
   const hitArtists = normalizeForMatch(artistSignal(item));
-  const bylineAgrees =
-    !!hitArtists && tokenOverlap(reqArtists, hitArtists) > 0;
+  const bylineAgrees = !!hitArtists && tokenOverlap(reqArtists, hitArtists) > 0;
   // Label and fan channels put the artist in the TITLE, not the byline:
   // the byline is the uploading channel ("Troll Punjabi"), which never
   // overlaps the artist and used to fail every such upload. When the
@@ -175,7 +196,55 @@ export function alternateCandidateOk(
   } else {
     if (delta < -240 || delta > 45) return false;
   }
+  // The absolute window alone is calibrated for long songs: +240s is a
+  // real intro/outro margin on an eight-minute track and nearly a doubling
+  // on a three-minute one (the 3:09 -> 6:15 case above passed it at +186).
+  // The longer side may exceed the shorter by half again plus 30s, and no
+  // more. A counterpart that fails this is a different cut of the song, not
+  // a video of it, and no swap beats a wrong swap.
+  const [shorter, longer] =
+    item.duration >= track.duration
+      ? [track.duration, item.duration]
+      : [item.duration, track.duration];
+  if (longer > shorter * 1.5 + 30) return false;
   return true;
+}
+
+/** Bare joiners in mashup titles ("A x B", "A ft B"); never identity. */
+const CONNECTOR_TOKENS = new Set([
+  "x",
+  "ft",
+  "feat",
+  "featuring",
+  "with",
+  "vs",
+]);
+
+/**
+ * A normalized title with every credited artist name and every connector
+ * token removed, so the overlap fallback scores the song, not the byline.
+ * Falls back to the full title when stripping would leave nothing: a title
+ * that IS an artist name ("Sidhu Moose Wala") still has to be compared.
+ */
+function withoutArtistTokens(
+  normalizedTitle: string,
+  track: { artists?: MinimalArtist[]; subtitle?: string },
+  item: { artists?: MinimalArtist[]; subtitle?: string },
+): string {
+  const drop = new Set(CONNECTOR_TOKENS);
+  for (const name of [
+    artistSignal(track),
+    artistSignal(item),
+    ...(track.artists ?? []).map((a) => a.name),
+    ...(item.artists ?? []).map((a) => a.name),
+  ]) {
+    for (const t of normalizeForMatch(name).split(/\s+/)) if (t) drop.add(t);
+  }
+  const kept = normalizedTitle
+    .split(/\s+/)
+    .filter((t) => t && !drop.has(t))
+    .join(" ");
+  return kept || normalizedTitle;
 }
 
 /**
