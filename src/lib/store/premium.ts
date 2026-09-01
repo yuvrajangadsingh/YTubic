@@ -1,8 +1,11 @@
 import { useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
-import { fetchPremiumStatus, type PremiumStatus } from "@/lib/innertube/account";
+import type { PremiumStatus } from "@/lib/innertube/account";
+import {
+  authLoggedInQuery,
+  premiumStatusQuery,
+} from "@/lib/store/auth-queries";
 
 type State = {
   /**
@@ -53,23 +56,14 @@ export function isPremium(): boolean {
  * a network round-trip.
  */
 export function usePremiumStatusSync(): void {
-  const loggedIn = useQuery({
-    queryKey: ["auth-logged-in"],
-    queryFn: () => invoke<boolean>("is_logged_in"),
-    staleTime: 30_000,
-  });
-
-  const premium = useQuery({
-    queryKey: ["premium-status"],
-    queryFn: fetchPremiumStatus,
-    enabled: loggedIn.data === true,
-    // Premium membership doesn't churn within a session — 30 min is fine
-    // and saves an extra account_menu hit on every settings visit.
-    staleTime: 30 * 60 * 1000,
-    retry: false,
-  });
+  const loggedIn = useQuery(authLoggedInQuery);
+  const premium = useQuery(premiumStatusQuery(loggedIn.data === true));
 
   useEffect(() => {
+    // Only an authoritative "signed out" clears the status. `undefined`
+    // covers both "still checking" and "the check failed", and a failed
+    // check must not downgrade a paying user: `null` here shuts off
+    // caching and arms the Premium gate on every track.
     if (loggedIn.data === false) {
       usePremiumStore.setState({ status: null });
       return;

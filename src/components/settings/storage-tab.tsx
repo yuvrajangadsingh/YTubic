@@ -37,6 +37,7 @@ import { formatBytes, formatDateTime, formatRelative } from "@/lib/format";
 import { fetchLibraryTracks } from "@/lib/innertube/library";
 import { clearPrefetchMemo } from "@/lib/stream";
 import { usePremiumStore } from "@/lib/store/premium";
+import { authLoggedInQuery } from "@/lib/store/auth-queries";
 import {
   useSettingsStore,
   type CacheAutoCleanPeriod,
@@ -45,11 +46,7 @@ import type { ShelfItem } from "@/lib/innertube/types";
 import { cn } from "@/lib/utils";
 
 export function StorageTab() {
-  const loggedIn = useQuery({
-    queryKey: ["auth-logged-in"],
-    queryFn: () => invoke<boolean>("is_logged_in"),
-    staleTime: 30_000,
-  });
+  const loggedIn = useQuery(authLoggedInQuery);
 
   return (
     <>

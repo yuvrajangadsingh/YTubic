@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { AlertCircleIcon, Loader2Icon, LogInIcon } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
 import { AnimatedTabs } from "@/components/ui/animated-tabs";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -20,6 +19,7 @@ import {
   type PlaylistFirstPage,
   type PlaylistNextPage,
 } from "@/lib/innertube/playlist";
+import { authLoggedInQuery } from "@/lib/store/auth-queries";
 import { openSettings } from "@/lib/store/settings-dialog";
 
 export const Route = createFileRoute("/library")({
@@ -27,11 +27,7 @@ export const Route = createFileRoute("/library")({
 });
 
 function LibraryPage() {
-  const loggedIn = useQuery({
-    queryKey: ["auth-logged-in"],
-    queryFn: () => invoke<boolean>("is_logged_in"),
-    staleTime: 30_000,
-  });
+  const loggedIn = useQuery(authLoggedInQuery);
 
   const [tab, setTab] = useState("playlists");
 

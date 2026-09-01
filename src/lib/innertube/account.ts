@@ -8,9 +8,12 @@ export type AccountInfo = {
 
 /**
  * Tri-state Premium signal:
- *  - null      → user is not signed in (or account_menu failed)
+ *  - null      → user is not signed in
  *  - "free"    → signed in, no Premium subscription detected
  *  - "premium" → signed in, Premium subscription detected
+ *
+ * A failed check is NOT `null`: it rejects, so the caller can hold the
+ * last known status instead of downgrading a paying user to Free.
  */
 export type PremiumStatus = null | "free" | "premium";
 
@@ -19,18 +22,27 @@ export type PremiumStatus = null | "free" | "premium";
  * `account/account_menu`. Anonymous calls return a generic sign-in
  * popup with no `activeAccountHeaderRenderer` — we treat that as
  * "not signed in" and return null.
+ *
+ * Nothing here is caught on purpose. A transport, IPC or keychain
+ * failure has to reach the caller as a rejection: swallowing it into
+ * `null` made a dropped connection indistinguishable from Google
+ * answering "anonymous", and the sidebar then offered a Sign in button
+ * to a user who had been signed in the whole time. `auth: "required"`
+ * closes the other half of that hole, where an unreadable jar sends the
+ * probe out anonymous and the anonymous menu comes back as proof.
  */
 export async function fetchAccountInfo(): Promise<AccountInfo | null> {
-  let json: YtNode;
-  try {
-    json = await innertubePost("account/account_menu", {});
-  } catch {
-    return null;
-  }
+  const json: YtNode = await innertubePost(
+    "account/account_menu",
+    {},
+    { auth: "required" },
+  );
 
   const header: YtNode | undefined =
     json?.actions?.[0]?.openPopupAction?.popup?.multiPageMenuRenderer?.header
       ?.activeAccountHeaderRenderer;
+  // Past this line `null` carries one meaning: Google answered, and the
+  // answer was anonymous.
   if (!header) return null;
 
   const readText = (node: YtNode | undefined): string =>
@@ -45,7 +57,10 @@ export async function fetchAccountInfo(): Promise<AccountInfo | null> {
   const photos: YtNode[] = header.accountPhoto?.thumbnails ?? [];
   const photoUrl = photos[photos.length - 1]?.url as string | undefined;
 
-  if (!name && !email) return null;
+  // An active-account header with no readable labels is a parse miss on
+  // an authenticated response, not a sign-out. Returning null here used
+  // to demote a live session to "anonymous"; hand back what we have and
+  // let callers fall back to the stored meta for the empty fields.
   return { name, email, photoUrl };
 }
 
@@ -65,15 +80,16 @@ export async function fetchAccountInfo(): Promise<AccountInfo | null> {
  *     lock paying users out of caching when our patterns drift.
  *
  * Returns `null` when not signed in so the caller can show the right
- * gate ("sign in" vs "upgrade").
+ * gate ("sign in" vs "upgrade"). Rejects (rather than returning null)
+ * when the call fails: `null` opens the Premium gate on every track, so
+ * a dropped connection must not be able to produce it.
  */
 export async function fetchPremiumStatus(): Promise<PremiumStatus> {
-  let json: YtNode;
-  try {
-    json = await innertubePost("account/account_menu", {});
-  } catch {
-    return null;
-  }
+  const json: YtNode = await innertubePost(
+    "account/account_menu",
+    {},
+    { auth: "required" },
+  );
 
   const popup: YtNode | undefined =
     json?.actions?.[0]?.openPopupAction?.popup?.multiPageMenuRenderer;
