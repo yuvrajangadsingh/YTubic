@@ -7,6 +7,8 @@
  * Kept dependency-free (no Tauri imports) so it's unit-testable.
  */
 
+import { cleanTrackTitle } from "@/lib/track-meta";
+
 /** Normalize a title/artist for fuzzy comparison: drop parentheticals,
  *  featurings, and punctuation; lowercase; collapse whitespace. */
 /** Like normalizeForMatch but KEEPS parenthetical qualifiers (remix,
@@ -29,6 +31,24 @@ export function normalizeForMatch(s: string): string {
     .replace(/\bfeat\.?\b.*$/i, " ")
     .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim();
+}
+
+/**
+ * Normalize a TITLE for comparison, stripping upload furniture first.
+ *
+ * `normalizeForMatch` already drops bracketed text, so this only differs for
+ * furniture that sits OUTSIDE brackets — the "Saajna - Official Video"
+ * shape, and the CJK bracket families NFKC leaves alone. Apply it to the
+ * candidate as well as the request: lyric databases are largely scraped from
+ * the same YouTube metadata, so they hold rows literally titled "Marshmello
+ * - Alone (Official Music Video)", and a correct record should not lose to a
+ * wrong one over the uploader's decoration.
+ *
+ * Symmetric by design. Cleaning only one side would break the tracks that
+ * currently match precisely BECAUSE both sides carry the same decoration.
+ */
+export function normalizeTitleForMatch(title: string): string {
+  return normalizeForMatch(cleanTrackTitle(title));
 }
 
 /** Jaccard similarity: shared tokens over the UNION of both sets (0..1).
