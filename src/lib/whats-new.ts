@@ -55,6 +55,51 @@ export type WhatsNewEntry = {
  */
 export const WHATS_NEW: WhatsNewEntry[] = [
   {
+    version: "0.4.4",
+    date: "September 2, 2026",
+    summary:
+      "Video up to 4K, lyrics that actually arrive, and staying signed in",
+    changes: [
+      {
+        type: "new",
+        title: "Video up to 4K",
+        text: "Videos start playing while they download instead of after, and the player can seek into a file that is still arriving. 1440p and 4K, which used to pull the whole file and then show nothing, play properly now.",
+      },
+      {
+        type: "new",
+        title: "YouTube Music's own lyrics",
+        text: "Synced lyrics come from YouTube Music first, matched by the track itself rather than by its title, so they cannot be another song's words. The other sources are still there behind it, and one of them, LRCLIB, is reachable for the first time in an installed build.",
+      },
+      {
+        type: "fixed",
+        title: "Top quality audio from a normal launch",
+        text: "The 271 kbps tier from 0.4.2 only worked when the app was started from a terminal. Launched from the Dock it silently fell back to 130 kbps. It is the top tier every time now.",
+      },
+      {
+        type: "fixed",
+        title: "Songs going silent when you switched desktops",
+        text: "Click a track, switch desktops while it loads, and it never started. The player now notices and starts it the moment the audio is ready, wherever you are.",
+      },
+      {
+        type: "fixed",
+        title: "Staying signed in",
+        text: "The session refresh used to stop counting while the Mac slept, so a closed lid could leave the account stale for hours. It now keeps proper time, saves the account safely so an interrupted write cannot read as signed out, and a network blip no longer shows a sign-in button to a signed-in user.",
+      },
+      {
+        type: "fixed",
+        title: "Library cut off at about 25",
+        text: "Playlists, saved albums and followed artists past the first page were simply missing, in the Library and in the Add to playlist menu. The whole library loads now.",
+      },
+      {
+        type: "improved",
+        title: "Smaller things",
+        text: "The Go to video option finds official videos with packaged titles. Opening the queue while a video plays no longer flashes it. The fullscreen player no longer leaves a gap where the window buttons would be. Cover art accents are calmer. The app keeps its own timestamped log in Library/Logs for bug reports.",
+      },
+    ],
+    alert:
+      "This version moves the app to its own identity. On first launch your data, sign-in and cache carry over automatically, and macOS may ask once about keychain access: click Always Allow.",
+  },
+  {
     version: "0.4.3",
     date: "August 27, 2026",
     summary: "Collapsed sidebar tells you what things are",
