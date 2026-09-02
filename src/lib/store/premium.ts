@@ -1,8 +1,11 @@
 import { useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
-import { fetchPremiumStatus, type PremiumStatus } from "@/lib/innertube/account";
+import type { PremiumStatus } from "@/lib/innertube/account";
+import {
+  authLoggedInQuery,
+  premiumStatusQuery,
+} from "@/lib/store/auth-queries";
 
 type State = {
   /**
@@ -13,6 +16,28 @@ type State = {
   setStatus: (status: PremiumStatus) => void;
 };
 
+/**
+ * Premium-status state shared across React and non-React code. The
+ * `audio-engine` + `stream.ts` modules consult this synchronously via
+ * `usePremiumStore.getState()` to decide whether playback is allowed
+ * and whether to fire prefetches.
+ *
+ * The actual fetching/refresh is owned by the `usePremiumStatusSync`
+ * hook mounted in AppShell. Keeping the store dumb means anyone with a
+ * cached value (e.g. a freshly opened floating-player window) starts
+ * from the conservative `null` and only flips to "premium" once the
+ * authoritative check completes.
+ *
+ * Nothing is persisted: `status` is rederived on every launch so a
+ * Premium → Free downgrade outside the app takes effect on the next
+ * start. There is deliberately NO user-facing override: playback
+ * itself is Premium-gated, so a manual "I have Premium" switch would
+ * be a one-click bypass of the gate. Misdetection is covered by
+ * fetchPremiumStatus failing open to "premium" when its patterns
+ * don't match, plus the Re-check button on the Storage tab. (An
+ * override used to exist and was persisted under the "ytm-premium"
+ * localStorage key; that key is now simply ignored.)
+ */
 export const usePremiumStore = create<State>()((set) => ({
   status: null,
   setStatus: (status) => set({ status }),
@@ -31,23 +56,14 @@ export function isPremium(): boolean {
  * a network round-trip.
  */
 export function usePremiumStatusSync(): void {
-  const loggedIn = useQuery({
-    queryKey: ["auth-logged-in"],
-    queryFn: () => invoke<boolean>("is_logged_in"),
-    staleTime: 30_000,
-  });
-
-  const premium = useQuery({
-    queryKey: ["premium-status"],
-    queryFn: fetchPremiumStatus,
-    enabled: loggedIn.data === true,
-    // Premium membership doesn't churn within a session — 30 min is fine
-    // and saves an extra account_menu hit on every settings visit.
-    staleTime: 30 * 60 * 1000,
-    retry: false,
-  });
+  const loggedIn = useQuery(authLoggedInQuery);
+  const premium = useQuery(premiumStatusQuery(loggedIn.data === true));
 
   useEffect(() => {
+    // Only an authoritative "signed out" clears the status. `undefined`
+    // covers both "still checking" and "the check failed", and a failed
+    // check must not downgrade a paying user: `null` here shuts off
+    // caching and arms the Premium gate on every track.
     if (loggedIn.data === false) {
       usePremiumStore.setState({ status: null });
       return;

@@ -1,10 +1,24 @@
-import { innertubePost, rawBrowse, type YtNode } from "./shared";
+import {
+  collectContinuationItems,
+  innertubePost,
+  rawBrowse,
+  readPagingToken,
+  type YtNode,
+} from "./shared";
 
 /**
  * Mutating InnerTube actions (likes + playlist edits). All require the
  * authenticated cookie jar populated by Settings → Sign in; anonymous
  * calls succeed HTTP-wise but don't persist anywhere.
  */
+
+/**
+ * Which is why every call below is `auth: "required"`: a jar that can't
+ * be read has to fail loudly here. Downgrading to anonymous would make
+ * the request answer 200, write nothing, and leave an optimistic UI
+ * showing an edit that never happened.
+ */
+const AUTHED = { auth: "required" } as const;
 
 export type LikeStatus = "LIKE" | "DISLIKE" | "INDIFFERENT";
 
@@ -13,7 +27,7 @@ async function rate(
   videoId: string,
 ): Promise<void> {
   try {
-    const resp = await innertubePost(endpoint, { target: { videoId } });
+    const resp = await innertubePost(endpoint, { target: { videoId } }, AUTHED);
     if (import.meta.env.DEV) {
       console.debug(`[mutations] ${endpoint} ${videoId} →`, resp);
     }
@@ -57,11 +71,15 @@ export type UserPlaylist = {
  * editable via `browse/edit_playlist`.
  */
 export async function fetchUserPlaylists(): Promise<UserPlaylist[]> {
-  const json = await rawBrowse("FEmusic_liked_playlists");
+  // Also AUTHED: anonymous this browse returns the generic explore page,
+  // which parses cleanly to zero playlists and tells the "Add to
+  // playlist" picker the user has none.
+  const json = await rawBrowse("FEmusic_liked_playlists", undefined, AUTHED);
   const tabs: YtNode[] =
     json?.contents?.singleColumnBrowseResultsRenderer?.tabs ?? [];
-  const sections: YtNode[] =
-    tabs[0]?.tabRenderer?.content?.sectionListRenderer?.contents ?? [];
+  const sectionList: YtNode | undefined =
+    tabs[0]?.tabRenderer?.content?.sectionListRenderer;
+  const sections: YtNode[] = sectionList?.contents ?? [];
 
   const out: UserPlaylist[] = [];
   for (const section of sections) {
@@ -69,7 +87,17 @@ export async function fetchUserPlaylists(): Promise<UserPlaylist[]> {
       section?.gridRenderer ??
       section?.musicShelfRenderer ??
       section?.musicCarouselShelfRenderer;
-    const items: YtNode[] = shelf?.items ?? shelf?.contents ?? [];
+    const firstPage: YtNode[] = shelf?.items ?? shelf?.contents ?? [];
+    // The shelf is paged at ~25 rows, so an owner of 30+ playlists would
+    // otherwise find the "Add to playlist" submenu missing everything past
+    // the first page.
+    const token =
+      readPagingToken(shelf) ??
+      (sections.length === 1 ? readPagingToken(sectionList) : undefined);
+    const items: YtNode[] = [
+      ...firstPage,
+      ...(await collectContinuationItems(token, AUTHED)),
+    ];
     for (const raw of items) {
       const r =
         raw?.musicTwoRowItemRenderer ??
@@ -138,10 +166,14 @@ export async function addToPlaylist(
   playlistId: string,
   videoId: string,
 ): Promise<void> {
-  const json = await innertubePost("browse/edit_playlist", {
-    playlistId,
-    actions: [{ action: "ACTION_ADD_VIDEO", addedVideoId: videoId }],
-  });
+  const json = await innertubePost(
+    "browse/edit_playlist",
+    {
+      playlistId,
+      actions: [{ action: "ACTION_ADD_VIDEO", addedVideoId: videoId }],
+    },
+    AUTHED,
+  );
   // edit_playlist returns HTTP 200 even when it rejects the edit (not the
   // owner, stale cookies, …) — surface the envelope status so the
   // optimistic "Added to <playlist>" toast doesn't lie.
@@ -162,16 +194,20 @@ export async function removeFromPlaylist(
   videoId: string,
   setVideoId: string,
 ): Promise<void> {
-  const json = await innertubePost("browse/edit_playlist", {
-    playlistId,
-    actions: [
-      {
-        action: "ACTION_REMOVE_VIDEO",
-        removedVideoId: videoId,
-        setVideoId,
-      },
-    ],
-  });
+  const json = await innertubePost(
+    "browse/edit_playlist",
+    {
+      playlistId,
+      actions: [
+        {
+          action: "ACTION_REMOVE_VIDEO",
+          removedVideoId: videoId,
+          setVideoId,
+        },
+      ],
+    },
+    AUTHED,
+  );
   const status = json?.status as string | undefined;
   if (status && status !== "STATUS_SUCCEEDED") {
     throw new Error(`edit_playlist failed: ${status}`);
@@ -187,11 +223,15 @@ export async function createPlaylistWithTrack(
   title: string,
   videoId: string,
 ): Promise<string> {
-  const json = await innertubePost("playlist/create", {
-    title,
-    videoIds: [videoId],
-    privacyStatus: "PRIVATE",
-  });
+  const json = await innertubePost(
+    "playlist/create",
+    {
+      title,
+      videoIds: [videoId],
+      privacyStatus: "PRIVATE",
+    },
+    AUTHED,
+  );
   const id: string | undefined =
     (json?.playlistId as string | undefined) ??
     (json?.response?.playlistId as string | undefined);

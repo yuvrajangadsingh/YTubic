@@ -1,8 +1,8 @@
 [package]
 name = "ytubic"
-version = "0.4.3"
+version = "0.4.4"
 description = "YTubic — fast, responsive YouTube Music desktop client"
-authors = ["George Shyshov"]
+authors = ["Yuvraj Angad Singh"]
 license = "GPL-3.0-only"
 edition = "2021"
 
@@ -45,6 +45,9 @@ tauri-plugin-shell = "2"
 reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
 urlencoding = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "process", "sync", "net"] }
+# ReceiverStream bridges an mpsc receiver to a hyper Body for the
+# range-proxy's tail-following 200 responses (stream_proxy.rs).
+tokio-stream = "0.1"
 axum = "0.7"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 tower = "0.5"
@@ -83,6 +86,9 @@ md5 = "0.7"
 mdns-sd = "0.20"
 # NB: the package is `rust_cast` with an underscore, not a hyphen.
 rust_cast = "0.21"
+# stderr redirection for the always-on app log (see applog.rs): pipe/dup2
+# and localtime_r. Already in the tree transitively.
+libc = "0.2"
 # Not used directly for TLS — declared only so we can name a crypto provider
 # at startup. rustls arrives transitively with BOTH `ring` and `aws-lc-rs`
 # enabled (feature unification across reqwest and rust_cast), and in that state

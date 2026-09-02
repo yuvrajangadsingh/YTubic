@@ -94,7 +94,12 @@ describe("alternateCandidateOk", () => {
   it("takes a genuine counterpart", () => {
     expect(
       alternateCandidateOk(
-        { videoId: "song-id", title: "Yezdi", subtitle: "Nanku", duration: 147 },
+        {
+          videoId: "song-id",
+          title: "Yezdi",
+          subtitle: "Nanku",
+          duration: 147,
+        },
         {
           kind: "video",
           id: "video-id",
@@ -110,7 +115,12 @@ describe("alternateCandidateOk", () => {
   it("still refuses a counterpart in a different league", () => {
     expect(
       alternateCandidateOk(
-        { videoId: "song-id", title: "Yezdi", subtitle: "Nanku", duration: 147 },
+        {
+          videoId: "song-id",
+          title: "Yezdi",
+          subtitle: "Nanku",
+          duration: 147,
+        },
         {
           kind: "video",
           id: "mix-id",
@@ -163,5 +173,192 @@ describe("cleanAudioSwapOk", () => {
     expect(cleanAudioSwapOk("song", undefined, 232)).toBe(false);
     expect(cleanAudioSwapOk("song", 465, undefined)).toBe(false);
     expect(cleanAudioSwapOk("song", 465, 45)).toBe(false);
+  });
+});
+
+// Real-world uploads: label/fan channels title the video
+// "Song (Official Video) | Artist | Album | Year" and the byline is the
+// CHANNEL, not the artist. Strings below are live payloads (Aug 2026).
+describe("alternateCandidateOk on channel uploads", () => {
+  const zaalmaSong = {
+    videoId: "x27KMVtjgeI",
+    title: "Zaalma",
+    artists: [{ name: "Pukhraj Bhalla" }],
+    duration: 255, // 4:15
+  };
+
+  it("accepts the official upload with a packaged title and channel byline", () => {
+    expect(
+      alternateCandidateOk(
+        zaalmaSong,
+        {
+          kind: "video",
+          id: "VnEJ86-9a38",
+          title:
+            "Zaalma (Full Song) | Pukhraj Bhalla ft JT Bhatti & Kru172 | YJKD | New Punjabi Song 2018",
+          subtitle: "Troll Punjabi • 10M views • 4:15",
+          duration: 255,
+        },
+        "video",
+      ),
+    ).toBe(true);
+  });
+
+  it("still rejects a different song that merely names the artist", () => {
+    expect(
+      alternateCandidateOk(
+        zaalmaSong,
+        {
+          kind: "video",
+          id: "EbUq23paEjM",
+          title: "Dil Haare - Pukhraj Bhalla | JT Beats",
+          subtitle: "Troll Punjabi • 4.8M views • 3:59",
+          duration: 239,
+        },
+        "video",
+      ),
+    ).toBe(false);
+  });
+
+  it("still rejects when the duration is in a different league", () => {
+    expect(
+      alternateCandidateOk(
+        zaalmaSong,
+        {
+          kind: "video",
+          id: "longmix",
+          title: "Zaalma | Pukhraj Bhalla nonstop mix",
+          subtitle: "Some Channel • 1M views • 32:10",
+          duration: 1930,
+        },
+        "video",
+      ),
+    ).toBe(false);
+  });
+
+  it("still rejects a candidate with no duration to check", () => {
+    expect(
+      alternateCandidateOk(
+        zaalmaSong,
+        {
+          kind: "video",
+          id: "-Chif1XK2e8",
+          title: "Pukhraj Bhalla - Zaalma (Lyrics)",
+          subtitle: "Lyrics Hub",
+          duration: undefined,
+        },
+        "video",
+      ),
+    ).toBe(false);
+  });
+
+  it("short titles cannot ride containment past the length guard", () => {
+    expect(
+      alternateCandidateOk(
+        {
+          videoId: "a",
+          title: "Om",
+          artists: [{ name: "Karan Aujla" }],
+          duration: 180,
+        },
+        {
+          kind: "video",
+          id: "b",
+          title: "Om Shanti Om full movie Karan Aujla reaction",
+          subtitle: "Some Channel • 3:05",
+          duration: 185,
+        },
+        "video",
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("alternateCandidateOk on sibling uploads from one mashup channel", () => {
+  // Real case, 2026-09-02: the finder took a different song from the same
+  // channel because the titles share the whole "x artist x channel Remix"
+  // suffix and +186s sat inside the absolute window.
+  const goriGall = {
+    videoId: "TprIB5AO41Q",
+    title: "Gori Gall x Surjit Bindrakhia x Bai G Remix",
+    artists: [{ name: "bai g" }],
+    duration: 189, // 3:09
+  };
+
+  it("rejects a sibling mashup whose title only shares the artist suffix", () => {
+    expect(
+      alternateCandidateOk(
+        goriGall,
+        {
+          kind: "video",
+          id: "zuUo38LCVhE",
+          title: "Boliyan x Surjit Bindrakhia x Bai G x Remix",
+          subtitle: "Bai G \u2022 1.2M views \u2022 6:15",
+          artists: [{ name: "Bai G" }],
+          duration: 375, // 6:15
+        },
+        "video",
+      ),
+    ).toBe(false);
+  });
+
+  it("still takes the same song's own video with a packaged title", () => {
+    expect(
+      alternateCandidateOk(
+        goriGall,
+        {
+          kind: "video",
+          id: "official",
+          title: "Gori Gall x Surjit Bindrakhia x Bai G Remix (Official Video)",
+          subtitle: "Bai G \u2022 900K views \u2022 3:25",
+          artists: [{ name: "Bai G" }],
+          duration: 205,
+        },
+        "video",
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a counterpart that is half again as long even inside the +240s window", () => {
+    expect(
+      alternateCandidateOk(
+        {
+          videoId: "z",
+          title: "Zaalma",
+          artists: [{ name: "Pukhraj Bhalla" }],
+          duration: 255,
+        },
+        {
+          kind: "video",
+          id: "extended",
+          title: "Zaalma (Full Song) | Pukhraj Bhalla | Extended",
+          subtitle: "Troll Punjabi \u2022 7:50",
+          duration: 470, // +215s, but 1.84x
+        },
+        "video",
+      ),
+    ).toBe(false);
+  });
+
+  it("a title that is only an artist name is still compared as a title", () => {
+    expect(
+      alternateCandidateOk(
+        {
+          videoId: "s",
+          title: "Sidhu Moose Wala",
+          artists: [{ name: "Sidhu Moose Wala" }],
+          duration: 200,
+        },
+        {
+          kind: "video",
+          id: "v",
+          title: "Sidhu Moose Wala (Official Video)",
+          subtitle: "Sidhu Moose Wala \u2022 3:30",
+          artists: [{ name: "Sidhu Moose Wala" }],
+          duration: 210,
+        },
+        "video",
+      ),
+    ).toBe(true);
   });
 });

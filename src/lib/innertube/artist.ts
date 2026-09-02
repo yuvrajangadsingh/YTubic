@@ -94,5 +94,6 @@ export async function setArtistSubscribed(
   await innertubePost(
     subscribed ? "subscription/subscribe" : "subscription/unsubscribe",
     { channelIds: [channelId] },
+    { auth: "required" },
   );
 }

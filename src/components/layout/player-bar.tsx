@@ -671,6 +671,61 @@ export type PlayerBarVariant = "right" | "floating";
 
 const COMPACT_PLAYER_CONTROLS_WIDTH = 336;
 
+/** Album art with its drag handle and the video-startup hold loader.
+ *  Extracted from PlayerBar's cover branch; video tracks never reach
+ *  this — the persistent hoisted surface owns those frames. */
+function CoverArt({
+  track,
+  variant,
+  iTunesCover,
+  videoStartup,
+  onCoverPointerDown,
+}: {
+  track: QueueTrack | undefined;
+  variant: PlayerBarVariant;
+  iTunesCover: string | null;
+  videoStartup: "idle" | "waiting" | "ready" | "fallback";
+  onCoverPointerDown: React.PointerEventHandler<HTMLElement>;
+}) {
+  return (
+    <div
+      onPointerDown={onCoverPointerDown}
+      className={cn(
+        "mx-auto w-full touch-none select-none",
+        variant === "floating" && "max-w-[20rem]",
+        variant !== "floating" && "cursor-grab active:cursor-grabbing",
+      )}
+    >
+      {track ? (
+        <div className="pointer-events-none relative">
+          <Thumbnail
+            thumbnails={track.thumbnails}
+            alt={track.title}
+            className="aspect-square w-full rounded-md border border-hairline pointer-events-none"
+            targetSize={1024}
+            highRes
+            overrideHighRes={iTunesCover}
+          />
+          {/* Playback is held until the video is ready (loader in the
+              middle of the art, YouTube style). "waiting" only; a
+              fallback start must not leave a stuck loader. */}
+          {videoStartup === "waiting" ? (
+            <div className="absolute inset-0 flex items-center justify-center">
+              <div className="flex items-center gap-1.5 rounded-full border border-hairline bg-black/55 px-3 py-1.5 text-xs font-medium text-white/85 backdrop-blur-md">
+                <Loader2Icon className="size-3.5 animate-spin" />
+                loading video
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : (
+        <div className="aspect-square w-full rounded-md border border-hairline bg-muted" />
+      )}
+    </div>
+  );
+}
+
+
 export function PlayerBar({
   variant = "right",
 }: {
@@ -798,6 +853,47 @@ export function PlayerBar({
           suppresses an opening fade on first mount — the player
           opens with the cover already visible, no need to animate it
           in from blank. */}
+      {/* The video surface lives OUTSIDE the queue/cover branch switch.
+          It used to be mounted inside whichever branch was showing, and
+          mode="wait" fully unmounts the old branch before the new one
+          mounts — so on every queue toggle the playing element belonged
+          to neither for a frame or two: a visible black blip and a
+          decoder hiccup. One persistent node whose wrapper classes swap
+          with the mode never reparents, so playback never blinks. The
+          branches below only render what sits UNDER the video. */}
+      {track && streamKind === "video" && variant === "right" && !fullscreen ? (
+        <div
+          onPointerDown={queueOpen ? undefined : onCoverPointerDown}
+          className={cn(
+            "shrink-0",
+            queueOpen
+              ? "px-3 pt-3"
+              : "touch-none select-none p-4 pb-0 cursor-grab active:cursor-grabbing",
+          )}
+        >
+          <div
+            className={cn(
+              !queueOpen &&
+                "pointer-events-none flex aspect-square w-full items-center justify-center",
+            )}
+          >
+            <div className="relative aspect-video w-full">
+              <VideoSurface className="size-full overflow-hidden rounded-md border border-hairline bg-black" />
+              {videoBuffering ? (
+                <div className="absolute inset-0 flex items-center justify-center rounded-md bg-black/25">
+                  <Loader2Icon className="size-6 animate-spin text-white/85" />
+                </div>
+              ) : null}
+              {!queueOpen ? (
+                <div className="absolute bottom-2 right-2">
+                  <VideoQualityBadge className="opacity-70 hover:opacity-100" />
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <AnimatePresence initial={false} mode="wait">
         {queueOpen ? (
           <motion.div
@@ -808,24 +904,6 @@ export function PlayerBar({
             transition={{ duration: 0.07 }}
             className="flex min-h-0 flex-1 flex-col"
           >
-            {/* Opening the queue used to unmount the cover branch and
-                take the video with it. Keep a compact surface docked
-                above the list while a video is playing — the singleton
-                element reparents here on mount and back to the cover
-                when the queue closes (mode="wait" serializes the two
-                mounts). Same gating as the cover-branch surface. */}
-            {track && streamKind === "video" && variant === "right" && !fullscreen ? (
-              <div className="shrink-0 px-3 pt-3">
-                <div className="relative aspect-video w-full">
-                  <VideoSurface className="size-full overflow-hidden rounded-md border border-hairline bg-black" />
-                  {videoBuffering ? (
-                    <div className="absolute inset-0 flex items-center justify-center rounded-md bg-black/25">
-                      <Loader2Icon className="size-6 animate-spin text-white/85" />
-                    </div>
-                  ) : null}
-                </div>
-              </div>
-            ) : null}
             <QueueBody onClose={() => setQueueOpen(false)} />
           </motion.div>
         ) : (
@@ -856,67 +934,20 @@ export function PlayerBar({
         {/* The right-card cover follows the resizable card width. Only
             the floating variant stays capped at 320px so making that
             window wider cannot push the controls below the viewport. */}
-        <div
-          onPointerDown={onCoverPointerDown}
-          className={cn(
-            "mx-auto w-full touch-none select-none",
-            variant === "floating" && "max-w-[20rem]",
-            variant !== "floating" && "cursor-grab active:cursor-grabbing",
-          )}
-        >
-          {/* When the user picked the video version, the engine element
-              carries real frames: show them here instead of the art.
-              Gated to the docked variant because the floating window is
-              a separate WKWebView and cannot adopt this document's
-              element, and to !fullscreen so the stage keeps ownership
-              while it's up (we re-adopt when it closes). The square
-              outer box stays so metadata and lyrics below don't jump
-              when a track flips between art and video. */}
-          {track && streamKind === "video" && variant === "right" && !fullscreen ? (
-            <div className="pointer-events-none flex aspect-square w-full items-center justify-center">
-              {/* Inner box matches the video rect exactly so the badge
-                  anchors to the video's own corner, not the square
-                  letterbox. The outer wrapper is pointer-events-none
-                  (the cover doubles as a drag handle); the badge
-                  re-enables its own pointer events. */}
-              <div className="relative aspect-video w-full">
-                <VideoSurface className="size-full overflow-hidden rounded-md border border-hairline bg-black" />
-                {videoBuffering ? (
-                  <div className="absolute inset-0 flex items-center justify-center rounded-md bg-black/25">
-                    <Loader2Icon className="size-6 animate-spin text-white/85" />
-                  </div>
-                ) : null}
-                <div className="absolute bottom-2 right-2">
-                  <VideoQualityBadge className="opacity-70 hover:opacity-100" />
-                </div>
-              </div>
-            </div>
-          ) : track ? (
-            <div className="pointer-events-none relative">
-              <Thumbnail
-                thumbnails={track.thumbnails}
-                alt={track.title}
-                className="aspect-square w-full rounded-md border border-hairline pointer-events-none"
-                targetSize={1024}
-                highRes
-                overrideHighRes={iTunesCover}
-              />
-              {/* Playback is held until the video is ready (loader in
-                  the middle of the art, YouTube style). "waiting" only;
-                  a fallback start must not leave a stuck loader. */}
-              {videoStartup === "waiting" ? (
-                <div className="absolute inset-0 flex items-center justify-center">
-                  <div className="flex items-center gap-1.5 rounded-full border border-hairline bg-black/55 px-3 py-1.5 text-xs font-medium text-white/85 backdrop-blur-md">
-                    <Loader2Icon className="size-3.5 animate-spin" />
-                    loading video
-                  </div>
-                </div>
-              ) : null}
-            </div>
-          ) : (
-            <div className="aspect-square w-full rounded-md border border-hairline bg-muted" />
-          )}
-        </div>
+        {/* Video tracks are handled by the persistent surface hoisted
+            above the branch switch, so the art wrapper only renders for
+            artwork. Skipped entirely in video mode rather than left
+            empty: an empty aspect-square would double the reserved
+            height under the hoisted video. */}
+        {track && streamKind === "video" && variant === "right" && !fullscreen ? null : (
+          <CoverArt
+            track={track}
+            variant={variant}
+            iTunesCover={iTunesCover}
+            videoStartup={videoStartup}
+            onCoverPointerDown={onCoverPointerDown}
+          />
+        )}
 
         {/* Title + artist with heart on the right */}
         <div className="flex items-start gap-2">

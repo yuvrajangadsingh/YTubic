@@ -96,35 +96,34 @@ export function TopBar() {
   const [aboutOpen, setAboutOpen] = useState(false);
 
   useEffect(() => {
-    // macOS has no custom maximize glyph to keep in sync; native traffic
-    // lights own that state entirely.
-    if (!IS_TAURI || IS_MAC) return;
+    if (!IS_TAURI) return;
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     const win = getCurrentWindow();
-    win.isMaximized().then((m) => {
-      if (!cancelled) setMaximized(m);
-    });
-    win.isFullscreen().then((f) => {
-      if (!cancelled) setFullscreenState(f);
-    });
+    const sync = () => {
+      // macOS has no custom maximize glyph to keep in sync; native traffic
+      // lights own that state entirely. Fullscreen is tracked on every
+      // platform: on macOS it is what collapses the traffic-light inset
+      // below, and this effect used to return early there, so the inset
+      // stayed as a dead gap in native fullscreen.
+      if (!IS_MAC) {
+        win.isMaximized().then((m) => {
+          if (!cancelled) setMaximized(m);
+        });
+      }
+      win.isFullscreen().then((f) => {
+        if (!cancelled) setFullscreenState(f);
+      });
+    };
+    sync();
     // Mirrors the cancelled-flag pattern used in audio-engine / app-shell:
     // `.onResized` is async, so its `.then` may resolve AFTER cleanup ran
     // in StrictMode's mount → unmount → remount cycle. Without the flag the
     // listener leaks twice and we get duplicated maximized-state updates.
-    win
-      .onResized(() => {
-        win.isMaximized().then((m) => {
-          if (!cancelled) setMaximized(m);
-        });
-        win.isFullscreen().then((f) => {
-          if (!cancelled) setFullscreenState(f);
-        });
-      })
-      .then((u) => {
-        if (cancelled) u();
-        else unlisten = u;
-      });
+    win.onResized(sync).then((u) => {
+      if (cancelled) u();
+      else unlisten = u;
+    });
     return () => {
       cancelled = true;
       unlisten?.();

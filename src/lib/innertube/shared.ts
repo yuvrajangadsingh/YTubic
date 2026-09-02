@@ -104,7 +104,29 @@ async function sha1Hex(text: string): Promise<string> {
  */
 type AuthContext = { cookie: string; pageId: string | null };
 
-const EMPTY_AUTH: AuthContext = { cookie: "", pageId: null };
+/**
+ * The auth context could not be read at all: the login keychain was
+ * unavailable (macOS dark wake), the jar failed to decrypt, storage
+ * errored, or the IPC call itself did.
+ *
+ * Deliberately distinct from a jar that is simply empty, which is an
+ * authoritative "signed out". Anything speaking for the account has to
+ * let this propagate: a request that goes out anonymous instead comes
+ * back looking exactly like a sign-out, and the app believes it.
+ */
+export class AuthUnavailableError extends Error {
+  /** Whatever `get_auth_context` rejected with. */
+  readonly reason: unknown;
+
+  constructor(reason?: unknown) {
+    super(`auth context unavailable: ${String(reason)}`);
+    this.name = "AuthUnavailableError";
+    this.reason = reason;
+  }
+}
+
+/** Whether a caller can fall back to an anonymous request. */
+export type AuthMode = "required" | "optional";
 
 // In-process cache for the auth context. Without it every browse / search
 // / next call invokes the Rust side, which hits disk + DPAPI-decrypts the
@@ -112,13 +134,18 @@ const EMPTY_AUTH: AuthContext = { cookie: "", pageId: null };
 // TTL keeps us responsive to silent re-logins (different webview session
 // dropping a fresh SID); `resetAuthCache()` is the explicit invalidation
 // path called from `resetInnertube()` after sign-in / sign-out.
+//
+// Only successful reads are ever cached. Caching a failure meant one
+// unreadable jar pinned every request to anonymous for the full five
+// minutes, which reads as a signed-out user to the rest of the app AND
+// to Google.
 const AUTH_CACHE_TTL_MS = 5 * 60 * 1000;
 let authCache: { value: AuthContext; loadedAt: number } | null = null;
 let authPromise: Promise<AuthContext> | null = null;
 // Bumped by resetAuthCache(). An in-flight load captures the epoch at start
-// and discards its result if a reset happened meanwhile; otherwise the
-// pre-reset value would be written back and served for the whole TTL after
-// a sign-in/out completes mid-fetch.
+// and refuses to write its result back if a reset happened meanwhile;
+// otherwise the pre-reset value would be served for the whole TTL after a
+// sign-in/out completes mid-fetch.
 let authEpoch = 0;
 
 async function loadAuthContext(): Promise<AuthContext> {
@@ -128,23 +155,26 @@ async function loadAuthContext(): Promise<AuthContext> {
   }
   if (authPromise) return authPromise;
   const epoch = authEpoch;
-  authPromise = invoke<AuthContext>("get_auth_context", {
+  const load = invoke<AuthContext>("get_auth_context", {
     host: "music.youtube.com",
   }).then(
     (value) => {
-      authPromise = null;
-      if (epoch !== authEpoch) return EMPTY_AUTH;
-      authCache = { value, loadedAt: Date.now() };
+      if (authPromise === load) authPromise = null;
+      // Reset mid-flight (sign-in, sign-out, cookie rotation): the value
+      // describes the identity we just left, so it must not be written
+      // back. It is still the freshest thing this call has, and handing
+      // back an empty context here would send this one request out
+      // anonymous, so return it uncached instead.
+      if (epoch === authEpoch) authCache = { value, loadedAt: Date.now() };
       return value;
     },
-    () => {
-      authPromise = null;
-      if (epoch !== authEpoch) return EMPTY_AUTH;
-      authCache = { value: EMPTY_AUTH, loadedAt: Date.now() };
-      return EMPTY_AUTH;
+    (e) => {
+      if (authPromise === load) authPromise = null;
+      throw new AuthUnavailableError(e);
     },
   );
-  return authPromise;
+  authPromise = load;
+  return load;
 }
 
 /**
@@ -218,9 +248,24 @@ export async function captureSetCookies(res: Response): Promise<void> {
  * (library, likes and home are scoped to the channel, not the Google
  * account). Returns an empty object when the user has no cookies
  * imported; callers fall back to anonymous requests.
+ *
+ * `mode` decides what happens when the jar cannot be read at all. Home,
+ * search and public playlists are fine anonymous, so they downgrade.
+ * Account-scoped callers pass "required" and get the error: an
+ * anonymous `/account_menu` answers "not signed in" about a signed-in
+ * user, and that answer is authoritative enough to clear the UI.
  */
-export async function authHeaders(): Promise<Record<string, string>> {
-  const { cookie, pageId } = await loadAuthContext();
+export async function authHeaders(
+  mode: AuthMode = "optional",
+): Promise<Record<string, string>> {
+  let ctx: AuthContext;
+  try {
+    ctx = await loadAuthContext();
+  } catch (e) {
+    if (mode === "required") throw e;
+    return {};
+  }
+  const { cookie, pageId } = ctx;
   if (!cookie) return {};
   const sapisid =
     cookie.match(/(?:^|;\s*)__Secure-3PAPISID=([^;]+)/)?.[1] ??
@@ -238,13 +283,14 @@ export async function authHeaders(): Promise<Record<string, string>> {
 export async function innertubePost(
   endpoint: string,
   body: Record<string, unknown>,
+  opts: { auth?: AuthMode } = {},
 ): Promise<YtNode> {
   // `endpoint` may already carry query params (reload continuations are
   // passed as `browse?ctoken=…` — the server ignores them in the body).
   const url = `https://music.youtube.com/youtubei/v1/${endpoint}${
     endpoint.includes("?") ? "&" : "?"
   }prettyPrint=false`;
-  const auth = await authHeaders();
+  const auth = await authHeaders(opts.auth);
   const visitor = loadVisitorData();
   const visitorHeader: Record<string, string> = visitor
     ? { "X-Goog-Visitor-Id": visitor }
@@ -270,10 +316,22 @@ export async function innertubePost(
   return json;
 }
 
-export function rawBrowse(browseId: string, params?: string): Promise<YtNode> {
+/**
+ * `opts` is not decoration. Most browses are public (home, explore, an
+ * album page) and downgrade to anonymous happily, but a library browse
+ * answers the generic explore page when it goes out unsigned — and that
+ * answer lands in the same query cache the sidebar reads, so one
+ * unreadable jar replaces the user's library with YouTube's front page
+ * for the whole staleTime. Account-scoped callers pass `"required"`.
+ */
+export function rawBrowse(
+  browseId: string,
+  params?: string,
+  opts: { auth?: AuthMode } = {},
+): Promise<YtNode> {
   const body: Record<string, unknown> = { browseId };
   if (params) body.params = params;
-  return innertubePost("browse", body);
+  return innertubePost("browse", body, opts);
 }
 
 export function rawSearch(query: string, params?: string): Promise<YtNode> {
@@ -291,8 +349,137 @@ export function rawNext(body: Record<string, unknown>): Promise<YtNode> {
  * legacy `nextContinuationData.continuation` token or the modern
  * `continuationCommand.token`.
  */
-export function rawBrowseContinuation(token: string): Promise<YtNode> {
-  return innertubePost("browse", { continuation: token });
+export function rawBrowseContinuation(
+  token: string,
+  opts: { auth?: AuthMode } = {},
+): Promise<YtNode> {
+  return innertubePost("browse", { continuation: token }, opts);
+}
+
+/**
+ * Paging token belonging to ONE container (a gridRenderer, musicShelfRenderer
+ * or the object a continuation page unwrapped to), read only off that node.
+ *
+ * Deliberately not `findContinuationToken`: that walks the whole response and
+ * returns whatever it hits first, which on a library page can be a filter
+ * chip's reload token rather than the grid's own next-page token. Following
+ * the wrong one either loops or silently returns nothing.
+ *
+ * Two shapes in the wild: the legacy `continuations[].nextContinuationData`
+ * and the newer trailing `continuationItemRenderer` appended to the item list.
+ */
+export function readPagingToken(container: YtNode | undefined): string | undefined {
+  if (!container) return undefined;
+  const conts: YtNode[] = container.continuations ?? [];
+  for (const c of conts) {
+    const legacy: string | undefined = c?.nextContinuationData?.continuation;
+    if (legacy) return legacy;
+    const modern: string | undefined =
+      c?.continuationEndpoint?.continuationCommand?.token ??
+      c?.continuationCommand?.token;
+    if (modern) return modern;
+  }
+  const items: YtNode[] = container.items ?? container.contents ?? [];
+  const last = items[items.length - 1];
+  const token: string | undefined =
+    last?.continuationItemRenderer?.continuationEndpoint?.continuationCommand
+      ?.token;
+  return token;
+}
+
+/**
+ * A `sectionListContinuation` hands back whole sections rather than rows, so
+ * unwrap any row that is itself a grid or shelf into the rows it holds. Rows
+ * that are already item renderers pass through untouched.
+ */
+function flattenContainerRows(rows: YtNode[]): YtNode[] {
+  const out: YtNode[] = [];
+  for (const row of rows) {
+    const inner: YtNode | undefined =
+      row?.gridRenderer ?? row?.musicShelfRenderer ?? row?.musicPlaylistShelfRenderer;
+    const nested: YtNode[] | undefined = inner?.items ?? inner?.contents;
+    if (nested?.length) out.push(...nested);
+    else out.push(row);
+  }
+  return out;
+}
+
+/**
+ * Unwrap a /browse continuation response into the rows it carries plus the
+ * token for the page after it. Covers every wrapper YTM returns for a paged
+ * library grid or shelf; an unrecognized shape yields no items, which ends
+ * the walk rather than looping.
+ */
+export function parseContinuationPage(json: YtNode | undefined): {
+  items: YtNode[];
+  token?: string;
+} {
+  const cc: YtNode | undefined = json?.continuationContents;
+  const container: YtNode | undefined =
+    cc?.gridContinuation ??
+    cc?.musicShelfContinuation ??
+    cc?.musicPlaylistShelfContinuation ??
+    cc?.sectionListContinuation ??
+    cc?.playlistVideoListContinuation;
+  if (container) {
+    const items: YtNode[] = container.items ?? container.contents ?? [];
+    return { items: flattenContainerRows(items), token: readPagingToken(container) };
+  }
+
+  // Newer responses skip `continuationContents` and append through an action.
+  const actions: YtNode[] = json?.onResponseReceivedActions ?? [];
+  for (const a of actions) {
+    const appended: YtNode[] | undefined =
+      a?.appendContinuationItemsAction?.continuationItems;
+    if (!appended?.length) continue;
+    return {
+      items: flattenContainerRows(appended),
+      token: readPagingToken({ items: appended }),
+    };
+  }
+  return { items: [] };
+}
+
+// A library grid hands back ~25 rows a page, so a 500-playlist library is 20
+// requests. The cap is a runaway guard (a token that keeps returning itself
+// would otherwise spin forever), set far above any real library.
+const MAX_CONTINUATION_PAGES = 40;
+
+/**
+ * Follow a container's paging tokens to exhaustion and return every row past
+ * the first page, in order.
+ *
+ * Truncation is the failure mode this exists to prevent, but a mid-walk error
+ * still can't be fatal: callers use this for library shelves where showing
+ * the pages that did load beats showing an error, so a failed request just
+ * ends the walk. Repeated tokens are dropped as well, since a server that
+ * hands back the token it was given would otherwise loop.
+ */
+export async function collectContinuationItems(
+  firstToken: string | undefined,
+  opts: { auth?: AuthMode } = {},
+): Promise<YtNode[]> {
+  const out: YtNode[] = [];
+  const seen = new Set<string>();
+  let token = firstToken;
+  for (let page = 0; token && page < MAX_CONTINUATION_PAGES; page++) {
+    if (seen.has(token)) break;
+    seen.add(token);
+    let json: YtNode;
+    try {
+      json = await rawBrowseContinuation(token, opts);
+    } catch (e) {
+      if (import.meta.env.DEV) {
+        console.debug("[innertube] continuation page failed:", e);
+      }
+      break;
+    }
+    const { items, token: nextToken } = parseContinuationPage(json);
+    if (items.length === 0) break;
+    out.push(...items);
+    token = nextToken;
+  }
+  return out;
 }
 
 /**
@@ -396,11 +583,20 @@ export function mapPlaylistPanelVideo(raw: YtNode): ShelfItem | null {
       ? "video"
       : "song";
 
+  // Show/UGC content often ships artist names as PLAIN byline runs (no
+  // channel browse endpoints), leaving `artists` empty — fall back to
+  // the byline text before the first "•" so the player still shows an
+  // artist line ("Badshah, ... • Hustle 5 • 2024" → "Badshah, ...").
+  const bylineFallback = readRuns(raw.longBylineText ?? raw.shortBylineText)
+    .split("•")[0]
+    ?.trim();
+
   return {
     kind,
     id: videoId,
     title,
-    subtitle: artists.map((a) => a.name).join(", ") || undefined,
+    subtitle:
+      artists.map((a) => a.name).join(", ") || bylineFallback || undefined,
     thumbnails,
     artists: artists.length ? artists : undefined,
     album,
@@ -868,6 +1064,27 @@ export function mapResponsiveListItem(raw: YtNode): ShelfItem | null {
     artists.map((a) => a.name).join(", ") ||
     readRuns(flex[1]?.musicResponsiveListItemFlexColumnRenderer?.text);
 
+  // A row that NAVIGATES (album/artist/playlist page) must be
+  // classified by its browse target even when a playable videoId is
+  // also present: album rows — singles especially, and authenticated
+  // payloads generally — ship a playable id in the overlay or
+  // playlistItemData alongside the album browseEndpoint. Checking
+  // videoId first turned those albums into "songs", so clicking an
+  // album on the search Albums tab played a track and built a radio
+  // queue instead of opening the album page.
+  const navKind = navBrowseId ? pageTypeToKind(navPageType) : undefined;
+  if (navBrowseId && navKind) {
+    return {
+      kind: navKind,
+      id: navBrowseId,
+      title,
+      subtitle: subtitleText || undefined,
+      thumbnails,
+      round: navKind === "artist",
+      explicit: explicit || undefined,
+    };
+  }
+
   if (videoId) {
     return {
       kind: "song",
@@ -883,20 +1100,6 @@ export function mapResponsiveListItem(raw: YtNode): ShelfItem | null {
       playCount,
       dateAdded,
       setVideoId: raw.playlistItemData?.playlistSetVideoId,
-    };
-  }
-
-  if (navBrowseId) {
-    const kind = pageTypeToKind(navPageType);
-    if (!kind) return null;
-    return {
-      kind,
-      id: navBrowseId,
-      title,
-      subtitle: subtitleText || undefined,
-      thumbnails,
-      round: kind === "artist",
-      explicit: explicit || undefined,
     };
   }
 
@@ -961,10 +1164,13 @@ export function collectShelfNodes(sections: YtNode[]): YtNode[] {
     }
     if (node.gridRenderer?.items) {
       // gridRenderer wraps raw two-row items; synthesize a shelf-like node.
+      // `continuations` rides along: the grid is what owns the paging token,
+      // and a caller that drops it here shows only the first ~25 rows.
       out.push({
         musicShelfRenderer: {
           title: node.gridRenderer.header?.gridHeaderRenderer?.title,
           contents: node.gridRenderer.items,
+          continuations: node.gridRenderer.continuations,
         },
       });
     }
