@@ -55,6 +55,25 @@ export type WhatsNewEntry = {
  */
 export const WHATS_NEW: WhatsNewEntry[] = [
   {
+    version: "0.4.5",
+    date: "September 2, 2026",
+    summary: "The app can update itself now",
+    changes: [
+      {
+        type: "fixed",
+        title: "Updates that actually arrive",
+        text: "The app was checking for updates against a signing key it does not hold, left over from the project it was forked from, so no release could ever be accepted. It now trusts its own key and releases are signed by the build that publishes them. This is the last version you have to install by hand.",
+      },
+      {
+        type: "fixed",
+        title: "The wrong video for a song",
+        text: "Switching a song to its video could land on a different song from the same channel when both titles ended in the same artist and remix tags. The match now compares the song part of the title, and a video that runs far longer than the track is no longer accepted.",
+      },
+    ],
+    alert:
+      "Install this one by hand, like the last. From the next release onward the app updates itself.",
+  },
+  {
     version: "0.4.4",
     date: "September 2, 2026",
     summary:
