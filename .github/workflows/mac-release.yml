@@ -101,6 +101,14 @@ jobs:
           YTUBIC_LASTFM_API_KEY: ${{ secrets.YTUBIC_LASTFM_API_KEY }}
           YTUBIC_LASTFM_API_SECRET: ${{ secrets.YTUBIC_LASTFM_API_SECRET }}
         with:
+          # createUpdaterArtifacts is false in tauri.macos.conf.json on
+          # purpose: a local `tauri build` has no signing key and would
+          # fail. CI does have one, and without the updater bundle the
+          # action falls back to tarring the .app itself, which produces
+          # an UNSIGNED tarball and then skips latest.json entirely --
+          # exactly why no release here has ever been updatable. Turn it
+          # on for this build only.
+          args: --target universal-apple-darwin --config {"bundle":{"createUpdaterArtifacts":true}}
           tagName: ${{ steps.version.outputs.tag }}
           releaseName: "YTubic ${{ steps.version.outputs.version }} — macOS"
           releaseBody: |
@@ -117,4 +125,3 @@ jobs:
           # Flip to false once you've seen it publish a good one.
           releaseDraft: true
           prerelease: false
-          args: --target universal-apple-darwin

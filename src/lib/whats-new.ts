@@ -55,6 +55,18 @@ export type WhatsNewEntry = {
  */
 export const WHATS_NEW: WhatsNewEntry[] = [
   {
+    version: "0.4.6",
+    date: "September 2, 2026",
+    summary: "Updates arrive on their own from here",
+    changes: [
+      {
+        type: "fixed",
+        title: "The update itself",
+        text: "0.4.5 fixed which key the app trusts, but the release build was never producing the signed package an update is delivered as, so there was nothing for the app to fetch. It does now. This is the first release the app can install on its own.",
+      },
+    ],
+  },
+  {
     version: "0.4.5",
     date: "September 2, 2026",
     summary: "The app can update itself now",
