@@ -3,6 +3,7 @@ import {
   durationMatches,
   hitMatches,
   normalizeForMatch,
+  normalizeTitleForMatch,
   tokenOverlap,
 } from "@/lib/lyrics/match";
 
@@ -14,6 +15,49 @@ describe("normalizeForMatch", () => {
   it("drops parentheticals and featurings", () => {
     expect(normalizeForMatch("Song (Remastered) feat. Someone")).toBe("song");
     expect(normalizeForMatch("Track [Live]")).toBe("track");
+  });
+});
+
+describe("normalizeTitleForMatch", () => {
+  it("also removes furniture that sits outside brackets", () => {
+    // This is the whole difference from normalizeForMatch, which already
+    // drops bracketed text but leaves a trailing " - Official Video".
+    expect(normalizeForMatch("Saajna - Official Video")).toBe(
+      "saajna official video",
+    );
+    expect(normalizeTitleForMatch("Saajna - Official Video")).toBe("saajna");
+  });
+
+  it("lets a decorated database row match the request", () => {
+    // LRCLIB is largely scraped from the same YouTube metadata, so it holds
+    // rows titled like this. Applied to the candidate as well as the
+    // request, the pair collapses to the same key.
+    expect(normalizeTitleForMatch("MITRAZ - Saajna (Official Video)")).toBe(
+      normalizeTitleForMatch("MITRAZ - Saajna"),
+    );
+  });
+
+  it("keeps matching the rows that already matched by shared decoration", () => {
+    // 10 of the 11 tracks with a feat. credit in the title currently match
+    // BECAUSE the database row carries the same decoration. Cleaning both
+    // sides preserves that; cleaning one side would have broken it.
+    const req = "Notorious Jatt (feat. P. Gill)";
+    expect(normalizeTitleForMatch(req)).toBe(normalizeTitleForMatch(req));
+    expect(
+      hitMatches(
+        normalizeTitleForMatch(req),
+        normalizeForMatch("Randy J"),
+        normalizeTitleForMatch(req),
+        normalizeForMatch("P. Gill & Randy J"),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not erase a version qualifier", () => {
+    // normalizeForMatch drops it either way; what matters is that the
+    // cleaner upstream of it does not, so the qualifier tie-break still has
+    // something to work with.
+    expect(normalizeTitleForMatch("Die For You (Remix)")).toBe("die for you");
   });
 });
 

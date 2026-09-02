@@ -6,7 +6,9 @@ import {
   hitMatches,
   normalizeForMatch,
   normalizeKeepingQualifiers,
+  normalizeTitleForMatch,
 } from "@/lib/lyrics/match";
+import { cleanTrackTitle, reattributedFromTitle } from "@/lib/track-meta";
 
 /**
  * LRCLIB (https://lrclib.net) — free, open lyrics database with synced
@@ -53,6 +55,33 @@ export async function fetchLrclibLyrics(
 ): Promise<Lyrics | null> {
   if (!p.title) return null;
 
+  const hit = await lookup(p, signal);
+  if (hit) return hit;
+
+  // Re-uploads invert the usual arrangement: the real artist sits in the
+  // title and the artist field holds the uploader's channel name. Nobody
+  // has heard of the channel, so the ordinary reading returns nothing from
+  // every provider. Only ever a SECOND attempt — see reattributedFromTitle
+  // for why guessing this eagerly wrecks a genuine "Numb - Encore".
+  //
+  // Honest note: measured over this library's 73 played tracks this fires
+  // on exactly one row and gains nothing (that row is "Title - Artist", not
+  // "Artist - Title", so it splits backwards and the query comes back
+  // empty). It costs nothing either, and it only runs once we already have
+  // no answer. The album is dropped because it belonged to the reading that
+  // just failed.
+  const alt = reattributedFromTitle(p.title, p.artist);
+  if (!alt) return null;
+  return lookup(
+    { title: alt.title, artist: alt.artist, duration: p.duration },
+    signal,
+  );
+}
+
+async function lookup(
+  p: LrclibParams,
+  signal?: AbortSignal,
+): Promise<Lyrics | null> {
   // Race /get against /search. /get is the strict exact-match endpoint
   // (tight title+artist+duration match → fastest path when YT's
   // metadata happens to line up with LRCLIB's record), /search is the
@@ -138,13 +167,13 @@ async function lrclibSearch(
   // song when LRCLIB has no record for this track (the wrong-lyrics bug).
   // Drop hits whose title/artist don't plausibly match the request before
   // any synced/duration preference runs.
-  const reqTitle = normalizeForMatch(p.title);
+  const reqTitle = normalizeTitleForMatch(p.title);
   const reqArtist = normalizeForMatch(p.artist ?? "");
   const matched = results.filter((rec) =>
     hitMatches(
       reqTitle,
       reqArtist,
-      normalizeForMatch(rec.trackName ?? ""),
+      normalizeTitleForMatch(rec.trackName ?? ""),
       normalizeForMatch(rec.artistName ?? ""),
     ),
   );
@@ -167,11 +196,14 @@ async function lrclibSearch(
   // the same title class.
   const synced = verified.filter((r) => r.syncedLyrics);
   const pool = synced.length > 0 ? synced : verified;
-  const qualTitle = normalizeKeepingQualifiers(p.title);
+  const qualTitle = normalizeKeepingQualifiers(cleanTrackTitle(p.title));
   const scored = pool.map((rec) => ({
     rec,
     exact:
-      normalizeKeepingQualifiers(rec.trackName ?? "") === qualTitle ? 0 : 1,
+      normalizeKeepingQualifiers(cleanTrackTitle(rec.trackName ?? "")) ===
+      qualTitle
+        ? 0
+        : 1,
     dDiff: p.duration ? Math.abs((rec.duration ?? 0) - p.duration) : 0,
   }));
   scored.sort((a, b) => a.exact - b.exact || a.dDiff - b.dDiff);
@@ -186,6 +218,23 @@ async function lrclibSearch(
  * change (Heat Waves sped-up: 179s upload vs the 238s original the
  * timings were cut for). Near-1 ratios are left alone (edit/master
  * variance), and extreme ratios mean a different cut entirely.
+ *
+ * KNOWN DEFECT, deliberately not fixed here: both inputs are container
+ * lengths that include head and tail padding, and padding does not get
+ * tempo-scaled, so the ratio is a biased estimate of the real tempo change.
+ * Four measured original/tempo-shifted LRC pairs put it low by 1.2% to 2.3%
+ * in BOTH stretch directions, landing the last line 3.7 to 5.3 s early — and
+ * all four clear the gates below, so this would have fired on every one of
+ * them. Systematic bias, so more samples will not average it out. Tracked as
+ * follow-up; see docs/lyrics-scorer-design-2026-08.md §5.
+ *
+ * A record's last LRC timestamp is the one claim it makes that can be
+ * checked against itself, and it was the obvious candidate for a cheap gate
+ * here — but it does not work: "the lyric body already fits inside this
+ * audio" is true of every genuinely sped-up upload (the test below is
+ * exactly that shape), so gating on it would skip the correction in the
+ * case this function exists for. It catches overhang, which is a different
+ * symptom from drift. Left alone rather than half-fixed.
  */
 export function scaleTimedLines(
   lines: TimedLine[],
