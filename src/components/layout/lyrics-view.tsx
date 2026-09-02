@@ -34,12 +34,10 @@ type Availability = "lrc" | "plain" | "loading" | "none";
 function loadPref(): Pref {
   try {
     const v = localStorage.getItem(PREF_KEY);
-    if (
-      v === "lrclib" ||
-      v === "musixmatch" ||
-      v === "genius" ||
-      v === "auto"
-    ) {
+    // Validated against SOURCE_ORDER, not a hardcoded list: with the names
+    // spelled out here, pinning any newly added source and restarting
+    // silently reverted to Auto.
+    if (v === "auto" || (v && (SOURCE_ORDER as string[]).includes(v))) {
       return v as Pref;
     }
   } catch {

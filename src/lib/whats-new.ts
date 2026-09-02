@@ -55,6 +55,28 @@ export type WhatsNewEntry = {
  */
 export const WHATS_NEW: WhatsNewEntry[] = [
   {
+    version: "0.4.7",
+    date: "September 2, 2026",
+    summary: "YouTube Music's own lyrics",
+    changes: [
+      {
+        type: "new",
+        title: "Lyrics straight from YouTube Music",
+        text: "Synced lyrics now come from YouTube Music itself, looked up by the track rather than by matching its title, so they cannot be another song's words. LRCLIB, Musixmatch and Genius stay behind it for anything YouTube Music does not have.",
+      },
+      {
+        type: "improved",
+        title: "Better matches from the other sources",
+        text: "Titles are cleaned before they are searched, so a track called Something (Official Video) is looked up as Something. Two tracks that previously found nothing now find their words.",
+      },
+      {
+        type: "fixed",
+        title: "A missed lyrics fetch no longer sticks",
+        text: "If a lyrics source failed because the network hiccuped, the app remembered that as no lyrics for an hour. A failure is now just a failure and the next attempt tries again.",
+      },
+    ],
+  },
+  {
     version: "0.4.6",
     date: "September 2, 2026",
     summary: "Updates arrive on their own from here",
@@ -97,9 +119,9 @@ export const WHATS_NEW: WhatsNewEntry[] = [
         text: "Videos start playing while they download instead of after, and the player can seek into a file that is still arriving. 1440p and 4K, which used to pull the whole file and then show nothing, play properly now.",
       },
       {
-        type: "new",
-        title: "YouTube Music's own lyrics",
-        text: "Synced lyrics come from YouTube Music first, matched by the track itself rather than by its title, so they cannot be another song's words. The other sources are still there behind it, and one of them, LRCLIB, is reachable for the first time in an installed build.",
+        type: "fixed",
+        title: "Lyrics that arrive at all",
+        text: "One of the three lyrics sources, LRCLIB, was blocked by the app's own security policy and had never worked in an installed build. It works now, so tracks that had no lyrics may have them.",
       },
       {
         type: "fixed",

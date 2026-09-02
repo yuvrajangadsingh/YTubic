@@ -1,6 +1,11 @@
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import type { Lyrics } from "@/lib/lyrics/types";
-import { hitMatches, normalizeForMatch } from "@/lib/lyrics/match";
+import {
+  hitMatches,
+  normalizeForMatch,
+  normalizeTitleForMatch,
+} from "@/lib/lyrics/match";
+import { LyricsRateLimitError } from "@/lib/lyrics/errors";
 
 /**
  * Genius (https://genius.com) — plain text only. The official API
@@ -55,20 +60,24 @@ export async function fetchGeniusLyrics(
   // Unverifiable means no lyrics beats confidently-wrong lyrics.
   if (!p.artist?.trim()) return null;
 
+  // Neither step swallows its fetch errors any more: a transport failure or
+  // a 5xx propagates so react-query treats it as the transient failure it is
+  // instead of persisting a dropped packet as "no lyrics" for an hour. Only
+  // a real answer — no matching hit, or a page with no lyrics in it — comes
+  // back as null. See lyrics/errors.ts.
   const url = await findSongUrl(p, signal);
   const text = url ? await scrapeLyrics(url, signal) : null;
-
-  // Both steps swallow their own fetch errors into null, which would
-  // cache a timeout as a permanent "no lyrics" for an hour. Rethrow so
-  // react-query treats it as the transient failure it is.
-  if (!text && signal?.aborted) {
-    throw signal.reason instanceof Error
-      ? signal.reason
-      : new Error("Genius timed out");
-  }
   if (!text) return null;
 
   return { kind: "plain", text, source: "Genius" };
+}
+
+/** A lookup that failed is not evidence of absence. */
+function throwForStatus(status: number, what: string): never {
+  if (status === 429) {
+    throw new LyricsRateLimitError(`${what} rate limited (429)`);
+  }
+  throw new Error(`${what} ${status}`);
 }
 
 async function findSongUrl(
@@ -79,58 +88,53 @@ async function findSongUrl(
   const url = new URL(SEARCH_URL);
   url.searchParams.set("q", q);
 
-  try {
-    const r = await tauriFetch(url.toString(), {
-      method: "GET",
-      headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
-      signal,
-    });
-    if (!r.ok) return null;
-    const json = (await r.json()) as GeniusSearchResponse;
-    const hits = json?.response?.hits ?? [];
+  const r = await tauriFetch(url.toString(), {
+    method: "GET",
+    headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+    signal,
+  });
+  if (!r.ok) throwForStatus(r.status, "Genius search");
+  const json = (await r.json()) as GeniusSearchResponse;
+  const hits = json?.response?.hits ?? [];
 
-    // Hits come back ordered by relevance. Keep only song hits whose
-    // lyrics page is actually populated (Genius lists "unreleased"
-    // tracks with stub pages that scrape to nothing).
-    const usable = hits.filter(
-      (h) =>
-        h.type === "song" &&
-        h.result?.url &&
-        h.result?.lyrics_state !== "unreleased",
-    );
-    const reqTitle = normalizeForMatch(p.title);
-    const reqArtist = p.artist ? normalizeForMatch(p.artist) : "";
-    for (const h of usable) {
-      const hitTitle = normalizeForMatch(h.result?.title ?? "");
-      const hitArtist = normalizeForMatch(h.result?.primary_artist?.name ?? "");
-      if (hitMatches(reqTitle, reqArtist, hitTitle, hitArtist)) {
-        return h.result?.url ?? null;
-      }
+  // Hits come back ordered by relevance. Keep only song hits whose
+  // lyrics page is actually populated (Genius lists "unreleased"
+  // tracks with stub pages that scrape to nothing).
+  const usable = hits.filter(
+    (h) =>
+      h.type === "song" &&
+      h.result?.url &&
+      h.result?.lyrics_state !== "unreleased",
+  );
+  const reqTitle = normalizeTitleForMatch(p.title);
+  const reqArtist = p.artist ? normalizeForMatch(p.artist) : "";
+  for (const h of usable) {
+    const hitTitle = normalizeTitleForMatch(h.result?.title ?? "");
+    const hitArtist = normalizeForMatch(h.result?.primary_artist?.name ?? "");
+    if (hitMatches(reqTitle, reqArtist, hitTitle, hitArtist)) {
+      return h.result?.url ?? null;
     }
-    // No hit passed the title/artist check — better no lyrics than a
-    // confidently-wrong different song.
-    return null;
-  } catch {
-    return null;
   }
+  // No hit passed the title/artist check — better no lyrics than a
+  // confidently-wrong different song. An empty result set is a genuine miss.
+  return null;
 }
 
 async function scrapeLyrics(
   songUrl: string,
   signal?: AbortSignal,
 ): Promise<string | null> {
-  try {
-    const r = await tauriFetch(songUrl, {
-      method: "GET",
-      headers: { "User-Agent": USER_AGENT, Accept: "text/html" },
-      signal,
-    });
-    if (!r.ok) return null;
-    const html = await r.text();
-    return extractLyricsFromHtml(html);
-  } catch {
-    return null;
-  }
+  const r = await tauriFetch(songUrl, {
+    method: "GET",
+    headers: { "User-Agent": USER_AGENT, Accept: "text/html" },
+    signal,
+  });
+  // A page the search just named that has since gone is a genuine miss;
+  // anything else is a failure to look up and must not be cached as one.
+  if (r.status === 404) return null;
+  if (!r.ok) throwForStatus(r.status, "Genius page");
+  const html = await r.text();
+  return extractLyricsFromHtml(html);
 }
 
 /**
