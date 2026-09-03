@@ -55,6 +55,18 @@ export type WhatsNewEntry = {
  */
 export const WHATS_NEW: WhatsNewEntry[] = [
   {
+    version: "0.4.8",
+    date: "September 3, 2026",
+    summary: "Signing in gets unstuck",
+    changes: [
+      {
+        type: "fixed",
+        title: "Sign-in that went nowhere",
+        text: "Google sometimes parks the sign-in window on one of its own pages and never sends you on to YouTube Music, so the app kept waiting for credentials that never arrived. It now sends you back through Google's own hand-off instead of guessing, which finishes the job.",
+      },
+    ],
+  },
+  {
     version: "0.4.7",
     date: "September 2, 2026",
     summary: "YouTube Music's own lyrics",
