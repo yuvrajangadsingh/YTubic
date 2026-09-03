@@ -144,6 +144,8 @@ export function useAudioEngine() {
   // without any of its real deps changing — used to re-fetch a fresh
   // stream URL after a transient failure (e.g. a googlevideo 403).
   const [retryNonce, setRetryNonce] = useState(0);
+  // See the stall watchdog below for why this is as long as it is.
+  const STALL_RELOAD_MS = 75_000;
 
   // Video-mode startup hold: audio and frames start TOGETHER (YouTube
   // semantics) instead of audio leading by however long the vonly
@@ -338,8 +340,7 @@ export function useAudioEngine() {
       // keeps this from looping: once we're on audio a repeat failure
       // falls through to the normal error path below.
       const errored = store();
-      const cur =
-        errored.index >= 0 ? errored.queue[errored.index] : undefined;
+      const cur = errored.index >= 0 ? errored.queue[errored.index] : undefined;
       if (cur && (mediaErr?.code === 3 || mediaErr?.code === 4)) {
         const ts = useTrackSourceStore.getState();
         const selected = ts.byVideoId[cur.videoId]?.selected ?? "song";
@@ -1151,6 +1152,53 @@ export function useAudioEngine() {
     }
   }, [playing, premiumOk, casting]);
 
+  // Stall watchdog.
+  //
+  // A load that never produces a single byte fires no `error` event, so
+  // the retry in onError never runs and nothing else is listening: the
+  // element sits at readyState 0 with networkState LOADING and the UI
+  // shows a spinner forever. Seen 2026-09-03 20:34, track 3c7Iw3AoiZQ:
+  // `src set` then `waiting` then `stalled`, and the stream server never
+  // logged a GET for it at all, so there was no request to time out and
+  // no failure to report. The app had no way to notice.
+  //
+  // Re-requesting is cheap enough to be the right answer even when the
+  // load was merely slow rather than dead: the proxy keys in-flight work
+  // by video id behind a OnceCell, so a second request joins the download
+  // already running instead of starting another one.
+  //
+  // The delay has to clear a legitimately slow cold start. Measured over
+  // 279 resolves: median 5.0s, 90th percentile 11.5s, slowest 33.7s, and
+  // a timed-out resolve may now be retried once, so the honest worst case
+  // is around a minute. 75s sits past that, which means this only fires
+  // for a load that is genuinely going nowhere.
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el || !videoId || !playing) return;
+    const timer = window.setTimeout(() => {
+      const s = usePlaybackStore.getState();
+      const cur = s.index >= 0 ? s.queue[s.index] : undefined;
+      // Moved on, paused, or it started after all: nothing to do.
+      if (!cur || cur.videoId !== videoId || !s.playing) return;
+      if (el.readyState >= 3 || el.buffered.length > 0) return;
+      const key = `${cur.videoId}:${s.index}`;
+      const state = `rs=${el.readyState} ns=${el.networkState}`;
+      if (retriedTrackRef.current === key) {
+        // Already reloaded this track once. Say so rather than looping.
+        appLog(`stalled again after a reload (${state}); giving up`);
+        s.setStatus("error", "The stream never started");
+        return;
+      }
+      retriedTrackRef.current = key;
+      appLog(
+        `nothing loaded after ${STALL_RELOAD_MS}ms (${state}); reloading the source`,
+      );
+      s.setStatus("loading");
+      setRetryNonce((n) => n + 1);
+    }, STALL_RELOAD_MS);
+    return () => window.clearTimeout(timer);
+  }, [videoId, playing, retryNonce]);
+
   // Volume / mute follow store.
   const volume = usePlaybackStore((s) => s.volume);
   const muted = usePlaybackStore((s) => s.muted);
@@ -1282,7 +1330,6 @@ export function useAudioEngine() {
   // session owning macOS Now Playing, its action handlers below receive
   // the system transport presses. Two registered command targets meant
   // every press could fire twice.)
-
 
   // System media-control / media-key button presses (SMTC on Windows, MPRIS
   // on Linux) arrive from Rust via souvlaki as a
@@ -1682,7 +1729,11 @@ function applyMediaSessionMetadata(
  * rejected by some WebKit builds.
  */
 function applyMediaSessionPosition(position: number, duration: number): void {
-  if (typeof navigator === "undefined" || !navigator.mediaSession?.setPositionState) return;
+  if (
+    typeof navigator === "undefined" ||
+    !navigator.mediaSession?.setPositionState
+  )
+    return;
   if (!navigator.userAgent.includes("Mac")) return;
   if (!Number.isFinite(duration) || duration <= 0) return;
   try {
