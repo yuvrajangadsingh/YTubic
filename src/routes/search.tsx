@@ -1024,7 +1024,7 @@ function ShelfSkeleton({
         </div>
       ) : (
         <div className="flex gap-2 overflow-hidden">
-          {Array.from({ length: 6 }).map((_, i) => (
+          {Array.from({ length: 12 }).map((_, i) => (
             <div key={i} className="w-44 shrink-0 md:w-48 lg:w-52">
               <div className="flex flex-col gap-2 p-2">
                 <Skeleton className="aspect-square w-full" />
@@ -1066,8 +1066,14 @@ function SearchSkeleton({
       {Array.from({ length: 3 }).map((_, shelfIdx) => (
         <section key={shelfIdx} className="flex flex-col gap-3">
           <Skeleton className="h-6 w-48" />
+          {/* Card count, not card width, is what has to reach the edge:
+              these mirror ShelfCarousel's own w-44/md:w-48/lg:w-52 cards,
+              and six of them stopped ~1290px in, leaving the right third
+              of a wide window empty while the carousel that replaced them
+              ran to the edge. Twelve covers a wide display; overflow-hidden
+              clips the rest, and an unused placeholder costs nothing. */}
           <div className="flex gap-2 overflow-hidden">
-            {Array.from({ length: 6 }).map((_, i) => (
+            {Array.from({ length: 12 }).map((_, i) => (
               <div key={i} className="w-44 shrink-0 md:w-48 lg:w-52">
                 <div className="flex flex-col gap-2 p-2">
                   <Skeleton className="aspect-square w-full" />
