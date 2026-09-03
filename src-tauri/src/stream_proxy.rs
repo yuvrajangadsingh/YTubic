@@ -78,6 +78,15 @@ const MIN_TOTAL: u64 = 32 * 1024;
 /// Retry schedule for a 403/network error on the current signed URL.
 const URL_RETRIES: u32 = 3;
 
+/// Ceiling on one `yt-dlp -j` extraction. Generous against the measured
+/// 5.0s median and 11.5s 90th percentile, because the alternative to
+/// waiting is the legacy blocking path, which is slower still.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The timeout's error text. Compared exactly in `resolve` to tell a slow
+/// extraction from a dead video, so keep the two in step.
+const TIMED_OUT: &str = "yt-dlp -j timed out after 30s";
+
 /// Filler download chunk: one ranged request per chunk (see fill()).
 const FILL_CHUNK: u64 = 10 * 1024 * 1024;
 
@@ -217,6 +226,27 @@ async fn resolve(ctx: &ResolveCtx) -> Result<Resolved, String> {
             );
             resolve_with(ctx, None).await
         }
+        // A timeout is worth one more attempt here rather than in the
+        // caller. Failing out drops the request onto the legacy blocking
+        // path, and that path runs yt-dlp again itself AND withholds byte
+        // zero until the whole file is on disk, so on the one step that
+        // just proved slow it pays the cost twice and adds full-file
+        // buffering. Measured 2026-09-03: a resolve hit this ceiling and
+        // the fallback turned it into 59s of silence for a 7MB track.
+        // Across 279 resolves the median is 5.0s and the 90th percentile
+        // 11.5s, so a second attempt normally costs nothing, and when it
+        // helps the request stays on the streaming path.
+        //
+        // Only on a timeout. An outright yt-dlp error (a private or
+        // removed video, "Video unavailable") is not slow, it is dead, and
+        // retrying that only doubles the wait before an honest failure.
+        Err(e) if e == TIMED_OUT => {
+            eprintln!(
+                "[proxy] {}: {e}; one more attempt before the blocking path",
+                ctx.video_id
+            );
+            resolve_with(ctx, ctx.cookies.as_deref()).await
+        }
         Err(e) => Err(e),
     }
 }
@@ -242,9 +272,9 @@ async fn resolve_with(ctx: &ResolveCtx, cookies: Option<&Path>) -> Result<Resolv
     // drops the child future — without kill_on_drop that leaks a live
     // yt-dlp process per abandonment.
     cmd.kill_on_drop(true);
-    let out = tokio::time::timeout(Duration::from_secs(30), cmd.output())
+    let out = tokio::time::timeout(RESOLVE_TIMEOUT, cmd.output())
         .await
-        .map_err(|_| "yt-dlp -j timed out after 30s".to_string())?
+        .map_err(|_| TIMED_OUT.to_string())?
         .map_err(|e| format!("spawn yt-dlp: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -899,6 +929,19 @@ pub fn spawn_tail_pump(
 
 #[cfg(test)]
 mod tests {
+    /// The retry in `resolve` keys off the timeout's exact text, so a
+    /// reworded timeout would silently stop retrying and a reworded
+    /// yt-dlp error could start being retried. Pin both directions.
+    #[test]
+    fn only_a_timeout_is_worth_a_second_attempt() {
+        assert_eq!(TIMED_OUT, format!("yt-dlp -j timed out after {}s", RESOLVE_TIMEOUT.as_secs()));
+        // A dead video must not match: retrying it just doubles the wait.
+        let dead = "yt-dlp -j exit exit status: 1: ERROR: [youtube] x: Video unavailable";
+        assert_ne!(dead, TIMED_OUT);
+        // Nor must the no-formats case, which has its own anonymous retry.
+        let no_formats = "yt-dlp -j exit exit status: 1: ERROR: Requested format is not available";
+        assert_ne!(no_formats, TIMED_OUT);
+    }
     use super::*;
 
     #[test]
