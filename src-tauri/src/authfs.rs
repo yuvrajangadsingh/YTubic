@@ -91,7 +91,7 @@ pub async fn write_atomic(path: PathBuf, bytes: Vec<u8>, mode: u32) -> Result<()
         .map_err(|e| format!("write task: {e}"))?
 }
 
-fn write_atomic_blocking(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+pub(crate) fn write_atomic_blocking(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     use std::io::Write;
 
     let dir = path

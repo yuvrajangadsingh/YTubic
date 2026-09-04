@@ -128,7 +128,7 @@ function FeedSkeleton() {
         <section key={shelfIdx} className="flex flex-col gap-3">
           <Skeleton className="h-6 w-64" />
           <div className="flex gap-2 overflow-hidden">
-            {Array.from({ length: 6 }).map((_, i) => (
+            {Array.from({ length: 12 }).map((_, i) => (
               <div key={i} className="w-44 shrink-0 md:w-48 lg:w-52">
                 <div className="flex flex-col gap-2 p-2">
                   <Skeleton className="aspect-square w-full" />

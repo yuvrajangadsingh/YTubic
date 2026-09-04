@@ -143,70 +143,244 @@ mod secure_store {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     const KEYRING_USER: &str = "cookie-encryption-key-v1";
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn keyring_encryption_key() -> Result<[u8; KEYRING_KEY_LEN], String> {
-        use keyring::{Entry, Error};
-        use rand::RngCore;
+    /// Where the cookie key lives on disk (macOS). Set once from setup.
+    #[cfg(target_os = "macos")]
+    static KEY_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    #[cfg(target_os = "macos")]
+    const KEY_FILE: &str = "cookie.key";
 
-        let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER)
-            .map_err(|error| format!("system credential store is unavailable: {error}"))?;
+    /// Tell the store where the app's data directory is. macOS keeps the
+    /// cookie key in a file there instead of the keychain; see
+    /// `encryption_key` for why.
+    pub fn init(app_data_dir: std::path::PathBuf) {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = KEY_DIR.set(app_data_dir);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = app_data_dir;
+        }
+    }
 
-        match entry.get_secret() {
-            Ok(secret) => secret.try_into().map_err(|secret: Vec<u8>| {
-                format!(
-                    "system credential store returned an invalid YTubic key ({} bytes)",
-                    secret.len()
-                )
+    /// The key on disk, if there is one. `Ok(None)` when the file does not
+    /// exist; an error for a file of the wrong size, which must never be
+    /// papered over by minting (that would orphan the jar).
+    #[cfg(target_os = "macos")]
+    fn key_from_dir(dir: &std::path::Path) -> Result<Option<[u8; KEYRING_KEY_LEN]>, String> {
+        let path = dir.join(KEY_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => bytes.try_into().map(Some).map_err(|bytes: Vec<u8>| {
+                format!("{} is {} bytes, not {KEYRING_KEY_LEN}", path.display(), bytes.len())
             }),
-            Err(Error::NoEntry) => {
-                // A pre-rename install kept this key under the upstream
-                // identifier (see identity.rs); move it the first time
-                // we look and find nothing. Reading the old item shows
-                // the keychain dialog once more — its ACL names the old
-                // app identity — and never again after the move.
-                //
-                // If the old item EXISTS but cannot be read (the dialog
-                // denied, an ACL failure), minting a fresh key here
-                // would shadow the one the jar is encrypted with — on
-                // 2026-08-31 15:40 exactly that made an intact jar read
-                // as signed-out. Fail this run instead; the next launch
-                // asks again with nothing lost.
-                if let Ok(old) = Entry::new(crate::identity::OLD_ID, KEYRING_USER) {
-                    match old.get_secret() {
-                        Ok(secret) if secret.len() == KEYRING_KEY_LEN => {
-                            entry.set_secret(&secret).map_err(|error| {
-                                format!("failed to save key in system credential store: {error}")
-                            })?;
-                            let _ = old.delete_credential();
-                            eprintln!("[identity] moved the cookie key to the new keychain item");
-                            return secret
-                                .try_into()
-                                .map_err(|_| "unreachable: length checked above".to_string());
-                        }
-                        Ok(secret) => {
-                            eprintln!(
-                                "[identity] old cookie key is {} bytes, not {KEYRING_KEY_LEN}; ignoring it",
-                                secret.len()
-                            );
-                        }
-                        Err(Error::NoEntry) => {}
-                        Err(error) => {
-                            return Err(format!(
-                                "cookie key exists under the old identifier but could not be read ({error}); not minting a replacement"
-                            ));
-                        }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("read {}: {e}", path.display())),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn store_key_in_dir(dir: &std::path::Path, key: &[u8; KEYRING_KEY_LEN]) -> Result<(), String> {
+        crate::authfs::write_atomic_blocking(&dir.join(KEY_FILE), key, 0o600)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    mod key_file_tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn tmp() -> std::path::PathBuf {
+            let d = std::env::temp_dir().join(format!("ytubic-key-{}", rand::random::<u64>()));
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        #[test]
+        fn absent_file_is_none_not_an_error() {
+            let d = tmp();
+            assert_eq!(key_from_dir(&d).unwrap(), None);
+        }
+
+        #[test]
+        fn a_stored_key_reads_back_identical_and_private() {
+            let d = tmp();
+            let key = mint_key();
+            store_key_in_dir(&d, &key).unwrap();
+            assert_eq!(key_from_dir(&d).unwrap(), Some(key));
+            let mode = std::fs::metadata(d.join(KEY_FILE)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "key file must be owner-only");
+        }
+
+        #[test]
+        fn a_wrong_sized_file_is_an_error_never_silently_replaced() {
+            // Minting over a damaged file would orphan the jar; the caller
+            // must see the problem, not a fresh key.
+            let d = tmp();
+            std::fs::write(d.join(KEY_FILE), [7_u8; 31]).unwrap();
+            assert!(key_from_dir(&d).is_err());
+        }
+    }
+
+    /// The key an existing install already encrypts its jar with, read
+    /// from the system credential store: the current item, else the
+    /// pre-rename item (see identity.rs). `Ok(None)` when neither exists.
+    ///
+    /// An item that EXISTS but cannot be read (the dialog denied, an ACL
+    /// failure) is an error, never `None`: minting a fresh key in that
+    /// state would shadow the one the jar is encrypted with. On
+    /// 2026-08-31 15:40 exactly that made an intact jar read as
+    /// signed-out. Fail this run; the next launch asks again with
+    /// nothing lost.
+    /// Every well-formed key the credential store holds, current item
+    /// first, then the pre-rename item. ALL of them, not the first: on
+    /// Aug 31 a shadow item was minted under the current name while the
+    /// real key sat under the old one, and "first found wins" would have
+    /// chosen the shadow for ever. The caller checks candidates against
+    /// the jar they are meant to open.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn keyring_existing_keys() -> Result<Vec<[u8; KEYRING_KEY_LEN]>, String> {
+        use keyring::{Entry, Error};
+        let mut found = Vec::new();
+        for (service, label) in [
+            (KEYRING_SERVICE, "current"),
+            (crate::identity::OLD_ID, "pre-rename"),
+        ] {
+            let entry = Entry::new(service, KEYRING_USER)
+                .map_err(|error| format!("system credential store is unavailable: {error}"))?;
+            match entry.get_secret() {
+                Ok(secret) if secret.len() == KEYRING_KEY_LEN => {
+                    if let Ok(key) = <[u8; KEYRING_KEY_LEN]>::try_from(secret) {
+                        found.push(key);
                     }
                 }
-                let mut key = [0_u8; KEYRING_KEY_LEN];
-                rand::rngs::OsRng.fill_bytes(&mut key);
-                entry.set_secret(&key).map_err(|error| {
-                    format!("failed to save key in system credential store: {error}")
-                })?;
-                Ok(key)
+                Ok(secret) => {
+                    eprintln!(
+                        "[secure] {label} keychain key is {} bytes, not {KEYRING_KEY_LEN}; ignoring it",
+                        secret.len()
+                    );
+                }
+                Err(Error::NoEntry) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "the {label} cookie key exists in the system credential store but could not be read ({error}); not minting a replacement"
+                    ));
+                }
             }
-            Err(error) => Err(format!(
-                "failed to read key from system credential store: {error}"
-            )),
+        }
+        Ok(found)
+    }
+
+    /// Encrypted jars already on disk under `accounts/<id>/cookies.enc`.
+    /// While any exist, a key is only accepted if it opens one of them,
+    /// and none is ever minted: a fresh key beside an existing jar is the
+    /// exact failure that made an intact jar read as signed-out.
+    #[cfg(target_os = "macos")]
+    fn existing_jars(app_data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let Ok(accounts) = std::fs::read_dir(app_data_dir.join("accounts")) else {
+            return Vec::new();
+        };
+        accounts
+            .flatten()
+            .map(|e| e.path().join("cookies.enc"))
+            .filter(|p| p.is_file())
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn opens_a_jar(key: &[u8; KEYRING_KEY_LEN], jars: &[std::path::PathBuf]) -> bool {
+        jars.iter().any(|jar| {
+            std::fs::read(jar)
+                .map(|bytes| keyring_decrypt_with_key(&bytes, key).is_ok())
+                .unwrap_or(false)
+        })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn mint_key() -> [u8; KEYRING_KEY_LEN] {
+        use rand::RngCore;
+        let mut key = [0_u8; KEYRING_KEY_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut key);
+        key
+    }
+
+    /// The 32-byte key the cookie jar is encrypted with.
+    ///
+    /// macOS: a 0600 file in the app's data directory, not a keychain
+    /// item. A keychain item's access list is keyed to each build's code
+    /// hash when the app has no Apple Team ID, so every rebuild and every
+    /// update put up the "YTubic wants to access key" dialog, and on
+    /// 2026-09-04 the first play after a relaunch waited 99 seconds on
+    /// it. The keychain was guarding a key whose product already sits on
+    /// disk: the jar is written out in plain text for yt-dlp, 0600, in
+    /// the same directory. A 0600 file beside it gives up nothing that
+    /// file did not already give up, and never asks.
+    ///
+    /// The first run after this change reads the existing keychain item
+    /// one final time (one last dialog) so the jar stays readable, writes
+    /// the file, and leaves the item in place unread. A fresh install
+    /// mints straight into the file and never touches the keychain.
+    ///
+    /// Linux: unchanged, the system credential store as before.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn encryption_key() -> Result<[u8; KEYRING_KEY_LEN], String> {
+        #[cfg(target_os = "macos")]
+        {
+            let dir = KEY_DIR
+                .get()
+                .ok_or_else(|| "secure store used before init".to_string())?;
+            if let Some(key) = key_from_dir(dir)? {
+                return Ok(key);
+            }
+            // Startup encrypts and decrypts from several tasks at once.
+            // On the first run of this build they all found no file and
+            // each went to the keychain: the migration line logged twice
+            // and a third caller held a dialog open (2026-09-04 13:33).
+            // Serialise the slow path and re-check under the lock so the
+            // keychain is read exactly once.
+            static MIGRATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _serial = MIGRATION
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(key) = key_from_dir(dir)? {
+                return Ok(key);
+            }
+            let candidates = keyring_existing_keys()?;
+            let jars = existing_jars(dir);
+            let (key, origin) = if jars.is_empty() {
+                match candidates.into_iter().next() {
+                    Some(key) => (key, "moved from the keychain"),
+                    None => (mint_key(), "minted"),
+                }
+            } else {
+                // A jar exists, so only a key that opens it is the key.
+                match candidates.into_iter().find(|k| opens_a_jar(k, &jars)) {
+                    Some(key) => (key, "moved from the keychain, verified against the jar"),
+                    None => {
+                        return Err(format!(
+                            "{} encrypted cookie jar(s) exist but no keychain key opens them; not minting a replacement",
+                            jars.len()
+                        ));
+                    }
+                }
+            };
+            store_key_in_dir(dir, &key)?;
+            eprintln!(
+                "[secure] cookie key {origin}; it lives in {} now and the keychain will not be asked again",
+                dir.join(KEY_FILE).display()
+            );
+            Ok(key)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use keyring::Entry;
+            if let Some(key) = keyring_existing_keys()?.into_iter().next() {
+                return Ok(key);
+            }
+            let key = mint_key();
+            Entry::new(KEYRING_SERVICE, KEYRING_USER)
+                .map_err(|error| format!("system credential store is unavailable: {error}"))?
+                .set_secret(&key)
+                .map_err(|error| format!("failed to save key in system credential store: {error}"))?;
+            Ok(key)
         }
     }
 
@@ -262,7 +436,7 @@ mod secure_store {
     pub fn encrypt(plain: &[u8]) -> Result<Vec<u8>, String> {
         use rand::RngCore;
 
-        let key = keyring_encryption_key()?;
+        let key = encryption_key()?;
         let mut nonce = [0_u8; KEYRING_NONCE_LEN];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         keyring_encrypt_with_key(plain, &key, &nonce)
@@ -273,7 +447,7 @@ mod secure_store {
         if !encrypted.starts_with(KEYRING_MAGIC) {
             return Ok(encrypted.to_vec());
         }
-        let key = keyring_encryption_key()?;
+        let key = encryption_key()?;
         keyring_decrypt_with_key(encrypted, &key)
     }
 
@@ -2979,10 +3153,15 @@ async fn delete_cache_entries(
                 freed += meta.len();
             }
             let _ = tokio::fs::remove_file(&path).await;
+            let _ = tokio::fs::remove_file(stream_proxy::degraded_marker(&path)).await;
             let _ = tokio::fs::remove_file(dir.join(part_name)).await;
         }
         for variant in [StreamVariant::Audio, StreamVariant::Muxed] {
             let (part_name, final_name) = stream_file_names(&id, variant);
+            // A degraded marker must go with its file, or a later good
+            // copy under the same name inherits it and gets evicted.
+            let _ =
+                tokio::fs::remove_file(stream_proxy::degraded_marker(&dir.join(&final_name))).await;
             let path = dir.join(final_name);
             if let Ok(meta) = tokio::fs::metadata(&path).await {
                 freed += meta.len();
@@ -4282,6 +4461,7 @@ async fn proxy_ensure(
     variant: StreamVariant,
     target_dir: &std::path::Path,
     map_key: &str,
+    background: bool,
 ) -> Result<Arc<stream_proxy::ProxyState>, String> {
     let cell = {
         let mut map = srv.proxies.lock().await;
@@ -4310,12 +4490,14 @@ async fn proxy_ensure(
                 cookies: ytdlp_cookie_file(&srv.app).await,
             };
             let t0 = std::time::Instant::now();
-            let state = stream_proxy::prepare(&srv.http, &ctx).await?;
+            let state = stream_proxy::prepare(&srv.http, &ctx, background).await?;
             eprintln!(
-                "[proxy] {video_id}: resolved+probed in {:.2}s (total={} mime={})",
+                "[proxy] {video_id}: resolved+probed in {:.2}s (total={} mime={} format={}{})",
                 t0.elapsed().as_secs_f32(),
                 state.total,
-                state.mime
+                state.mime,
+                state.format_id.as_deref().unwrap_or("?"),
+                if state.degraded { " degraded" } else { "" }
             );
 
             // Claim the legacy downloads slot so /prefetch and fallback
@@ -4516,7 +4698,13 @@ async fn stream_handler(
     );
 
     if !final_path.exists() {
-        match proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key).await {
+        // Mark the id as wanted by a play for as long as this request is
+        // waiting on the cell, so a prefetch already queued for it stops
+        // waiting as background work (see stream_proxy::foreground_waiting).
+        stream_proxy::foreground_waiting(&video_id, true);
+        let ensured = proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key, false).await;
+        stream_proxy::foreground_waiting(&video_id, false);
+        match ensured {
             Ok(pstate) => {
                 let range = (!range_hdr.is_empty()).then_some(range_hdr.as_str());
                 return proxy_respond(&srv, pstate, &video_id, variant, &target_dir, range, t0)
@@ -4663,6 +4851,29 @@ async fn cover_serve_handler(
 /// same `?ephemeral=1` flag as /stream so non-Premium prefetches (if
 /// the frontend ever lets one through) land in the session-only pool
 /// rather than the persistent cache.
+/// Drop the anonymous fallback's cached files (see `ProxyState.degraded`),
+/// except the track named by `?keep=<id>`, which is the one playing now
+/// and must stay readable. The frontend calls this whenever a track
+/// starts, which also covers the first play after a launch, so a degraded
+/// copy is never replayed once playback has moved on.
+async fn degraded_evict_handler(
+    AxumState(srv): AxumState<StreamServer>,
+    req: Request,
+) -> StatusCode {
+    let keep = req
+        .uri()
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("keep=")))
+        .map(str::to_string)
+        .filter(|id| sanitize_video_id(id));
+    let mut n = stream_proxy::evict_degraded(&srv.cache_dir, keep.as_deref()).await;
+    n += stream_proxy::evict_degraded(&srv.ephemeral_dir, keep.as_deref()).await;
+    if n > 0 {
+        eprintln!("[proxy] evicted {n} degraded cache file(s)");
+    }
+    StatusCode::NO_CONTENT
+}
+
 async fn prefetch_handler(
     AxumState(srv): AxumState<StreamServer>,
     Path(video_id): Path<String>,
@@ -4694,7 +4905,7 @@ async fn prefetch_handler(
     // Preferred: start (or join) a range-proxy download. proxy_ensure
     // claims the downloads slot atomically itself, so a concurrent
     // /stream or /prefetch can't start a second writer for the key.
-    if proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key)
+    if proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key, true)
         .await
         .is_ok()
     {
@@ -4799,6 +5010,7 @@ async fn start_stream_server(
     let routes = Router::new()
         .route("/stream/:video_id", get(stream_handler))
         .route("/prefetch/:video_id", get(prefetch_handler))
+        .route("/degraded/evict", get(degraded_evict_handler))
         .route("/cover/:filename", get(cover_serve_handler))
         .with_state(server);
     let app = Router::new()
@@ -5113,6 +5325,11 @@ pub fn run() {
             // From here on stderr lands in the app log with timestamps,
             // however the app was launched.
             applog::init(app.handle());
+            // The cookie key's home on macOS; must precede the first
+            // encrypt/decrypt, which the session load below performs.
+            if let Ok(dir) = app.path().app_data_dir() {
+                secure_store::init(dir);
+            }
             for line in &identity_report {
                 eprintln!("[identity] {line}");
             }
@@ -5200,6 +5417,32 @@ pub fn run() {
                     if let Some(settings) = WebViewExt::settings(&wv) {
                         settings.set_enable_smooth_scrolling(true);
                     }
+                });
+            }
+            // WebKit treats a window on another Space as occluded and marks
+            // the page hidden. Measured on 2026-09-04, all from that one
+            // state: rendering stops (the Space thumbnail goes flat grey),
+            // timers slow to one tick per several minutes, a pending
+            // play() is aborted on the visible-to-hidden edge, and after a
+            // long pause remote media commands are accepted by WebKit and
+            // never reach the page. Nothing inside the page can undo any of
+            // it; this turns the detection off at the source, with the
+            // same private WebKit property Electron-style shells set. The
+            // cost is rendering a window nobody is looking at, which for
+            // a music player is nothing next to the bugs it removes. App
+            // Nap is handled separately in app_nap.rs.
+            #[cfg(target_os = "macos")]
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.with_webview(|webview| unsafe {
+                    use objc2::msg_send;
+                    use objc2::runtime::AnyObject;
+                    let wk: *mut AnyObject = webview.inner().cast();
+                    if wk.is_null() {
+                        eprintln!("[webkit] no WKWebView handle; occlusion detection left on");
+                        return;
+                    }
+                    let _: () = msg_send![wk, _setWindowOcclusionDetectionEnabled: false];
+                    eprintln!("[webkit] window occlusion detection disabled for the main window");
                 });
             }
             // Debug builds swap the taskbar/window icon to the orange
