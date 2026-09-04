@@ -102,6 +102,36 @@ describe("looksLikeSiteChrome", () => {
     ).toBe(false);
   });
 
+  it("a repeated hook is one word, not three pieces of chrome", () => {
+    // Review finding: "Home / Home / Home" counted as three hits.
+    expect(
+      looksLikeSiteChrome([
+        "Home",
+        "Home",
+        "Home",
+        "Take me home tonight",
+        "I don't want to let you go till you see the light",
+      ]),
+    ).toBe(false);
+  });
+
+  it("a chant of short lines with one chrome word is a song", () => {
+    expect(
+      looksLikeSiteChrome([
+        "Home",
+        "Hey",
+        "Ho",
+        "Hey",
+        "Ho",
+        "Hey",
+        "Ho",
+        "Hey",
+        "Ho",
+        "Home",
+      ]),
+    ).toBe(false);
+  });
+
   it("empty input is not chrome", () => {
     expect(looksLikeSiteChrome([])).toBe(false);
     expect(looksLikeSiteChrome(["", "  "])).toBe(false);

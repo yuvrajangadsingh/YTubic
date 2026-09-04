@@ -81,7 +81,11 @@ export function looksLikeSiteChrome(lines: string[]): boolean {
     .filter(Boolean)
     .slice(0, HEAD_LINES);
   if (head.length === 0) return false;
-  const chromeHits = head.filter((l) => CHROME_LINES.has(chromeKey(l))).length;
+  // DISTINCT chrome terms. A hook that repeats ("Home / Home / Home") is
+  // one word said three times, not three pieces of a navigation bar.
+  const chromeHits = new Set(
+    head.map(chromeKey).filter((k) => CHROME_LINES.has(k)),
+  ).size;
   if (chromeHits >= CHROME_HITS_ALONE) return true;
   if (chromeHits < CHROME_HITS_WITH_SHAPE) return false;
   const shortLabels = head.filter(

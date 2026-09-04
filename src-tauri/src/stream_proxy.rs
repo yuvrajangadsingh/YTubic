@@ -95,6 +95,12 @@ const TIMED_OUT_PREFIX: &str = "yt-dlp -j timed out after";
 /// blocking path is the honest next step.
 const FALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long a signed-in resolve may run before an anonymous one is
+/// started alongside it (the hedge). 12s is the measured 90th percentile
+/// of signed-in resolves, so about one fetched play in ten hedges; the
+/// rest never notice. His call, 2026-09-04: 12 over 15.
+const HEDGE_AFTER: Duration = Duration::from_secs(12);
+
 /// Resolver admission. Plays go first; speculative work waits.
 ///
 /// Measured 2026-09-04: a resolve that overlapped another resolve
@@ -122,16 +128,72 @@ impl Drop for ForegroundGuard {
     }
 }
 
+/// Video ids a play is waiting on right now. A prefetch that is still
+/// queued for admission when the user clicks the same track must not
+/// keep waiting as background work: the click joined its single-flight
+/// cell and inherits whatever priority the cell's initialiser has
+/// (review finding, 2026-09-04). `stream_handler` marks the id before it
+/// awaits the cell and clears it after; `admit_background` treats the
+/// mark as its cue to stop waiting, and `prepare` then counts the resolve
+/// as foreground.
+static FOREGROUND_WAITING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+pub fn foreground_waiting(video_id: &str, waiting: bool) {
+    let mut set = FOREGROUND_WAITING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if waiting {
+        set.insert(video_id.to_string());
+    } else {
+        set.remove(video_id);
+    }
+}
+
+fn foreground_wants(video_id: &str) -> bool {
+    FOREGROUND_WAITING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(video_id)
+}
+
+/// Outcome of background admission. `Skip` means the prefetch is not run
+/// at all: the earlier version let a timed-out wait proceed WITHOUT a
+/// permit, so every prefetch that had queued up for 45s then started
+/// yt-dlp together, which is the overlap this exists to prevent.
+enum Admission {
+    Slot(tokio::sync::SemaphorePermit<'static>),
+    /// A play for this id arrived while waiting: run it as foreground.
+    Promoted,
+    Skip,
+}
+
 /// Wait for the background slot, then for the foreground to go quiet.
-async fn admit_background(video_id: &str) -> Option<tokio::sync::SemaphorePermit<'static>> {
+async fn admit_background(video_id: &str) -> Admission {
     let started = std::time::Instant::now();
-    let permit = tokio::time::timeout(BACKGROUND_MAX_WAIT, BACKGROUND_SLOT.acquire())
-        .await
-        .ok()?
-        .ok()?;
+    let permit = loop {
+        if foreground_wants(video_id) {
+            return Admission::Promoted;
+        }
+        match tokio::time::timeout(Duration::from_millis(250), BACKGROUND_SLOT.acquire()).await {
+            Ok(Ok(p)) => break p,
+            Ok(Err(_)) => return Admission::Skip,
+            Err(_) if started.elapsed() > BACKGROUND_MAX_WAIT => {
+                eprintln!("[proxy] {video_id}: prefetch skipped, resolver busy for 45s");
+                return Admission::Skip;
+            }
+            Err(_) => {}
+        }
+    };
     while FOREGROUND_RESOLVES.load(Ordering::SeqCst) > 0 {
+        if foreground_wants(video_id) {
+            drop(permit);
+            return Admission::Promoted;
+        }
         if started.elapsed() > BACKGROUND_MAX_WAIT {
-            break;
+            eprintln!("[proxy] {video_id}: prefetch skipped, foreground busy for 45s");
+            return Admission::Skip;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -142,7 +204,7 @@ async fn admit_background(video_id: &str) -> Option<tokio::sync::SemaphorePermit
             waited.as_secs_f32()
         );
     }
-    Some(permit)
+    Admission::Slot(permit)
 }
 
 /// Filler download chunk: one ranged request per chunk (see fill()).
@@ -232,12 +294,24 @@ pub async fn prepare(
     // Admission: see FOREGROUND_RESOLVES. A background (prefetch) resolve
     // takes the single background slot and yields to any play in flight;
     // a foreground resolve registers itself so background work holds off.
+    let mut foreground = !background;
     let _permit = if background {
-        admit_background(&ctx.video_id).await
+        match admit_background(&ctx.video_id).await {
+            Admission::Slot(p) => Some(p),
+            Admission::Promoted => {
+                eprintln!(
+                    "[proxy] {}: prefetch promoted, a play is waiting on it",
+                    ctx.video_id
+                );
+                foreground = true;
+                None
+            }
+            Admission::Skip => return Err("prefetch skipped: resolver busy".to_string()),
+        }
     } else {
         None
     };
-    let _foreground = (!background).then(ForegroundGuard::enter);
+    let _foreground = foreground.then(ForegroundGuard::enter);
     let resolved = resolve(ctx).await?;
     let total = probe_total(client, &resolved.url).await?;
     if total < MIN_TOTAL {
@@ -279,7 +353,13 @@ pub async fn evict_degraded(dir: &Path, keep: Option<&str>) -> usize {
         let Some(file_name) = name.strip_suffix(".degraded") else {
             continue;
         };
-        if keep.is_some_and(|k| file_name.starts_with(k)) {
+        // Exact id, not a prefix: "abc" must not spare "abcdef.webm".
+        let id = file_name
+            .strip_suffix(".video.mp4")
+            .or_else(|| file_name.strip_suffix(".webm"))
+            .or_else(|| file_name.split(".vonly").next().filter(|_| file_name.contains(".vonly")))
+            .unwrap_or(file_name);
+        if keep.is_some_and(|k| k == id) {
             continue;
         }
         let file = dir.join(file_name);
@@ -339,9 +419,74 @@ struct Resolved {
 /// is what shipped before 0.4.2 (130k, no Premium tracks), a downgrade
 /// rather than a 502, and the reason now goes into the log with it.
 async fn resolve(ctx: &ResolveCtx) -> Result<Resolved, String> {
-    match resolve_with(ctx, ctx.cookies.as_deref(), RESOLVE_TIMEOUT).await {
+    // Anonymous tracks resolve once, plainly.
+    let Some(cookies) = ctx.cookies.as_deref() else {
+        return resolve_with(ctx, None, RESOLVE_TIMEOUT).await;
+    };
+
+    // Signed-in: run the real resolve, and if it is still going at
+    // HEDGE_AFTER, start an anonymous one alongside and take whichever
+    // finishes first. The signed-in path hung past 12s on one fetched
+    // play in ten today (17.7s, 29s, 41s, 98s); the anonymous path,
+    // measured at 2.0s, would have had sound in each within seconds. The
+    // hedge only ever costs the anonymous tier on a play that was already
+    // slow, and that copy is marked degraded so it is not kept.
+    let signed = resolve_with(ctx, Some(cookies), RESOLVE_TIMEOUT);
+    tokio::pin!(signed);
+    let hedge_timer = tokio::time::sleep(HEDGE_AFTER);
+    tokio::pin!(hedge_timer);
+
+    let signed_result = tokio::select! {
+        r = &mut signed => Some(r),
+        _ = &mut hedge_timer => None,
+    };
+    let signed_result = match signed_result {
+        Some(r) => r,
+        None => {
+            eprintln!(
+                "[proxy] {}: signed-in resolve past {}s; hedging with an anonymous resolve",
+                ctx.video_id,
+                HEDGE_AFTER.as_secs()
+            );
+            let anon = resolve_with(ctx, None, FALLBACK_TIMEOUT);
+            tokio::pin!(anon);
+            tokio::select! {
+                r = &mut signed => match r {
+                    // The signed path came through after all: it wins,
+                    // the anonymous child is dropped (kill_on_drop).
+                    Ok(r) => return Ok(r),
+                    // Signed died; whatever the hedge returns is the answer.
+                    Err(e) => {
+                        eprintln!("[proxy] {}: signed-in resolve failed while hedged ({e})", ctx.video_id);
+                        let mut a = anon.await?;
+                        a.degraded = true;
+                        return Ok(a);
+                    }
+                },
+                a = &mut anon => match a {
+                    Ok(mut a) => {
+                        a.degraded = true;
+                        eprintln!(
+                            "[proxy] {}: anonymous hedge won with format {} (degraded; not kept as the cached copy)",
+                            ctx.video_id,
+                            a.format_id.as_deref().unwrap_or("?")
+                        );
+                        return Ok(a);
+                    }
+                    // The hedge itself failed; fall through to the signed
+                    // result, whatever it turns out to be.
+                    Err(e) => {
+                        eprintln!("[proxy] {}: anonymous hedge failed ({e}); waiting on signed-in", ctx.video_id);
+                        signed.await
+                    }
+                },
+            }
+        }
+    };
+
+    match signed_result {
         Ok(r) => Ok(r),
-        Err(e) if ctx.cookies.is_some() && e.contains("Requested format is not available") => {
+        Err(e) if e.contains("Requested format is not available") => {
             eprintln!(
                 "[proxy] {}: signed-in extraction returned no formats; retrying anonymously ({e})",
                 ctx.video_id
@@ -774,16 +919,31 @@ async fn fill(
         );
         return false;
     }
-    if let Err(e) = tokio::fs::rename(part_path, final_path).await {
-        eprintln!("[proxy] {} rename: {e}", ctx.video_id);
-        return false;
-    }
+    let marker = degraded_marker(final_path);
     if state.degraded {
         // The file has to land under its canonical name so the play in
         // progress keeps reading it. The marker is what stops it being
         // treated as the real cached copy afterwards: evicted when
-        // playback moves on and at the next launch.
-        let _ = tokio::fs::write(degraded_marker(final_path), b"").await;
+        // playback moves on and at the next launch. It is committed
+        // BEFORE the rename: the other order left a window (a full disk,
+        // a crash between the two) in which an unmarked low-tier file
+        // became the permanent cached copy. If the marker cannot be
+        // written the file is not published at all.
+        if let Err(e) = tokio::fs::write(&marker, b"").await {
+            eprintln!("[proxy] {} degraded marker: {e}; not publishing", ctx.video_id);
+            let _ = tokio::fs::remove_file(part_path).await;
+            return false;
+        }
+    } else {
+        // A stale marker from an earlier degraded copy must not outlive
+        // the good file that replaces it, or the next eviction deletes
+        // the good file.
+        let _ = tokio::fs::remove_file(&marker).await;
+    }
+    if let Err(e) = tokio::fs::rename(part_path, final_path).await {
+        eprintln!("[proxy] {} rename: {e}", ctx.video_id);
+        let _ = tokio::fs::remove_file(&marker).await;
+        return false;
     }
     eprintln!(
         "[proxy] cached {} ({total} bytes in {:.2}s{})",

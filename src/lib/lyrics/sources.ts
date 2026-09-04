@@ -95,7 +95,9 @@ export function useLyricsSources(
 
   // Keyed on the videoId alone. No title, no artist, nothing to normalise.
   const ytmusic = useQuery({
-    queryKey: ["lyrics", "ytmusic-v1", track?.videoId],
+    // v2: results now pass the site-chrome gate (plausibility.ts); orphan
+    // v1 entries that hydrate from the persisted cache without running it.
+    queryKey: ["lyrics", "ytmusic-v2", track?.videoId],
     queryFn: () =>
       fetchYtMusicLyrics(
         track!.videoId,
@@ -149,7 +151,8 @@ export function useLyricsSources(
   });
 
   const musixmatch = useQuery({
-    queryKey: ["lyrics", "musixmatch-v3", title, artistName, track?.duration],
+    // v4: site-chrome gate; orphan v3 entries that bypass it from the cache.
+    queryKey: ["lyrics", "musixmatch-v4", title, artistName, track?.duration],
     queryFn: () =>
       fetchMusixmatchLyrics(
         {
@@ -165,7 +168,8 @@ export function useLyricsSources(
   });
 
   const genius = useQuery({
-    queryKey: ["lyrics", "genius-v3", title, artistName],
+    // v4: site-chrome gate; orphan v3 entries that bypass it from the cache.
+    queryKey: ["lyrics", "genius-v4", title, artistName],
     queryFn: () =>
       fetchGeniusLyrics(
         {
