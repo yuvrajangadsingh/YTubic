@@ -56,9 +56,6 @@ let mediaElSingleton: HTMLVideoElement | null = null;
 const STORM_WINDOW_MS = 1000;
 const STORM_FLIPS = 8;
 const STORM_HOLD_MS = 5000;
-
-// See the media-session keepalive effect in useAudioEngine.
-const MEDIA_SESSION_KEEPALIVE_MS = 60_000;
 let stormActiveUntil = 0;
 let flipTimes: number[] = [];
 // The last play/pause the user asked for while a storm was being held
@@ -1445,40 +1442,15 @@ export function useAudioEngine() {
     applyMediaSessionPosition(s.position, dur);
   }, [track, playing, videoStartupPhase]);
 
-  // Media-session keepalive while paused. A hack, and labelled as one.
-  //
-  // 2026-09-04: F8 pressed 78+ minutes into a pause reached macOS, was
-  // routed to this app's WebKit process (mediaremoted: "Sending command
-  // TogglePlayPause ... com.apple.WebKit.GPU/<bundle id>", accepted in
-  // 10ms) and never reached the page: no mediaSession handler fired. The
-  // same press 66s into a pause worked. WebKit stops forwarding remote
-  // commands to a page whose media has sat paused long enough, and
-  // instead queues a resume for the next time the window is visible,
-  // which is the "switched Space and it started playing" report.
-  //
-  // WKWebView offers no way to suppress or replace its session (see
-  // upstream 3a9db77), so this re-asserts the session's metadata and
-  // paused state once a minute while paused, betting that WebKit's
-  // liveness judgement keys off recent activity. Nothing documents that.
-  // The real fix is native playback in Rust (Linear ME-34), where the
-  // app owns the session outright. Verified only by a real long pause.
-  useEffect(() => {
-    if (!track || playing) return;
-    if (typeof navigator === "undefined" || !navigator.mediaSession) return;
-    if (!navigator.userAgent.includes("Mac")) return;
-    let ticks = 0;
-    const id = window.setInterval(() => {
-      const s = usePlaybackStore.getState();
-      const dur = s.duration > 0 ? s.duration : (track.duration ?? 0);
-      applyMediaSessionMetadata(track, false);
-      applyMediaSessionPosition(s.position, dur);
-      ticks += 1;
-      if (ticks === 1 || ticks % 10 === 0) {
-        appLog(`mediaSession keepalive: tick ${ticks}, paused ${ticks} min`);
-      }
-    }, MEDIA_SESSION_KEEPALIVE_MS);
-    return () => window.clearInterval(id);
-  }, [track, playing]);
+  // There is deliberately no keepalive for WebKit's media session here.
+  // One was tried on 2026-09-04 (re-asserting metadata and paused state
+  // once a minute while paused) and failed its first real test: WebKit
+  // throttled the interval itself once the page was hidden (one tick per
+  // 4.5 minutes instead of one a minute), and an F8 press 65 minutes into
+  // the pause still never reached the page. Page-level tricks do not
+  // survive WebKit's hidden-page state. After a long pause, playback
+  // resumes from the app's own play button; the fix is native playback
+  // in Rust, where the app owns the session outright (Linear ME-34).
 
   // What the storm breaker does when a hold ends (see noteFlip). Reset
   // drops the source and lets the resolve effect re-install it through
