@@ -102,6 +102,12 @@ export function WhatsNewDialog() {
           chips' punch-through outlines and the bottom fade blend into
           it instead of the plain dialog background. */}
       <DialogContent
+        // Radix focuses the first focusable element on open, which here is
+        // the newest entry's expand button, and it paints a focus ring
+        // around that entry that reads as a selection nobody made.
+        // Keyboard users can still Tab into the list. Ported from upstream
+        // 7637a14.
+        onOpenAutoFocus={(e) => e.preventDefault()}
         overlayClassName={frostedDialogOverlay}
         className={cn(
           "flex h-[min(760px,85vh)] w-[640px] max-w-[calc(100vw-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-[640px] [--wn-bg:var(--background)] dark:[--wn-bg:oklch(0.19_0_0)]",
