@@ -230,9 +230,16 @@ mod secure_store {
     /// 2026-08-31 15:40 exactly that made an intact jar read as
     /// signed-out. Fail this run; the next launch asks again with
     /// nothing lost.
+    /// Every well-formed key the credential store holds, current item
+    /// first, then the pre-rename item. ALL of them, not the first: on
+    /// Aug 31 a shadow item was minted under the current name while the
+    /// real key sat under the old one, and "first found wins" would have
+    /// chosen the shadow for ever. The caller checks candidates against
+    /// the jar they are meant to open.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn keyring_existing_key() -> Result<Option<[u8; KEYRING_KEY_LEN]>, String> {
+    fn keyring_existing_keys() -> Result<Vec<[u8; KEYRING_KEY_LEN]>, String> {
         use keyring::{Entry, Error};
+        let mut found = Vec::new();
         for (service, label) in [
             (KEYRING_SERVICE, "current"),
             (crate::identity::OLD_ID, "pre-rename"),
@@ -241,10 +248,9 @@ mod secure_store {
                 .map_err(|error| format!("system credential store is unavailable: {error}"))?;
             match entry.get_secret() {
                 Ok(secret) if secret.len() == KEYRING_KEY_LEN => {
-                    return secret
-                        .try_into()
-                        .map(Some)
-                        .map_err(|_| "unreachable: length checked above".to_string());
+                    if let Ok(key) = <[u8; KEYRING_KEY_LEN]>::try_from(secret) {
+                        found.push(key);
+                    }
                 }
                 Ok(secret) => {
                     eprintln!(
@@ -260,7 +266,32 @@ mod secure_store {
                 }
             }
         }
-        Ok(None)
+        Ok(found)
+    }
+
+    /// Encrypted jars already on disk under `accounts/<id>/cookies.enc`.
+    /// While any exist, a key is only accepted if it opens one of them,
+    /// and none is ever minted: a fresh key beside an existing jar is the
+    /// exact failure that made an intact jar read as signed-out.
+    #[cfg(target_os = "macos")]
+    fn existing_jars(app_data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let Ok(accounts) = std::fs::read_dir(app_data_dir.join("accounts")) else {
+            return Vec::new();
+        };
+        accounts
+            .flatten()
+            .map(|e| e.path().join("cookies.enc"))
+            .filter(|p| p.is_file())
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn opens_a_jar(key: &[u8; KEYRING_KEY_LEN], jars: &[std::path::PathBuf]) -> bool {
+        jars.iter().any(|jar| {
+            std::fs::read(jar)
+                .map(|bytes| keyring_decrypt_with_key(&bytes, key).is_ok())
+                .unwrap_or(false)
+        })
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -312,9 +343,24 @@ mod secure_store {
             if let Some(key) = key_from_dir(dir)? {
                 return Ok(key);
             }
-            let (key, origin) = match keyring_existing_key()? {
-                Some(key) => (key, "moved from the keychain"),
-                None => (mint_key(), "minted"),
+            let candidates = keyring_existing_keys()?;
+            let jars = existing_jars(dir);
+            let (key, origin) = if jars.is_empty() {
+                match candidates.into_iter().next() {
+                    Some(key) => (key, "moved from the keychain"),
+                    None => (mint_key(), "minted"),
+                }
+            } else {
+                // A jar exists, so only a key that opens it is the key.
+                match candidates.into_iter().find(|k| opens_a_jar(k, &jars)) {
+                    Some(key) => (key, "moved from the keychain, verified against the jar"),
+                    None => {
+                        return Err(format!(
+                            "{} encrypted cookie jar(s) exist but no keychain key opens them; not minting a replacement",
+                            jars.len()
+                        ));
+                    }
+                }
             };
             store_key_in_dir(dir, &key)?;
             eprintln!(
@@ -326,7 +372,7 @@ mod secure_store {
         #[cfg(target_os = "linux")]
         {
             use keyring::Entry;
-            if let Some(key) = keyring_existing_key()? {
+            if let Some(key) = keyring_existing_keys()?.into_iter().next() {
                 return Ok(key);
             }
             let key = mint_key();
@@ -3107,10 +3153,15 @@ async fn delete_cache_entries(
                 freed += meta.len();
             }
             let _ = tokio::fs::remove_file(&path).await;
+            let _ = tokio::fs::remove_file(stream_proxy::degraded_marker(&path)).await;
             let _ = tokio::fs::remove_file(dir.join(part_name)).await;
         }
         for variant in [StreamVariant::Audio, StreamVariant::Muxed] {
             let (part_name, final_name) = stream_file_names(&id, variant);
+            // A degraded marker must go with its file, or a later good
+            // copy under the same name inherits it and gets evicted.
+            let _ =
+                tokio::fs::remove_file(stream_proxy::degraded_marker(&dir.join(&final_name))).await;
             let path = dir.join(final_name);
             if let Ok(meta) = tokio::fs::metadata(&path).await {
                 freed += meta.len();
@@ -4410,6 +4461,7 @@ async fn proxy_ensure(
     variant: StreamVariant,
     target_dir: &std::path::Path,
     map_key: &str,
+    background: bool,
 ) -> Result<Arc<stream_proxy::ProxyState>, String> {
     let cell = {
         let mut map = srv.proxies.lock().await;
@@ -4438,12 +4490,14 @@ async fn proxy_ensure(
                 cookies: ytdlp_cookie_file(&srv.app).await,
             };
             let t0 = std::time::Instant::now();
-            let state = stream_proxy::prepare(&srv.http, &ctx).await?;
+            let state = stream_proxy::prepare(&srv.http, &ctx, background).await?;
             eprintln!(
-                "[proxy] {video_id}: resolved+probed in {:.2}s (total={} mime={})",
+                "[proxy] {video_id}: resolved+probed in {:.2}s (total={} mime={} format={}{})",
                 t0.elapsed().as_secs_f32(),
                 state.total,
-                state.mime
+                state.mime,
+                state.format_id.as_deref().unwrap_or("?"),
+                if state.degraded { " degraded" } else { "" }
             );
 
             // Claim the legacy downloads slot so /prefetch and fallback
@@ -4644,7 +4698,13 @@ async fn stream_handler(
     );
 
     if !final_path.exists() {
-        match proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key).await {
+        // Mark the id as wanted by a play for as long as this request is
+        // waiting on the cell, so a prefetch already queued for it stops
+        // waiting as background work (see stream_proxy::foreground_waiting).
+        stream_proxy::foreground_waiting(&video_id, true);
+        let ensured = proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key, false).await;
+        stream_proxy::foreground_waiting(&video_id, false);
+        match ensured {
             Ok(pstate) => {
                 let range = (!range_hdr.is_empty()).then_some(range_hdr.as_str());
                 return proxy_respond(&srv, pstate, &video_id, variant, &target_dir, range, t0)
@@ -4791,6 +4851,29 @@ async fn cover_serve_handler(
 /// same `?ephemeral=1` flag as /stream so non-Premium prefetches (if
 /// the frontend ever lets one through) land in the session-only pool
 /// rather than the persistent cache.
+/// Drop the anonymous fallback's cached files (see `ProxyState.degraded`),
+/// except the track named by `?keep=<id>`, which is the one playing now
+/// and must stay readable. The frontend calls this whenever a track
+/// starts, which also covers the first play after a launch, so a degraded
+/// copy is never replayed once playback has moved on.
+async fn degraded_evict_handler(
+    AxumState(srv): AxumState<StreamServer>,
+    req: Request,
+) -> StatusCode {
+    let keep = req
+        .uri()
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("keep=")))
+        .map(str::to_string)
+        .filter(|id| sanitize_video_id(id));
+    let mut n = stream_proxy::evict_degraded(&srv.cache_dir, keep.as_deref()).await;
+    n += stream_proxy::evict_degraded(&srv.ephemeral_dir, keep.as_deref()).await;
+    if n > 0 {
+        eprintln!("[proxy] evicted {n} degraded cache file(s)");
+    }
+    StatusCode::NO_CONTENT
+}
+
 async fn prefetch_handler(
     AxumState(srv): AxumState<StreamServer>,
     Path(video_id): Path<String>,
@@ -4822,7 +4905,7 @@ async fn prefetch_handler(
     // Preferred: start (or join) a range-proxy download. proxy_ensure
     // claims the downloads slot atomically itself, so a concurrent
     // /stream or /prefetch can't start a second writer for the key.
-    if proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key)
+    if proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key, true)
         .await
         .is_ok()
     {
@@ -4927,6 +5010,7 @@ async fn start_stream_server(
     let routes = Router::new()
         .route("/stream/:video_id", get(stream_handler))
         .route("/prefetch/:video_id", get(prefetch_handler))
+        .route("/degraded/evict", get(degraded_evict_handler))
         .route("/cover/:filename", get(cover_serve_handler))
         .with_state(server);
     let app = Router::new()

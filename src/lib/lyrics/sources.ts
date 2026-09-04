@@ -3,6 +3,7 @@ import { fetchLrclibLyrics } from "@/lib/lyrics/lrclib";
 import { fetchMusixmatchLyrics } from "@/lib/lyrics/musixmatch";
 import { fetchGeniusLyrics } from "@/lib/lyrics/genius";
 import { fetchYtMusicLyrics } from "@/lib/lyrics/ytmusic";
+import { rejectSiteChrome } from "@/lib/lyrics/plausibility";
 import { shouldRetryLyricsQuery } from "@/lib/lyrics/errors";
 import { cleanTrackTitle, lyricsArtist } from "@/lib/track-meta";
 import type { Lyrics } from "@/lib/lyrics/types";
@@ -65,7 +66,10 @@ function lyricsTimeoutSignal(ms: number): AbortSignal {
  * and the remaining sources still answer — a YouTube Music outage degrades
  * to the other three rather than blanking the panel.
  */
-export function useLyricsSources(track: QueueTrack | undefined, enabled: boolean) {
+export function useLyricsSources(
+  track: QueueTrack | undefined,
+  enabled: boolean,
+) {
   // YTM's strings are built for a UI, not for a database query: titles
   // carry "(Official Video)" style upload furniture and tracks played from
   // search cards / next-up rows carry a decorated breadcrumb ("Song • Don
@@ -91,12 +95,14 @@ export function useLyricsSources(track: QueueTrack | undefined, enabled: boolean
 
   // Keyed on the videoId alone. No title, no artist, nothing to normalise.
   const ytmusic = useQuery({
-    queryKey: ["lyrics", "ytmusic-v1", track?.videoId],
+    // v2: results now pass the site-chrome gate (plausibility.ts); orphan
+    // v1 entries that hydrate from the persisted cache without running it.
+    queryKey: ["lyrics", "ytmusic-v2", track?.videoId],
     queryFn: () =>
       fetchYtMusicLyrics(
         track!.videoId,
         lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
-      ),
+      ).then(rejectSiteChrome("YouTube Music")),
     enabled: !!track?.videoId && enabled,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
@@ -118,10 +124,12 @@ export function useLyricsSources(track: QueueTrack | undefined, enabled: boolean
   // lookup metadata rather than YTM's display strings, and a failed lookup
   // no longer resolves to a cached "no lyrics" — orphan every entry keyed
   // on a raw title, and every one holding a swallowed failure.
+  // lrclib-v7: results that read as a web page's navigation are rejected
+  // (plausibility.ts) — orphan v6 entries that cached such a record.
   const lrclib = useQuery({
     queryKey: [
       "lyrics",
-      "lrclib-v6",
+      "lrclib-v7",
       title,
       artistName,
       track?.album,
@@ -136,14 +144,15 @@ export function useLyricsSources(track: QueueTrack | undefined, enabled: boolean
           duration: track?.duration,
         },
         lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
-      ),
+      ).then(rejectSiteChrome("LRCLIB")),
     enabled: !!track && enabled && verifiable,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
   });
 
   const musixmatch = useQuery({
-    queryKey: ["lyrics", "musixmatch-v3", title, artistName, track?.duration],
+    // v4: site-chrome gate; orphan v3 entries that bypass it from the cache.
+    queryKey: ["lyrics", "musixmatch-v4", title, artistName, track?.duration],
     queryFn: () =>
       fetchMusixmatchLyrics(
         {
@@ -152,14 +161,15 @@ export function useLyricsSources(track: QueueTrack | undefined, enabled: boolean
           duration: track?.duration,
         },
         lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
-      ),
+      ).then(rejectSiteChrome("Musixmatch")),
     enabled: !!track && enabled && verifiable,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
   });
 
   const genius = useQuery({
-    queryKey: ["lyrics", "genius-v3", title, artistName],
+    // v4: site-chrome gate; orphan v3 entries that bypass it from the cache.
+    queryKey: ["lyrics", "genius-v4", title, artistName],
     queryFn: () =>
       fetchGeniusLyrics(
         {
@@ -167,7 +177,7 @@ export function useLyricsSources(track: QueueTrack | undefined, enabled: boolean
           artist: artistName,
         },
         lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
-      ),
+      ).then(rejectSiteChrome("Genius")),
     enabled: !!track && enabled && verifiable,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,

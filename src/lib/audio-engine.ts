@@ -4,7 +4,12 @@ import { useShallow } from "zustand/react/shallow";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { fetchRadio, fetchWatchQueueContinuation } from "@/lib/innertube/radio";
-import { prefetchStream, saveTrackMeta, streamUrlFor } from "@/lib/stream";
+import {
+  getStreamBaseUrl,
+  prefetchStream,
+  saveTrackMeta,
+  streamUrlFor,
+} from "@/lib/stream";
 import { usePlaybackStore, type QueueTrack } from "@/lib/store/playback";
 import { isCasting, useCastStore } from "@/lib/store/cast";
 import { usePremiumStore } from "@/lib/store/premium";
@@ -53,6 +58,28 @@ const STORM_FLIPS = 8;
 const STORM_HOLD_MS = 5000;
 let stormActiveUntil = 0;
 let flipTimes: number[] = [];
+// The last play/pause the user asked for while a storm was being held
+// off. Applied when the hold ends, so a real press during those five
+// seconds is delayed rather than swallowed.
+let deferredIntent: "play" | "pause" | "toggle" | null = null;
+let deferredTimer: number | null = null;
+
+function deferDuringStorm(action: "play" | "pause" | "toggle"): void {
+  deferredIntent = action;
+  if (deferredTimer !== null) window.clearTimeout(deferredTimer);
+  const wait = Math.max(0, stormActiveUntil - performance.now()) + 50;
+  deferredTimer = window.setTimeout(() => {
+    deferredTimer = null;
+    const intent = deferredIntent;
+    deferredIntent = null;
+    if (!intent) return;
+    appLog(`applying the ${intent} deferred during the play/pause storm`);
+    const s = usePlaybackStore.getState();
+    if (intent === "toggle") s.toggle();
+    else s.setPlaying(intent === "play");
+  }, wait);
+}
+
 function noteFlip(kind: "play" | "pause"): void {
   const now = performance.now();
   flipTimes.push(now);
@@ -60,7 +87,7 @@ function noteFlip(kind: "play" | "pause"): void {
   if (flipTimes.length >= STORM_FLIPS && stormActiveUntil <= now) {
     stormActiveUntil = now + STORM_HOLD_MS;
     appLog(
-      `play/pause storm: ${flipTimes.length} flips in ${STORM_WINDOW_MS}ms (last: ${kind}); ignoring OS media commands for ${STORM_HOLD_MS}ms`,
+      `play/pause storm: ${flipTimes.length} flips in ${STORM_WINDOW_MS}ms (last: ${kind}); holding OS play/pause for ${STORM_HOLD_MS}ms`,
     );
   }
 }
@@ -174,8 +201,13 @@ export function useAudioEngine() {
   // without any of its real deps changing — used to re-fetch a fresh
   // stream URL after a transient failure (e.g. a googlevideo 403).
   const [retryNonce, setRetryNonce] = useState(0);
-  // See the stall watchdog below for why this is as long as it is.
-  const STALL_RELOAD_MS = 75_000;
+  // See the stall watchdog below for why this is as long as it is. It
+  // has to clear the whole legitimate pre-byte budget: a signed-in
+  // resolve may run 30s to its ceiling, the anonymous fallback 15s more,
+  // and three probe timeouts with backoff about 31s on top, before the
+  // filler starts. 75s sat inside that and could restart a load that was
+  // slow but alive (review finding, 2026-09-04).
+  const STALL_RELOAD_MS = 100_000;
 
   // Video-mode startup hold: audio and frames start TOGETHER (YouTube
   // semantics) instead of audio leading by however long the vonly
@@ -840,6 +872,21 @@ export function useAudioEngine() {
         }
         el.load();
         appLog(`src set ${videoId ?? "-"} ${mediaState(el)}`);
+        // A track that had to fall back to the anonymous resolve was cached
+        // as a lower tier; now that playback has moved to this one, drop
+        // any such copies except this track's own, so the next play of
+        // them resolves signed-in again. Local, fire-and-forget.
+        //
+        // `keep` is the STREAM id, not the queue id: a song playing from
+        // its video counterpart (or the reverse) streams under a different
+        // id, and sparing the queue id would delete the file being read.
+        void getStreamBaseUrl()
+          .then((base) =>
+            fetch(
+              `${base}/degraded/evict?keep=${encodeURIComponent(streamVideoId ?? videoId ?? "")}`,
+            ),
+          )
+          .catch(() => {});
         const hold = videoHoldRef.current;
         if (hold && hold.token === token) {
           el.addEventListener(
@@ -1235,7 +1282,10 @@ export function useAudioEngine() {
       setRetryNonce((n) => n + 1);
     }, STALL_RELOAD_MS);
     return () => window.clearTimeout(timer);
-  }, [videoId, playing, retryNonce]);
+    // Keyed to the same load generation as the resolve effect: a source
+    // flip (song<->video) or an adjacent duplicate id starts a fresh load
+    // that must get a fresh timer, not inherit one about to fire.
+  }, [videoId, streamVideoId, wantVideo, index, playing, retryNonce]);
 
   // Volume / mute follow store.
   const volume = usePlaybackStore((s) => s.volume);
@@ -1382,8 +1432,19 @@ export function useAudioEngine() {
       appLog(
         `media-control ${e.payload.action} (store playing=${store.playing})`,
       );
-      if (stormActiveUntil > performance.now()) {
-        appLog(`media-control ${e.payload.action} IGNORED: play/pause storm`);
+      // Only the state flips are gated during a storm; next, previous,
+      // seek and stop are not part of a play/pause feedback loop and must
+      // keep working. A gated flip is remembered and applied once the
+      // storm settles, so a real press during the cooldown is delayed,
+      // never lost.
+      if (
+        stormActiveUntil > performance.now() &&
+        (e.payload.action === "play" ||
+          e.payload.action === "pause" ||
+          e.payload.action === "toggle")
+      ) {
+        appLog(`media-control ${e.payload.action} deferred: play/pause storm`);
+        deferDuringStorm(e.payload.action);
         return;
       }
       switch (e.payload.action) {
@@ -1443,12 +1504,18 @@ export function useAudioEngine() {
     };
     trySet("play", () => {
       appLog(`mediaSession play (store playing=${store().playing})`);
-      if (stormActiveUntil > performance.now()) return;
+      if (stormActiveUntil > performance.now()) {
+        deferDuringStorm("play");
+        return;
+      }
       store().setPlaying(true);
     });
     trySet("pause", () => {
       appLog(`mediaSession pause (store playing=${store().playing})`);
-      if (stormActiveUntil > performance.now()) return;
+      if (stormActiveUntil > performance.now()) {
+        deferDuringStorm("pause");
+        return;
+      }
       store().setPlaying(false);
     });
     trySet("previoustrack", () => store().prev());
