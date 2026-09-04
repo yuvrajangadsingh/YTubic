@@ -55,6 +55,49 @@ export type WhatsNewEntry = {
  */
 export const WHATS_NEW: WhatsNewEntry[] = [
   {
+    version: "0.4.9",
+    date: "September 4, 2026",
+    summary:
+      "No more keychain prompt, fewer long waits, and the app stays awake on other desktops",
+    changes: [
+      {
+        type: "fixed",
+        title: "The keychain dialog is gone",
+        text: "Every new build asked for keychain access, and one morning the first play waited 99 seconds on that dialog. The cookie key now lives in a private file in the app's own folder, so updates start silently.",
+      },
+      {
+        type: "improved",
+        title: "Slow starts get a second chance sooner",
+        text: "If finding a stream takes more than 12 seconds, a second lookup starts alongside it and whichever finishes first plays. Prefetching the next song now waits its turn behind the one you clicked instead of competing with it.",
+      },
+      {
+        type: "fixed",
+        title: "Staying responsive on another desktop",
+        text: "macOS told the app it was hidden whenever it sat on a different desktop, which froze its rendering, slowed its timers and could swallow media keys. It no longer believes that. The desktop thumbnail shows the app again.",
+      },
+      {
+        type: "fixed",
+        title: "A play that never starts now recovers",
+        text: "A track that produced no sound after a long wait used to sit on a spinner forever. It now reloads itself once, and tells you if that fails too.",
+      },
+      {
+        type: "fixed",
+        title: "Play/pause flicker cannot hang the app",
+        text: "When the media element flips play and pause on its own, the app steps back for five seconds and resets the player if the flicker persists, instead of spinning with it.",
+      },
+      {
+        type: "fixed",
+        title: "Lyrics that are actually lyrics",
+        text: "A track showed a lyrics website's menu as its words. Every lyrics source now passes a check that rejects scraped page navigation.",
+      },
+      {
+        type: "improved",
+        title: "Loading placeholders fill wide windows",
+        text: "The search and home skeletons stopped two thirds of the way across a wide window. They reach the edge now.",
+      },
+    ],
+  },
+  {
     version: "0.4.8",
     date: "September 3, 2026",
     summary: "Signing in gets unstuck",
