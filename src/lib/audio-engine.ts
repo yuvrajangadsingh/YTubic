@@ -56,6 +56,9 @@ let mediaElSingleton: HTMLVideoElement | null = null;
 const STORM_WINDOW_MS = 1000;
 const STORM_FLIPS = 8;
 const STORM_HOLD_MS = 5000;
+
+// See the media-session keepalive effect in useAudioEngine.
+const MEDIA_SESSION_KEEPALIVE_MS = 60_000;
 let stormActiveUntil = 0;
 let flipTimes: number[] = [];
 // The last play/pause the user asked for while a storm was being held
@@ -80,15 +83,59 @@ function deferDuringStorm(action: "play" | "pause" | "toggle"): void {
   }, wait);
 }
 
+// While a storm is held the app goes silent: the element's play/pause
+// events are not echoed into the store and the store is not enforced on
+// the element. 2026-09-04 18:25: WebKit released a backlog of held media
+// commands as a burst and the element then flipped play/pause four times
+// a second for 500+ cycles; every "element playing under a paused store"
+// line came BEFORE any play() of ours, so the flips were WebKit's and the
+// app was only echoing them. Gating OS commands (the first version of
+// this breaker) did nothing because none were arriving as commands.
+//
+// When the hold ends, one of two things happens:
+//   - the element kept flipping on its own during the hold: WebKit's
+//     session is wedged, so the media element is hard-reset (src
+//     dropped, load(), source re-installed by the resolve effect), which
+//     discards whatever WebKit had queued;
+//   - it went quiet: the element is reconciled once to the store.
+let holdFlips = 0;
+let stormResetHandler: (() => void) | null = null;
+let stormReconcileHandler: (() => void) | null = null;
+
+function stormActive(): boolean {
+  return stormActiveUntil > performance.now();
+}
+
 function noteFlip(kind: "play" | "pause"): void {
   const now = performance.now();
+  if (stormActiveUntil > now) {
+    holdFlips += 1;
+    return;
+  }
   flipTimes.push(now);
   flipTimes = flipTimes.filter((t) => now - t <= STORM_WINDOW_MS);
-  if (flipTimes.length >= STORM_FLIPS && stormActiveUntil <= now) {
+  if (flipTimes.length >= STORM_FLIPS) {
     stormActiveUntil = now + STORM_HOLD_MS;
+    holdFlips = 0;
+    flipTimes = [];
     appLog(
-      `play/pause storm: ${flipTimes.length} flips in ${STORM_WINDOW_MS}ms (last: ${kind}); holding OS play/pause for ${STORM_HOLD_MS}ms`,
+      `play/pause storm: ${flipTimes.length + STORM_FLIPS} flips in ${STORM_WINDOW_MS}ms (last: ${kind}); app goes silent for ${STORM_HOLD_MS}ms`,
     );
+    window.setTimeout(() => {
+      const flips = holdFlips;
+      holdFlips = 0;
+      if (flips >= STORM_FLIPS) {
+        appLog(
+          `storm persisted through the hold (${flips} flips with the app silent); hard-resetting the media element`,
+        );
+        stormResetHandler?.();
+      } else {
+        appLog(
+          `storm settled (${flips} flips during the hold); reconciling the element to the store`,
+        );
+        stormReconcileHandler?.();
+      }
+    }, STORM_HOLD_MS + 100);
   }
 }
 export function getMediaElement(): HTMLVideoElement | null {
@@ -369,6 +416,8 @@ export function useAudioEngine() {
     const onElPause = () => {
       const s = store();
       if (isCasting()) return;
+      // During a storm hold the app does not echo the element; see noteFlip.
+      if (stormActive()) return;
       if (s.status === "ready" && s.playing && !el.ended) {
         appLog("element paused under a playing store; store -> paused");
         s.setPlaying(false);
@@ -377,6 +426,7 @@ export function useAudioEngine() {
     const onElPlay = () => {
       const s = store();
       if (isCasting()) return;
+      if (stormActive()) return;
       if (s.status === "ready" && !s.playing) {
         appLog("element playing under a paused store; store -> playing");
         s.setPlaying(true);
@@ -1223,6 +1273,9 @@ export function useAudioEngine() {
       return;
     }
     if (!el.src) return;
+    // During a storm hold the store is not enforced on the element
+    // either; the hold's end reconciles once. See noteFlip.
+    if (stormActive()) return;
     if (playing) {
       // Startup hold active: the intent is recorded in `playing` and
       // maybeStartHeld() acts on it at release. Playing now would leak
@@ -1391,6 +1444,74 @@ export function useAudioEngine() {
     applyMediaSessionMetadata(track, actuallyPlaying);
     applyMediaSessionPosition(s.position, dur);
   }, [track, playing, videoStartupPhase]);
+
+  // Media-session keepalive while paused. A hack, and labelled as one.
+  //
+  // 2026-09-04: F8 pressed 78+ minutes into a pause reached macOS, was
+  // routed to this app's WebKit process (mediaremoted: "Sending command
+  // TogglePlayPause ... com.apple.WebKit.GPU/<bundle id>", accepted in
+  // 10ms) and never reached the page: no mediaSession handler fired. The
+  // same press 66s into a pause worked. WebKit stops forwarding remote
+  // commands to a page whose media has sat paused long enough, and
+  // instead queues a resume for the next time the window is visible,
+  // which is the "switched Space and it started playing" report.
+  //
+  // WKWebView offers no way to suppress or replace its session (see
+  // upstream 3a9db77), so this re-asserts the session's metadata and
+  // paused state once a minute while paused, betting that WebKit's
+  // liveness judgement keys off recent activity. Nothing documents that.
+  // The real fix is native playback in Rust (Linear ME-34), where the
+  // app owns the session outright. Verified only by a real long pause.
+  useEffect(() => {
+    if (!track || playing) return;
+    if (typeof navigator === "undefined" || !navigator.mediaSession) return;
+    if (!navigator.userAgent.includes("Mac")) return;
+    let ticks = 0;
+    const id = window.setInterval(() => {
+      const s = usePlaybackStore.getState();
+      const dur = s.duration > 0 ? s.duration : (track.duration ?? 0);
+      applyMediaSessionMetadata(track, false);
+      applyMediaSessionPosition(s.position, dur);
+      ticks += 1;
+      if (ticks === 1 || ticks % 10 === 0) {
+        appLog(`mediaSession keepalive: tick ${ticks}, paused ${ticks} min`);
+      }
+    }, MEDIA_SESSION_KEEPALIVE_MS);
+    return () => window.clearInterval(id);
+  }, [track, playing]);
+
+  // What the storm breaker does when a hold ends (see noteFlip). Reset
+  // drops the source and lets the resolve effect re-install it through
+  // retryNonce, which discards whatever WebKit had queued against the
+  // element; reconcile enforces the store once.
+  useEffect(() => {
+    stormResetHandler = () => {
+      const el = audioRef.current;
+      if (!el) return;
+      try {
+        el.pause();
+      } catch {
+        /* nothing to pause */
+      }
+      el.removeAttribute("src");
+      el.load();
+      setRetryNonce((n) => n + 1);
+    };
+    stormReconcileHandler = () => {
+      const el = audioRef.current;
+      if (!el) return;
+      const s = usePlaybackStore.getState();
+      if (s.playing && el.paused && el.src && !videoHoldRef.current) {
+        void playLocal(el).catch(() => {});
+      } else if (!s.playing && !el.paused) {
+        el.pause();
+      }
+    };
+    return () => {
+      stormResetHandler = null;
+      stormReconcileHandler = null;
+    };
+  }, []);
 
   // Tray menu commands come via a Tauri event. `cancelled` flag
   // protects against StrictMode's mount→unmount→mount race that
