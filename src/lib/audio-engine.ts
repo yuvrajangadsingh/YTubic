@@ -56,6 +56,14 @@ let mediaElSingleton: HTMLVideoElement | null = null;
 const STORM_WINDOW_MS = 1000;
 const STORM_FLIPS = 8;
 const STORM_HOLD_MS = 5000;
+
+/// How long the next-track prefetch waits for the queue position to settle
+/// before firing. Anything comfortably above a skip interval coalesces a
+/// burst; measured skips run about 500ms apart, and the median gap between
+/// plays is 130s, so 2s costs almost nothing in lead time.
+const PREFETCH_SETTLE_MS = 2000;
+/// One retry after admission control declines a prefetch under pressure.
+const PREFETCH_RETRY_MS = 5000;
 let stormActiveUntil = 0;
 let flipTimes: number[] = [];
 // The last play/pause the user asked for while a storm was being held
@@ -1659,19 +1667,62 @@ export function useAudioEngine() {
   const nextStreamVideoId = useTrackSourceStore((s) =>
     nextVideoId ? resolveStreamId(nextVideoId, s.byVideoId) : undefined,
   );
+  // Warm the next track. This used to be gated on `status === "ready"`,
+  // which the media element only reaches on its `playing` event, so a
+  // track skipped BEFORE it made a sound never warmed the next one. That
+  // cascades: the next track is then cold, gets skipped for the same
+  // reason, and the gate stays shut for as long as the user keeps moving.
+  // Measured over 352 plays in the app's own log: 30% of plays never
+  // reach `playing` at all, the gate was open on 94% of the plays that
+  // started instantly and on only 42% of the ones that had to wait, and
+  // 85 of 147 cache misses followed a track that never opened it.
+  //
+  // The gate is now playback INTENT rather than proof of playback. `playing`
+  // covers every skip-before-sound case while still declining to warm from
+  // a queue that is merely restored at launch, or paused, or whose current
+  // track just failed to resolve. Resolver contention, which is what the
+  // old gate was really standing in for, is handled properly now by the
+  // admission control in stream_proxy.rs: plays never wait, prefetches take
+  // a single background slot and yield to them.
   useEffect(() => {
-    if (status !== "ready") return;
+    if (!playing) return;
     if (!nextStreamVideoId) return;
-    void prefetchStream(nextStreamVideoId);
-    // Label the prefetched file too — same reasoning as the play path.
-    const st = usePlaybackStore.getState();
-    void saveTrackMeta(
-      nextStreamVideoId,
-      st.index >= 0 && st.index + 1 < st.queue.length
-        ? st.queue[st.index + 1]
-        : undefined,
-    );
-  }, [status, nextStreamVideoId]);
+    let cancelled = false;
+    let retry: number | undefined;
+    // Settle before firing: a burst of skips arms one timer per step and
+    // the cleanup clears every one but the last, so twelve skips cost one
+    // resolve rather than twelve. The cost is that much less lead time,
+    // which is cheap against a median gap between plays of 130s.
+    const fire = () => {
+      void (async () => {
+        const outcome = await prefetchStream(nextStreamVideoId);
+        if (cancelled) return;
+        if (outcome === "busy") {
+          // Admission control declined; it did no work, so try once more.
+          // Cancelled by the same cleanup if the target moves on.
+          retry = window.setTimeout(fire, PREFETCH_RETRY_MS);
+          return;
+        }
+        if (outcome === "failed") return;
+        // Label the prefetched file too — same reasoning as the play path.
+        // Inside the timer on purpose: out here, a skip burst wrote one
+        // metadata sidecar per skipped track for files it never fetched.
+        const st = usePlaybackStore.getState();
+        void saveTrackMeta(
+          nextStreamVideoId,
+          st.index >= 0 && st.index + 1 < st.queue.length
+            ? st.queue[st.index + 1]
+            : undefined,
+        );
+      })();
+    };
+    const timer = window.setTimeout(fire, PREFETCH_SETTLE_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      if (retry !== undefined) window.clearTimeout(retry);
+    };
+  }, [playing, nextStreamVideoId]);
 
   // Auto-extend the queue with radio tracks when we're near the end, so
   // playback continues past the explicit queue.

@@ -86,6 +86,14 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The timeout's error text. Compared exactly in `resolve` to tell a slow
 /// extraction from a dead video, so keep the two in step.
 const TIMED_OUT: &str = "yt-dlp -j timed out after 30s";
+
+/// A prefetch that admission control deliberately declined. The handler
+/// MUST tell this apart from a real failure: a real failure falls through
+/// to the legacy blocking downloader, and sending a deliberate skip down
+/// that path spawns the very yt-dlp the skip existed to prevent, which is
+/// exactly what shipped on 2026-09-04 and defeated the cap on the one
+/// path it was built for.
+pub const SKIPPED: &str = "prefetch skipped: resolver busy";
 /// Prefix shared by every timeout message, whatever the ceiling was.
 const TIMED_OUT_PREFIX: &str = "yt-dlp -j timed out after";
 
@@ -306,7 +314,7 @@ pub async fn prepare(
                 foreground = true;
                 None
             }
-            Admission::Skip => return Err("prefetch skipped: resolver busy".to_string()),
+            Admission::Skip => return Err(SKIPPED.to_string()),
         }
     } else {
         None
@@ -1239,6 +1247,26 @@ pub fn spawn_tail_pump(
 
 #[cfg(test)]
 mod tests {
+    /// `prefetch_handler` compares this string exactly to tell a declined
+    /// prefetch from a real failure, and the two live in different files.
+    /// When they drifted apart the skip fell through to the legacy
+    /// downloader and spawned the yt-dlp it existed to prevent, so pin it.
+    #[test]
+    fn the_skip_marker_is_distinguishable_from_a_real_failure() {
+        assert_eq!(SKIPPED, "prefetch skipped: resolver busy");
+        // Must not collide with the errors that SHOULD reach the legacy path.
+        assert_ne!(SKIPPED, TIMED_OUT);
+        assert!(!SKIPPED.starts_with(TIMED_OUT_PREFIX));
+        for real_failure in [
+            "yt-dlp -j exit exit status: 1: ERROR: [youtube] x: Video unavailable",
+            "legacy download already in flight",
+            "suspiciously small stream (12 bytes)",
+            "spawn yt-dlp: No such file or directory",
+        ] {
+            assert_ne!(real_failure, SKIPPED);
+        }
+    }
+
     /// The anonymous fallback in `resolve` keys off the timeout message's
     /// prefix, so a reworded timeout would silently stop falling back and
     /// a reworded yt-dlp error could start being treated as slow. Pin

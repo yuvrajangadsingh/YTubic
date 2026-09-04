@@ -61,8 +61,7 @@ export async function streamUrlFor(
   if (opts?.vonly) {
     params.set("vonly", "1");
     if (opts.vonlyHeight) params.set("h", String(opts.vonlyHeight));
-  }
-  else if (opts?.video) params.set("video", "1");
+  } else if (opts?.video) params.set("video", "1");
   const qs = params.toString();
   return `${base}/stream/${encodeURIComponent(videoId)}${qs ? `?${qs}` : ""}`;
 }
@@ -97,9 +96,13 @@ const prefetched = new Set<string>();
  * The server itself is idempotent on a per-file basis (checks .part /
  * .webm existence), so re-firing is cheap but still skippable.
  */
-export async function prefetchStream(videoId: string): Promise<void> {
-  if (!isPremium()) return;
-  if (prefetched.has(videoId)) return;
+export type PrefetchOutcome = "started" | "skipped" | "busy" | "failed";
+
+export async function prefetchStream(
+  videoId: string,
+): Promise<PrefetchOutcome> {
+  if (!isPremium()) return "skipped";
+  if (prefetched.has(videoId)) return "skipped";
   prefetched.add(videoId);
   try {
     const base = await getStreamBaseUrl();
@@ -108,10 +111,15 @@ export async function prefetchStream(videoId: string): Promise<void> {
     // HTTP 4xx/5xx (yt-dlp spawn/extractor failure) resolves normally — drop
     // the warm mark on an error status so the id is retried later.
     const res = await fetch(`${base}/prefetch/${encodeURIComponent(videoId)}`);
-    if (!res.ok) prefetched.delete(videoId);
+    if (res.ok) return "started";
+    prefetched.delete(videoId);
+    // 429 is admission control declining under pressure, not a failure:
+    // the server did no work at all, so this one is worth retrying once.
+    return res.status === 429 ? "busy" : "failed";
   } catch {
     // If it fails we'll just fall through to on-demand fetch later.
     prefetched.delete(videoId);
+    return "failed";
   }
 }
 
