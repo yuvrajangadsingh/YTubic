@@ -1264,7 +1264,16 @@ mod tests {
     /// the track that is playing.
     #[tokio::test]
     async fn degraded_eviction_keeps_the_playing_track() {
-        let dir = std::env::temp_dir().join(format!("ytubic-degraded-{}", rand::random::<u64>()));
+        // No `rand` here: that crate is only a dependency on macOS and
+        // Linux, and this test compiles on Windows too (CI, 2026-09-04).
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ytubic-degraded-{}-{nonce}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         for id in ["keepme", "dropme"] {
             let f = dir.join(format!("{id}.webm"));
