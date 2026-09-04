@@ -34,6 +34,36 @@ import { appLog, mediaState } from "@/lib/app-log";
 // The engine's singleton element, exposed so the fullscreen player can
 // adopt it as a visible surface when the current stream is a video file.
 let mediaElSingleton: HTMLVideoElement | null = null;
+
+// Play/pause storm breaker.
+//
+// 2026-09-04 12:53: the element played, paused within milliseconds, and
+// played again, dozens of times a second for over four minutes, never
+// moving past 48.0s, with the UI starved to a grey flash. Every path in
+// this file that calls play() checks the store first, so the store itself
+// was being flipped each cycle, and the only writers that can do that
+// without a user gesture are the two OS media integrations (the Rust
+// media-controls listener and the webview's own mediaSession handlers).
+// Both are logged now so the next occurrence names its source. Until it
+// does, this is the guard rail: if the element flips state more than
+// STORM_FLIPS times inside STORM_WINDOW_MS, OS media commands are ignored
+// for STORM_HOLD_MS and the element settles on whatever the store says.
+const STORM_WINDOW_MS = 1000;
+const STORM_FLIPS = 8;
+const STORM_HOLD_MS = 5000;
+let stormActiveUntil = 0;
+let flipTimes: number[] = [];
+function noteFlip(kind: "play" | "pause"): void {
+  const now = performance.now();
+  flipTimes.push(now);
+  flipTimes = flipTimes.filter((t) => now - t <= STORM_WINDOW_MS);
+  if (flipTimes.length >= STORM_FLIPS && stormActiveUntil <= now) {
+    stormActiveUntil = now + STORM_HOLD_MS;
+    appLog(
+      `play/pause storm: ${flipTimes.length} flips in ${STORM_WINDOW_MS}ms (last: ${kind}); ignoring OS media commands for ${STORM_HOLD_MS}ms`,
+    );
+  }
+}
 export function getMediaElement(): HTMLVideoElement | null {
   return mediaElSingleton;
 }
@@ -308,6 +338,7 @@ export function useAudioEngine() {
       const s = store();
       if (isCasting()) return;
       if (s.status === "ready" && s.playing && !el.ended) {
+        appLog("element paused under a playing store; store -> paused");
         s.setPlaying(false);
       }
     };
@@ -315,6 +346,7 @@ export function useAudioEngine() {
       const s = store();
       if (isCasting()) return;
       if (s.status === "ready" && !s.playing) {
+        appLog("element playing under a paused store; store -> playing");
         s.setPlaying(true);
       }
     };
@@ -439,6 +471,10 @@ export function useAudioEngine() {
       }
     };
 
+    const onFlipPlay = () => noteFlip("play");
+    const onFlipPause = () => noteFlip("pause");
+    el.addEventListener("play", onFlipPlay);
+    el.addEventListener("pause", onFlipPause);
     el.addEventListener("timeupdate", onTimeUpdate);
     el.addEventListener("durationchange", onDurationChange);
     el.addEventListener("progress", onProgress);
@@ -451,6 +487,8 @@ export function useAudioEngine() {
     for (const t of LOGGED) el.addEventListener(t, onLogged);
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
+      el.removeEventListener("play", onFlipPlay);
+      el.removeEventListener("pause", onFlipPause);
       el.removeEventListener("timeupdate", onTimeUpdate);
       el.removeEventListener("durationchange", onDurationChange);
       el.removeEventListener("progress", onProgress);
@@ -1341,6 +1379,13 @@ export function useAudioEngine() {
     let dispose: (() => void) | undefined;
     void listen<{ action: string; position?: number }>("media-control", (e) => {
       const store = usePlaybackStore.getState();
+      appLog(
+        `media-control ${e.payload.action} (store playing=${store.playing})`,
+      );
+      if (stormActiveUntil > performance.now()) {
+        appLog(`media-control ${e.payload.action} IGNORED: play/pause storm`);
+        return;
+      }
       switch (e.payload.action) {
         case "play":
           store.setPlaying(true);
@@ -1396,8 +1441,16 @@ export function useAudioEngine() {
         /* unsupported on this WebKit build */
       }
     };
-    trySet("play", () => store().setPlaying(true));
-    trySet("pause", () => store().setPlaying(false));
+    trySet("play", () => {
+      appLog(`mediaSession play (store playing=${store().playing})`);
+      if (stormActiveUntil > performance.now()) return;
+      store().setPlaying(true);
+    });
+    trySet("pause", () => {
+      appLog(`mediaSession pause (store playing=${store().playing})`);
+      if (stormActiveUntil > performance.now()) return;
+      store().setPlaying(false);
+    });
     trySet("previoustrack", () => store().prev());
     trySet("nexttrack", () => store().next());
     trySet("seekto", (details) => {
