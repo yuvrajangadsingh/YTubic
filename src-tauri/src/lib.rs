@@ -143,70 +143,185 @@ mod secure_store {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     const KEYRING_USER: &str = "cookie-encryption-key-v1";
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn keyring_encryption_key() -> Result<[u8; KEYRING_KEY_LEN], String> {
-        use keyring::{Entry, Error};
-        use rand::RngCore;
+    /// Where the cookie key lives on disk (macOS). Set once from setup.
+    #[cfg(target_os = "macos")]
+    static KEY_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    #[cfg(target_os = "macos")]
+    const KEY_FILE: &str = "cookie.key";
 
-        let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER)
-            .map_err(|error| format!("system credential store is unavailable: {error}"))?;
+    /// Tell the store where the app's data directory is. macOS keeps the
+    /// cookie key in a file there instead of the keychain; see
+    /// `encryption_key` for why.
+    pub fn init(app_data_dir: std::path::PathBuf) {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = KEY_DIR.set(app_data_dir);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = app_data_dir;
+        }
+    }
 
-        match entry.get_secret() {
-            Ok(secret) => secret.try_into().map_err(|secret: Vec<u8>| {
-                format!(
-                    "system credential store returned an invalid YTubic key ({} bytes)",
-                    secret.len()
-                )
+    /// The key on disk, if there is one. `Ok(None)` when the file does not
+    /// exist; an error for a file of the wrong size, which must never be
+    /// papered over by minting (that would orphan the jar).
+    #[cfg(target_os = "macos")]
+    fn key_from_dir(dir: &std::path::Path) -> Result<Option<[u8; KEYRING_KEY_LEN]>, String> {
+        let path = dir.join(KEY_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => bytes.try_into().map(Some).map_err(|bytes: Vec<u8>| {
+                format!("{} is {} bytes, not {KEYRING_KEY_LEN}", path.display(), bytes.len())
             }),
-            Err(Error::NoEntry) => {
-                // A pre-rename install kept this key under the upstream
-                // identifier (see identity.rs); move it the first time
-                // we look and find nothing. Reading the old item shows
-                // the keychain dialog once more — its ACL names the old
-                // app identity — and never again after the move.
-                //
-                // If the old item EXISTS but cannot be read (the dialog
-                // denied, an ACL failure), minting a fresh key here
-                // would shadow the one the jar is encrypted with — on
-                // 2026-08-31 15:40 exactly that made an intact jar read
-                // as signed-out. Fail this run instead; the next launch
-                // asks again with nothing lost.
-                if let Ok(old) = Entry::new(crate::identity::OLD_ID, KEYRING_USER) {
-                    match old.get_secret() {
-                        Ok(secret) if secret.len() == KEYRING_KEY_LEN => {
-                            entry.set_secret(&secret).map_err(|error| {
-                                format!("failed to save key in system credential store: {error}")
-                            })?;
-                            let _ = old.delete_credential();
-                            eprintln!("[identity] moved the cookie key to the new keychain item");
-                            return secret
-                                .try_into()
-                                .map_err(|_| "unreachable: length checked above".to_string());
-                        }
-                        Ok(secret) => {
-                            eprintln!(
-                                "[identity] old cookie key is {} bytes, not {KEYRING_KEY_LEN}; ignoring it",
-                                secret.len()
-                            );
-                        }
-                        Err(Error::NoEntry) => {}
-                        Err(error) => {
-                            return Err(format!(
-                                "cookie key exists under the old identifier but could not be read ({error}); not minting a replacement"
-                            ));
-                        }
-                    }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("read {}: {e}", path.display())),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn store_key_in_dir(dir: &std::path::Path, key: &[u8; KEYRING_KEY_LEN]) -> Result<(), String> {
+        crate::authfs::write_atomic_blocking(&dir.join(KEY_FILE), key, 0o600)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    mod key_file_tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn tmp() -> std::path::PathBuf {
+            let d = std::env::temp_dir().join(format!("ytubic-key-{}", rand::random::<u64>()));
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        #[test]
+        fn absent_file_is_none_not_an_error() {
+            let d = tmp();
+            assert_eq!(key_from_dir(&d).unwrap(), None);
+        }
+
+        #[test]
+        fn a_stored_key_reads_back_identical_and_private() {
+            let d = tmp();
+            let key = mint_key();
+            store_key_in_dir(&d, &key).unwrap();
+            assert_eq!(key_from_dir(&d).unwrap(), Some(key));
+            let mode = std::fs::metadata(d.join(KEY_FILE)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "key file must be owner-only");
+        }
+
+        #[test]
+        fn a_wrong_sized_file_is_an_error_never_silently_replaced() {
+            // Minting over a damaged file would orphan the jar; the caller
+            // must see the problem, not a fresh key.
+            let d = tmp();
+            std::fs::write(d.join(KEY_FILE), [7_u8; 31]).unwrap();
+            assert!(key_from_dir(&d).is_err());
+        }
+    }
+
+    /// The key an existing install already encrypts its jar with, read
+    /// from the system credential store: the current item, else the
+    /// pre-rename item (see identity.rs). `Ok(None)` when neither exists.
+    ///
+    /// An item that EXISTS but cannot be read (the dialog denied, an ACL
+    /// failure) is an error, never `None`: minting a fresh key in that
+    /// state would shadow the one the jar is encrypted with. On
+    /// 2026-08-31 15:40 exactly that made an intact jar read as
+    /// signed-out. Fail this run; the next launch asks again with
+    /// nothing lost.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn keyring_existing_key() -> Result<Option<[u8; KEYRING_KEY_LEN]>, String> {
+        use keyring::{Entry, Error};
+        for (service, label) in [
+            (KEYRING_SERVICE, "current"),
+            (crate::identity::OLD_ID, "pre-rename"),
+        ] {
+            let entry = Entry::new(service, KEYRING_USER)
+                .map_err(|error| format!("system credential store is unavailable: {error}"))?;
+            match entry.get_secret() {
+                Ok(secret) if secret.len() == KEYRING_KEY_LEN => {
+                    return secret
+                        .try_into()
+                        .map(Some)
+                        .map_err(|_| "unreachable: length checked above".to_string());
                 }
-                let mut key = [0_u8; KEYRING_KEY_LEN];
-                rand::rngs::OsRng.fill_bytes(&mut key);
-                entry.set_secret(&key).map_err(|error| {
-                    format!("failed to save key in system credential store: {error}")
-                })?;
-                Ok(key)
+                Ok(secret) => {
+                    eprintln!(
+                        "[secure] {label} keychain key is {} bytes, not {KEYRING_KEY_LEN}; ignoring it",
+                        secret.len()
+                    );
+                }
+                Err(Error::NoEntry) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "the {label} cookie key exists in the system credential store but could not be read ({error}); not minting a replacement"
+                    ));
+                }
             }
-            Err(error) => Err(format!(
-                "failed to read key from system credential store: {error}"
-            )),
+        }
+        Ok(None)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn mint_key() -> [u8; KEYRING_KEY_LEN] {
+        use rand::RngCore;
+        let mut key = [0_u8; KEYRING_KEY_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut key);
+        key
+    }
+
+    /// The 32-byte key the cookie jar is encrypted with.
+    ///
+    /// macOS: a 0600 file in the app's data directory, not a keychain
+    /// item. A keychain item's access list is keyed to each build's code
+    /// hash when the app has no Apple Team ID, so every rebuild and every
+    /// update put up the "YTubic wants to access key" dialog, and on
+    /// 2026-09-04 the first play after a relaunch waited 99 seconds on
+    /// it. The keychain was guarding a key whose product already sits on
+    /// disk: the jar is written out in plain text for yt-dlp, 0600, in
+    /// the same directory. A 0600 file beside it gives up nothing that
+    /// file did not already give up, and never asks.
+    ///
+    /// The first run after this change reads the existing keychain item
+    /// one final time (one last dialog) so the jar stays readable, writes
+    /// the file, and leaves the item in place unread. A fresh install
+    /// mints straight into the file and never touches the keychain.
+    ///
+    /// Linux: unchanged, the system credential store as before.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn encryption_key() -> Result<[u8; KEYRING_KEY_LEN], String> {
+        #[cfg(target_os = "macos")]
+        {
+            let dir = KEY_DIR
+                .get()
+                .ok_or_else(|| "secure store used before init".to_string())?;
+            if let Some(key) = key_from_dir(dir)? {
+                return Ok(key);
+            }
+            let (key, origin) = match keyring_existing_key()? {
+                Some(key) => (key, "moved from the keychain"),
+                None => (mint_key(), "minted"),
+            };
+            store_key_in_dir(dir, &key)?;
+            eprintln!(
+                "[secure] cookie key {origin}; it lives in {} now and the keychain will not be asked again",
+                dir.join(KEY_FILE).display()
+            );
+            Ok(key)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use keyring::Entry;
+            if let Some(key) = keyring_existing_key()? {
+                return Ok(key);
+            }
+            let key = mint_key();
+            Entry::new(KEYRING_SERVICE, KEYRING_USER)
+                .map_err(|error| format!("system credential store is unavailable: {error}"))?
+                .set_secret(&key)
+                .map_err(|error| format!("failed to save key in system credential store: {error}"))?;
+            Ok(key)
         }
     }
 
@@ -262,7 +377,7 @@ mod secure_store {
     pub fn encrypt(plain: &[u8]) -> Result<Vec<u8>, String> {
         use rand::RngCore;
 
-        let key = keyring_encryption_key()?;
+        let key = encryption_key()?;
         let mut nonce = [0_u8; KEYRING_NONCE_LEN];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         keyring_encrypt_with_key(plain, &key, &nonce)
@@ -273,7 +388,7 @@ mod secure_store {
         if !encrypted.starts_with(KEYRING_MAGIC) {
             return Ok(encrypted.to_vec());
         }
-        let key = keyring_encryption_key()?;
+        let key = encryption_key()?;
         keyring_decrypt_with_key(encrypted, &key)
     }
 
@@ -5113,6 +5228,11 @@ pub fn run() {
             // From here on stderr lands in the app log with timestamps,
             // however the app was launched.
             applog::init(app.handle());
+            // The cookie key's home on macOS; must precede the first
+            // encrypt/decrypt, which the session load below performs.
+            if let Ok(dir) = app.path().app_data_dir() {
+                secure_store::init(dir);
+            }
             for line in &identity_report {
                 eprintln!("[identity] {line}");
             }
