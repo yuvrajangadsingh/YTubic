@@ -86,6 +86,64 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The timeout's error text. Compared exactly in `resolve` to tell a slow
 /// extraction from a dead video, so keep the two in step.
 const TIMED_OUT: &str = "yt-dlp -j timed out after 30s";
+/// Prefix shared by every timeout message, whatever the ceiling was.
+const TIMED_OUT_PREFIX: &str = "yt-dlp -j timed out after";
+
+/// Ceiling on the anonymous fallback that runs after a signed-in resolve
+/// times out. Anonymous extraction skips the watch page and the JS
+/// challenge and measured 2.0s; if it has not answered in 15s the
+/// blocking path is the honest next step.
+const FALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Resolver admission. Plays go first; speculative work waits.
+///
+/// Measured 2026-09-04: a resolve that overlapped another resolve
+/// exceeded 15s twice as often (9% vs 4.4%), and nothing capped how many
+/// yt-dlp processes ran at once. Foreground resolves are never made to
+/// wait, since a click behind a prefetch would be the worst outcome of
+/// all. Background (prefetch) resolves take one slot between them and
+/// hold off while any foreground resolve is running. A background wait is
+/// bounded so a stuck foreground can never starve prefetch for ever.
+static FOREGROUND_RESOLVES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static BACKGROUND_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+const BACKGROUND_MAX_WAIT: Duration = Duration::from_secs(45);
+
+struct ForegroundGuard;
+impl ForegroundGuard {
+    fn enter() -> Self {
+        FOREGROUND_RESOLVES.fetch_add(1, Ordering::SeqCst);
+        ForegroundGuard
+    }
+}
+impl Drop for ForegroundGuard {
+    fn drop(&mut self) {
+        FOREGROUND_RESOLVES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Wait for the background slot, then for the foreground to go quiet.
+async fn admit_background(video_id: &str) -> Option<tokio::sync::SemaphorePermit<'static>> {
+    let started = std::time::Instant::now();
+    let permit = tokio::time::timeout(BACKGROUND_MAX_WAIT, BACKGROUND_SLOT.acquire())
+        .await
+        .ok()?
+        .ok()?;
+    while FOREGROUND_RESOLVES.load(Ordering::SeqCst) > 0 {
+        if started.elapsed() > BACKGROUND_MAX_WAIT {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let waited = started.elapsed();
+    if waited > Duration::from_millis(500) {
+        eprintln!(
+            "[proxy] {video_id}: background resolve waited {:.1}s for the foreground",
+            waited.as_secs_f32()
+        );
+    }
+    Some(permit)
+}
 
 /// Filler download chunk: one ranged request per chunk (see fill()).
 const FILL_CHUNK: u64 = 10 * 1024 * 1024;
@@ -129,6 +187,9 @@ pub struct ProxyState {
     /// re-resolve pins -f to this exact format so a selector fallback
     /// can't splice a different representation onto the written prefix.
     pub format_id: Option<String>,
+    /// From the anonymous fallback after a signed-in timeout: served for
+    /// this play, never kept as the canonical cached copy (see `fill`).
+    pub degraded: bool,
     /// Bytes contiguously written to the .part file from offset 0.
     pub filled: AtomicU64,
     /// Final file renamed into place; `filled == total`.
@@ -140,12 +201,19 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
-    fn new(url: String, total: u64, mime: String, format_id: Option<String>) -> Self {
+    fn new(
+        url: String,
+        total: u64,
+        mime: String,
+        format_id: Option<String>,
+        degraded: bool,
+    ) -> Self {
         ProxyState {
             url: Mutex::new(url),
             total,
             mime,
             format_id,
+            degraded,
             filled: AtomicU64::new(0),
             complete: AtomicBool::new(false),
             failed: AtomicBool::new(false),
@@ -159,7 +227,17 @@ impl ProxyState {
 pub async fn prepare(
     client: &reqwest::Client,
     ctx: &ResolveCtx,
+    background: bool,
 ) -> Result<Arc<ProxyState>, String> {
+    // Admission: see FOREGROUND_RESOLVES. A background (prefetch) resolve
+    // takes the single background slot and yields to any play in flight;
+    // a foreground resolve registers itself so background work holds off.
+    let _permit = if background {
+        admit_background(&ctx.video_id).await
+    } else {
+        None
+    };
+    let _foreground = (!background).then(ForegroundGuard::enter);
     let resolved = resolve(ctx).await?;
     let total = probe_total(client, &resolved.url).await?;
     if total < MIN_TOTAL {
@@ -170,7 +248,47 @@ pub async fn prepare(
         total,
         resolved.mime,
         resolved.format_id,
+        resolved.degraded,
     )))
+}
+
+/// Sidecar that marks a cached file as the anonymous fallback's output.
+/// A file with this marker is deleted at the next launch, and by
+/// `evict_degraded` whenever playback moves to another track, so the
+/// next play of that track resolves signed-in again instead of replaying
+/// the lower tier for ever.
+pub fn degraded_marker(final_path: &Path) -> PathBuf {
+    let mut s = final_path.as_os_str().to_owned();
+    s.push(".degraded");
+    PathBuf::from(s)
+}
+
+/// Delete every degraded cached file under `dir` except the one for
+/// `keep` (the track playing right now, which must stay readable).
+/// Returns how many were removed.
+pub async fn evict_degraded(dir: &Path, keep: Option<&str>) -> usize {
+    let mut removed = 0;
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return 0;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let marker = entry.path();
+        let Some(name) = marker.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(file_name) = name.strip_suffix(".degraded") else {
+            continue;
+        };
+        if keep.is_some_and(|k| file_name.starts_with(k)) {
+            continue;
+        }
+        let file = dir.join(file_name);
+        let _ = tokio::fs::remove_file(&file).await;
+        let _ = tokio::fs::remove_file(&marker).await;
+        removed += 1;
+        eprintln!("[proxy] evicted degraded cache file {file_name}");
+    }
+    removed
 }
 
 /// Map of in-flight proxy downloads, keyed like the legacy downloads
@@ -199,6 +317,10 @@ struct Resolved {
     url: String,
     mime: String,
     format_id: Option<String>,
+    /// Came from the anonymous fallback after the signed-in path timed
+    /// out: a lower tier than the account is entitled to, and not to be
+    /// kept as the canonical cached copy.
+    degraded: bool,
 }
 
 /// Direct-URL resolution via `yt-dlp -j -f <format>`.
@@ -217,41 +339,54 @@ struct Resolved {
 /// is what shipped before 0.4.2 (130k, no Premium tracks), a downgrade
 /// rather than a 502, and the reason now goes into the log with it.
 async fn resolve(ctx: &ResolveCtx) -> Result<Resolved, String> {
-    match resolve_with(ctx, ctx.cookies.as_deref()).await {
+    match resolve_with(ctx, ctx.cookies.as_deref(), RESOLVE_TIMEOUT).await {
         Ok(r) => Ok(r),
         Err(e) if ctx.cookies.is_some() && e.contains("Requested format is not available") => {
             eprintln!(
                 "[proxy] {}: signed-in extraction returned no formats; retrying anonymously ({e})",
                 ctx.video_id
             );
-            resolve_with(ctx, None).await
+            resolve_with(ctx, None, RESOLVE_TIMEOUT).await
         }
-        // A timeout is worth one more attempt here rather than in the
-        // caller. Failing out drops the request onto the legacy blocking
-        // path, and that path runs yt-dlp again itself AND withholds byte
-        // zero until the whole file is on disk, so on the one step that
-        // just proved slow it pays the cost twice and adds full-file
-        // buffering. Measured 2026-09-03: a resolve hit this ceiling and
-        // the fallback turned it into 59s of silence for a 7MB track.
-        // Across 279 resolves the median is 5.0s and the 90th percentile
-        // 11.5s, so a second attempt normally costs nothing, and when it
-        // helps the request stays on the streaming path.
+        // A signed-in resolve that hits the ceiling is not retried the
+        // same way. That was tried (2026-09-03) and on 2026-09-04 14:14 it
+        // cost a click 60 seconds instead of 30: the second attempt hung
+        // exactly like the first, then the legacy blocking path took
+        // another 36. The legacy path succeeded because it is a DIFFERENT
+        // path: the anonymous client, no watch page, no JS challenge,
+        // measured 2.0s. So that is the fallback here, with its own
+        // shorter ceiling. The price is the anonymous tier (130k) for this
+        // one play, which beats a minute of silence; the result is marked
+        // degraded so it is not kept as the canonical cached copy and the
+        // next play resolves signed-in again.
         //
-        // Only on a timeout. An outright yt-dlp error (a private or
-        // removed video, "Video unavailable") is not slow, it is dead, and
+        // Only on a timeout, and only when there was a signed-in path to
+        // fall back FROM. An outright yt-dlp error (a private or removed
+        // video, "Video unavailable") is not slow, it is dead, and
         // retrying that only doubles the wait before an honest failure.
-        Err(e) if e == TIMED_OUT => {
+        Err(e) if ctx.cookies.is_some() && e.starts_with(TIMED_OUT_PREFIX) => {
             eprintln!(
-                "[proxy] {}: {e}; one more attempt before the blocking path",
+                "[proxy] {}: {e}; falling back to an anonymous resolve",
                 ctx.video_id
             );
-            resolve_with(ctx, ctx.cookies.as_deref()).await
+            let mut r = resolve_with(ctx, None, FALLBACK_TIMEOUT).await?;
+            r.degraded = true;
+            eprintln!(
+                "[proxy] {}: anonymous fallback resolved format {} (degraded; not kept as the cached copy)",
+                ctx.video_id,
+                r.format_id.as_deref().unwrap_or("?")
+            );
+            Ok(r)
         }
         Err(e) => Err(e),
     }
 }
 
-async fn resolve_with(ctx: &ResolveCtx, cookies: Option<&Path>) -> Result<Resolved, String> {
+async fn resolve_with(
+    ctx: &ResolveCtx,
+    cookies: Option<&Path>,
+    ceiling: Duration,
+) -> Result<Resolved, String> {
     let url = format!("https://www.youtube.com/watch?v={}", ctx.video_id);
     let mut cmd = tokio::process::Command::new(&ctx.ytdlp_program);
     // No --no-warnings here: stderr is captured, not inherited, so on
@@ -272,9 +407,15 @@ async fn resolve_with(ctx: &ResolveCtx, cookies: Option<&Path>) -> Result<Resolv
     // drops the child future — without kill_on_drop that leaks a live
     // yt-dlp process per abandonment.
     cmd.kill_on_drop(true);
-    let out = tokio::time::timeout(RESOLVE_TIMEOUT, cmd.output())
+    let out = tokio::time::timeout(ceiling, cmd.output())
         .await
-        .map_err(|_| TIMED_OUT.to_string())?
+        .map_err(|_| {
+            if ceiling == RESOLVE_TIMEOUT {
+                TIMED_OUT.to_string()
+            } else {
+                format!("{TIMED_OUT_PREFIX} {}s", ceiling.as_secs())
+            }
+        })?
         .map_err(|e| format!("spawn yt-dlp: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -316,6 +457,7 @@ async fn resolve_with(ctx: &ResolveCtx, cookies: Option<&Path>) -> Result<Resolv
     let vcodec = fmt.get("vcodec").and_then(|v| v.as_str()).unwrap_or("");
     Ok(Resolved {
         url: direct,
+        degraded: false,
         mime: mime_for(ext, acodec, vcodec, ctx.video).to_string(),
         format_id: fmt
             .get("format_id")
@@ -636,10 +778,18 @@ async fn fill(
         eprintln!("[proxy] {} rename: {e}", ctx.video_id);
         return false;
     }
+    if state.degraded {
+        // The file has to land under its canonical name so the play in
+        // progress keeps reading it. The marker is what stops it being
+        // treated as the real cached copy afterwards: evicted when
+        // playback moves on and at the next launch.
+        let _ = tokio::fs::write(degraded_marker(final_path), b"").await;
+    }
     eprintln!(
-        "[proxy] cached {} ({total} bytes in {:.2}s)",
+        "[proxy] cached {} ({total} bytes in {:.2}s{})",
         ctx.video_id,
-        t0.elapsed().as_secs_f32()
+        t0.elapsed().as_secs_f32(),
+        if state.degraded { ", degraded" } else { "" }
     );
     true
 }
@@ -929,18 +1079,46 @@ pub fn spawn_tail_pump(
 
 #[cfg(test)]
 mod tests {
-    /// The retry in `resolve` keys off the timeout's exact text, so a
-    /// reworded timeout would silently stop retrying and a reworded
-    /// yt-dlp error could start being retried. Pin both directions.
+    /// The anonymous fallback in `resolve` keys off the timeout message's
+    /// prefix, so a reworded timeout would silently stop falling back and
+    /// a reworded yt-dlp error could start being treated as slow. Pin
+    /// both directions, for both ceilings.
     #[test]
-    fn only_a_timeout_is_worth_a_second_attempt() {
-        assert_eq!(TIMED_OUT, format!("yt-dlp -j timed out after {}s", RESOLVE_TIMEOUT.as_secs()));
-        // A dead video must not match: retrying it just doubles the wait.
+    fn only_a_timeout_earns_the_anonymous_fallback() {
+        assert_eq!(
+            TIMED_OUT,
+            format!("{TIMED_OUT_PREFIX} {}s", RESOLVE_TIMEOUT.as_secs())
+        );
+        assert!(TIMED_OUT.starts_with(TIMED_OUT_PREFIX));
+        let fallback_timed_out = format!("{TIMED_OUT_PREFIX} {}s", FALLBACK_TIMEOUT.as_secs());
+        assert!(fallback_timed_out.starts_with(TIMED_OUT_PREFIX));
+        // A dead video must not match: falling back just doubles the wait.
         let dead = "yt-dlp -j exit exit status: 1: ERROR: [youtube] x: Video unavailable";
-        assert_ne!(dead, TIMED_OUT);
+        assert!(!dead.starts_with(TIMED_OUT_PREFIX));
         // Nor must the no-formats case, which has its own anonymous retry.
         let no_formats = "yt-dlp -j exit exit status: 1: ERROR: Requested format is not available";
-        assert_ne!(no_formats, TIMED_OUT);
+        assert!(!no_formats.starts_with(TIMED_OUT_PREFIX));
+    }
+
+    /// The marker sits beside the canonical file and eviction spares only
+    /// the track that is playing.
+    #[tokio::test]
+    async fn degraded_eviction_keeps_the_playing_track() {
+        let dir = std::env::temp_dir().join(format!("ytubic-degraded-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for id in ["keepme", "dropme"] {
+            let f = dir.join(format!("{id}.webm"));
+            std::fs::write(&f, b"x").unwrap();
+            std::fs::write(degraded_marker(&f), b"").unwrap();
+        }
+        // An ordinary cached file with no marker is never touched.
+        std::fs::write(dir.join("normal.webm"), b"x").unwrap();
+        let removed = evict_degraded(&dir, Some("keepme")).await;
+        assert_eq!(removed, 1);
+        assert!(dir.join("keepme.webm").exists());
+        assert!(dir.join("normal.webm").exists());
+        assert!(!dir.join("dropme.webm").exists());
+        assert!(!dir.join("dropme.webm.degraded").exists());
     }
     use super::*;
 

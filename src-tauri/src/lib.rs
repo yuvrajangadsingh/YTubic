@@ -4410,6 +4410,7 @@ async fn proxy_ensure(
     variant: StreamVariant,
     target_dir: &std::path::Path,
     map_key: &str,
+    background: bool,
 ) -> Result<Arc<stream_proxy::ProxyState>, String> {
     let cell = {
         let mut map = srv.proxies.lock().await;
@@ -4438,12 +4439,14 @@ async fn proxy_ensure(
                 cookies: ytdlp_cookie_file(&srv.app).await,
             };
             let t0 = std::time::Instant::now();
-            let state = stream_proxy::prepare(&srv.http, &ctx).await?;
+            let state = stream_proxy::prepare(&srv.http, &ctx, background).await?;
             eprintln!(
-                "[proxy] {video_id}: resolved+probed in {:.2}s (total={} mime={})",
+                "[proxy] {video_id}: resolved+probed in {:.2}s (total={} mime={} format={}{})",
                 t0.elapsed().as_secs_f32(),
                 state.total,
-                state.mime
+                state.mime,
+                state.format_id.as_deref().unwrap_or("?"),
+                if state.degraded { " degraded" } else { "" }
             );
 
             // Claim the legacy downloads slot so /prefetch and fallback
@@ -4644,7 +4647,7 @@ async fn stream_handler(
     );
 
     if !final_path.exists() {
-        match proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key).await {
+        match proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key, false).await {
             Ok(pstate) => {
                 let range = (!range_hdr.is_empty()).then_some(range_hdr.as_str());
                 return proxy_respond(&srv, pstate, &video_id, variant, &target_dir, range, t0)
@@ -4791,6 +4794,29 @@ async fn cover_serve_handler(
 /// same `?ephemeral=1` flag as /stream so non-Premium prefetches (if
 /// the frontend ever lets one through) land in the session-only pool
 /// rather than the persistent cache.
+/// Drop the anonymous fallback's cached files (see `ProxyState.degraded`),
+/// except the track named by `?keep=<id>`, which is the one playing now
+/// and must stay readable. The frontend calls this whenever a track
+/// starts, which also covers the first play after a launch, so a degraded
+/// copy is never replayed once playback has moved on.
+async fn degraded_evict_handler(
+    AxumState(srv): AxumState<StreamServer>,
+    req: Request,
+) -> StatusCode {
+    let keep = req
+        .uri()
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("keep=")))
+        .map(str::to_string)
+        .filter(|id| sanitize_video_id(id));
+    let mut n = stream_proxy::evict_degraded(&srv.cache_dir, keep.as_deref()).await;
+    n += stream_proxy::evict_degraded(&srv.ephemeral_dir, keep.as_deref()).await;
+    if n > 0 {
+        eprintln!("[proxy] evicted {n} degraded cache file(s)");
+    }
+    StatusCode::NO_CONTENT
+}
+
 async fn prefetch_handler(
     AxumState(srv): AxumState<StreamServer>,
     Path(video_id): Path<String>,
@@ -4822,7 +4848,7 @@ async fn prefetch_handler(
     // Preferred: start (or join) a range-proxy download. proxy_ensure
     // claims the downloads slot atomically itself, so a concurrent
     // /stream or /prefetch can't start a second writer for the key.
-    if proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key)
+    if proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key, true)
         .await
         .is_ok()
     {
@@ -4927,6 +4953,7 @@ async fn start_stream_server(
     let routes = Router::new()
         .route("/stream/:video_id", get(stream_handler))
         .route("/prefetch/:video_id", get(prefetch_handler))
+        .route("/degraded/evict", get(degraded_evict_handler))
         .route("/cover/:filename", get(cover_serve_handler))
         .with_state(server);
     let app = Router::new()

@@ -4,7 +4,12 @@ import { useShallow } from "zustand/react/shallow";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { fetchRadio, fetchWatchQueueContinuation } from "@/lib/innertube/radio";
-import { prefetchStream, saveTrackMeta, streamUrlFor } from "@/lib/stream";
+import {
+  getStreamBaseUrl,
+  prefetchStream,
+  saveTrackMeta,
+  streamUrlFor,
+} from "@/lib/stream";
 import { usePlaybackStore, type QueueTrack } from "@/lib/store/playback";
 import { isCasting, useCastStore } from "@/lib/store/cast";
 import { usePremiumStore } from "@/lib/store/premium";
@@ -840,6 +845,17 @@ export function useAudioEngine() {
         }
         el.load();
         appLog(`src set ${videoId ?? "-"} ${mediaState(el)}`);
+        // A track that had to fall back to the anonymous resolve was cached
+        // as a lower tier; now that playback has moved to this one, drop
+        // any such copies except this track's own, so the next play of
+        // them resolves signed-in again. Local, fire-and-forget.
+        void getStreamBaseUrl()
+          .then((base) =>
+            fetch(
+              `${base}/degraded/evict?keep=${encodeURIComponent(videoId ?? "")}`,
+            ),
+          )
+          .catch(() => {});
         const hold = videoHoldRef.current;
         if (hold && hold.token === token) {
           el.addEventListener(
