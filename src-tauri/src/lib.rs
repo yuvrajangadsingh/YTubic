@@ -5419,6 +5419,32 @@ pub fn run() {
                     }
                 });
             }
+            // WebKit treats a window on another Space as occluded and marks
+            // the page hidden. Measured on 2026-09-04, all from that one
+            // state: rendering stops (the Space thumbnail goes flat grey),
+            // timers slow to one tick per several minutes, a pending
+            // play() is aborted on the visible-to-hidden edge, and after a
+            // long pause remote media commands are accepted by WebKit and
+            // never reach the page. Nothing inside the page can undo any of
+            // it; this turns the detection off at the source, with the
+            // same private WebKit property Electron-style shells set. The
+            // cost is rendering a window nobody is looking at, which for
+            // a music player is nothing next to the bugs it removes. App
+            // Nap is handled separately in app_nap.rs.
+            #[cfg(target_os = "macos")]
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.with_webview(|webview| unsafe {
+                    use objc2::msg_send;
+                    use objc2::runtime::AnyObject;
+                    let wk: *mut AnyObject = webview.inner().cast();
+                    if wk.is_null() {
+                        eprintln!("[webkit] no WKWebView handle; occlusion detection left on");
+                        return;
+                    }
+                    let _: () = msg_send![wk, _setWindowOcclusionDetectionEnabled: false];
+                    eprintln!("[webkit] window occlusion detection disabled for the main window");
+                });
+            }
             // Debug builds swap the taskbar/window icon to the orange
             // dev variant (see runtime_icon) so a dev instance is
             // instantly distinguishable from an installed release.
