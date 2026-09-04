@@ -299,6 +299,19 @@ mod secure_store {
             if let Some(key) = key_from_dir(dir)? {
                 return Ok(key);
             }
+            // Startup encrypts and decrypts from several tasks at once.
+            // On the first run of this build they all found no file and
+            // each went to the keychain: the migration line logged twice
+            // and a third caller held a dialog open (2026-09-04 13:33).
+            // Serialise the slow path and re-check under the lock so the
+            // keychain is read exactly once.
+            static MIGRATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _serial = MIGRATION
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(key) = key_from_dir(dir)? {
+                return Ok(key);
+            }
             let (key, origin) = match keyring_existing_key()? {
                 Some(key) => (key, "moved from the keychain"),
                 None => (mint_key(), "minted"),
