@@ -4905,11 +4905,18 @@ async fn prefetch_handler(
     // Preferred: start (or join) a range-proxy download. proxy_ensure
     // claims the downloads slot atomically itself, so a concurrent
     // /stream or /prefetch can't start a second writer for the key.
-    if proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key, true)
-        .await
-        .is_ok()
-    {
-        return StatusCode::ACCEPTED;
+    match proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key, true).await {
+        Ok(_) => return StatusCode::ACCEPTED,
+        // A deliberate skip is NOT a failure and must not fall through to
+        // the legacy downloader below: that spawns the uncapped yt-dlp the
+        // skip existed to prevent. 429 tells the client this was refused
+        // for pressure, not broken, so it can retry once; any other error
+        // is a real proxy failure and still earns the legacy path.
+        Err(e) if e == stream_proxy::SKIPPED => {
+            eprintln!("[proxy] {video_id}: prefetch declined (resolver busy), not falling back");
+            return StatusCode::TOO_MANY_REQUESTS;
+        }
+        Err(_) => {}
     }
     if final_path.exists() {
         return StatusCode::OK;
