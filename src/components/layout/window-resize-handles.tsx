@@ -36,20 +36,17 @@ const HANDLES: { direction: ResizeDirection; className: string }[] = [
   },
 ];
 
-const isWindows =
-  typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
-
 /**
- * Frameless WebKit windows do not have the invisible native resize border that
- * WebView2 provides on Windows, so Linux and the frameless macOS mini-player
- * need explicit edge grips. The decorated macOS main window disables these.
+ * Frameless WebKit windows do not have an invisible native resize border, so
+ * Linux and the frameless macOS mini-player need explicit edge grips. The
+ * decorated macOS main window disables these.
  */
 export function WindowResizeHandles({
   disabled = false,
 }: {
   disabled?: boolean;
 }) {
-  if (disabled || isWindows) return null;
+  if (disabled) return null;
 
   return (
     <>
