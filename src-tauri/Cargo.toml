@@ -32,7 +32,7 @@ serde_json = "1"
 # hours. We echo rotations into the jar ourselves (merge_response_cookies),
 # so the shadow store must not exist: it also attached partial cookie sets
 # to requests that carried no explicit Cookie header, and it kept session
-# security cookies in plaintext next to our DPAPI-encrypted jar.
+# security cookies in plaintext next to our encrypted jar.
 tauri-plugin-http = { version = "2", default-features = false, features = [
     "unsafe-headers",
     "rustls-tls",
@@ -93,21 +93,11 @@ libc = "0.2"
 # it panics rather than choosing. See the install_default call in run().
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Security_Cryptography",
-    # SetCurrentProcessExplicitAppUserModelID — pins our AppUserModelID onto the
-    # process so the SMTC media tile resolves (via the installer's matching Start
-    # Menu shortcut) to "YTubic" instead of "Unknown app". See src/appid.rs.
-    "Win32_UI_Shell",
-] }
-
 # macOS system Now Playing (Control Center / media keys / AirPods). A
-# Tauri WKWebView doesn't bridge the JS MediaSession API to the system
-# the way WebView2 does for Windows, so we drive MediaPlayer.framework
-# directly. objc2 + objc2-foundation are already in the tree via tauri;
-# declared here so we can use them, plus the MediaPlayer bindings.
+# Tauri WKWebView doesn't bridge the JS MediaSession API to the system,
+# so we drive MediaPlayer.framework directly. objc2 + objc2-foundation are
+# already in the tree via tauri; declared here so we can use them, plus the
+# MediaPlayer bindings.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
