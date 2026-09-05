@@ -74,11 +74,8 @@ const UPDATE_TIMEOUT: Duration = Duration::from_secs(180);
 /// Hard cap on the first-run download (~12 MB single-file, ~52 MB zip).
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
 /// Where the managed executable lives for this install. On macOS that is
-/// one level deeper than the others: the entry point inside the unpacked
+/// one level deeper than on Linux: the entry point inside the unpacked
 /// bundle directory.
 pub fn managed_path(app: &tauri::AppHandle) -> PathBuf {
     let dir = app
@@ -255,8 +252,6 @@ pub async fn ensure(app: tauri::AppHandle) {
 async fn probe_path_install() -> bool {
     let mut cmd = tokio::process::Command::new("yt-dlp");
     cmd.arg("--version");
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
     match cmd.status().await {
@@ -545,8 +540,6 @@ async fn latest_release_tag() -> Option<String> {
 async fn installed_version(managed: &Path) -> Option<String> {
     let mut cmd = tokio::process::Command::new(managed);
     cmd.arg("--version");
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
     let out = cmd.output().await.ok()?;
     if !out.status.success() {
         return None;
