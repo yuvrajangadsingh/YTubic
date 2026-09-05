@@ -17,9 +17,9 @@
 //!
 //! Rotation is a single rename at ~5MB so the file cannot grow without
 //! bound. Debug builds keep stderr on the terminal, where `tauri dev`
-//! wants it. Unix only; Windows keeps its existing behavior.
+//! wants it. Unix only.
 
-#[cfg(all(unix, not(debug_assertions)))]
+#[cfg(not(debug_assertions))]
 pub fn init(app: &tauri::AppHandle) {
     use std::fs::{self, OpenOptions};
     use std::io::{BufRead, BufReader, Write};
@@ -79,10 +79,10 @@ pub fn init(app: &tauri::AppHandle) {
         .ok();
 }
 
-#[cfg(not(all(unix, not(debug_assertions))))]
+#[cfg(debug_assertions)]
 pub fn init(_app: &tauri::AppHandle) {}
 
-#[cfg(all(unix, not(debug_assertions)))]
+#[cfg(not(debug_assertions))]
 fn now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
