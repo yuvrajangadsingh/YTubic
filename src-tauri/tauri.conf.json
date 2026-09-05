@@ -31,14 +31,12 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
     "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico"
+      "icons/icon.icns"
     ]
   },
   "plugins": {
@@ -46,10 +44,7 @@
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI5OEY4ODI0Q0FDMDFEQzgKUldUSUhjREtKSWlQS1c5ZFovMGZGajF2L2RqUDVYVFZPL3NTMC9lQUROT0F2ZVpmNDh2ZGc4ZUMK",
       "endpoints": [
         "https://github.com/yuvrajangadsingh/YTubic/releases/latest/download/latest.json"
-      ],
-      "windows": {
-        "installMode": "passive"
-      }
+      ]
     }
   }
 }
