@@ -129,7 +129,7 @@ export class AuthUnavailableError extends Error {
 export type AuthMode = "required" | "optional";
 
 // In-process cache for the auth context. Without it every browse / search
-// / next call invokes the Rust side, which hits disk + DPAPI-decrypts the
+// / next call invokes the Rust side, which hits disk + decrypts the
 // jar (a 1000-track playlist scroll would do that 10+ times for no gain).
 // TTL keeps us responsive to silent re-logins (different webview session
 // dropping a fresh SID); `resetAuthCache()` is the explicit invalidation

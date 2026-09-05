@@ -4962,7 +4962,7 @@ fn runtime_icon(app: &tauri::AppHandle) -> tauri::image::Image<'static> {
 /// it sat there as a red dot that ignored the system appearance. This is the
 /// same play glyph with the disc dropped, black on transparency.
 ///
-/// Everywhere else keeps the app icon: Windows and Linux trays expect colour.
+/// Everywhere else keeps the app icon: Linux trays expect colour.
 fn tray_icon(app: &tauri::AppHandle) -> tauri::image::Image<'static> {
     #[cfg(target_os = "macos")]
     {
@@ -5001,8 +5001,8 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             "YTubic"
         })
         .menu(&menu)
-        // macOS menu-bar extras conventionally open on left-click. Windows
-        // and Linux keep left-click reserved for restoring the main window.
+        // macOS menu-bar extras conventionally open on left-click. Linux
+        // keeps left-click reserved for restoring the main window.
         .show_menu_on_left_click(cfg!(target_os = "macos"))
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => show_main_window(app),

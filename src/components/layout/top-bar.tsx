@@ -57,7 +57,7 @@ import { AboutDialog } from "@/components/layout/about-dialog";
 
 // Caption-bar nav buttons get just an icon-color shift on hover —
 // the default ghost-button square highlight competes visually with
-// the Windows-style min/max/close cells on the right side of the bar.
+// the min/max/close cells on the right side of the bar.
 const NAV_BTN_CLS =
   "size-7 text-foreground/65 hover:bg-transparent hover:text-foreground dark:hover:bg-transparent";
 
@@ -70,14 +70,14 @@ const IS_TAURI =
 
 // NB: IS_MAC comes from @/lib/platform (imported above). On macOS the window
 // uses native decorations with an overlay title bar (tauri.macos.conf.json),
-// so the OS draws traffic lights top-left and the Windows-style
-// min/max/close cells must not render.
+// so the OS draws traffic lights top-left and our own min/max/close
+// cells must not render.
 
 /**
- * Cross-platform title bar. Windows and Linux use the frameless base config,
- * so we draw the caption controls ourselves. macOS uses native traffic lights
- * over an overlay title bar; the navigation cluster is inset around them and
- * the Windows-style controls are omitted.
+ * Cross-platform title bar. Linux uses the frameless base config, so we draw
+ * the caption controls ourselves. macOS uses native traffic lights over an
+ * overlay title bar; the navigation cluster is inset around them and the
+ * caption controls are omitted.
  *
  * Clicking our close button still goes through the Rust
  * `WindowEvent::CloseRequested` handler, which either hides the window
@@ -420,9 +420,8 @@ function ReportIssueDialog({
   );
 }
 
-/* Hand-drawn 10×10 SVGs match the Windows 11 caption-button glyphs
-   more faithfully than Lucide icons (which are designed at 24px and
-   look chunky at this size). */
+/* Hand-drawn 10×10 SVGs, because Lucide icons are designed at 24px and
+   look chunky scaled down to caption-button size. */
 
 function MinimizeGlyph() {
   return (

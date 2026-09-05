@@ -221,7 +221,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-background">
           {background === "ambient" && <BackgroundCover />}
           {/* Custom title bar spans the full window width so the
-              Windows-style min/max/close buttons land in the actual
+              min/max/close buttons land in the actual
               top-right corner, not behind the floating player. */}
           <TopBar />
           <div className="relative flex min-h-0 flex-1">

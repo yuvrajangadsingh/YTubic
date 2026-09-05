@@ -46,7 +46,7 @@ Next track is prefetched. 64% of plays start from disk and are instant.
 - **Storm breaker**: if the element flips play/pause 8 times in a second, the app goes silent for 5s and hard-resets the element if the flipping persists.
 - **WebKit occlusion detection is off** for the main window: a window on another Space was being marked hidden, which froze rendering, throttled timers and swallowed media keys.
 - **Media keys after a long pause are WebKit's problem**, not fixable from the page; the fix is native audio in Rust (ME-34).
-- **CI runs macOS + Ubuntu only.** Windows dropped Sep 2026.
+- **macOS is the only shipped platform.** Windows dropped Sep 2026: the CI job, the release job and the Windows-only Rust paths all went with it. CI runs macOS + Ubuntu.
 - **Releases**: `release/x.y.z` branch → PR to main → merge → the workflow builds a signed DMG and `latest.json` as a draft → publish by hand. The updater key is ours (`298F8824CAC01DC8`).
 - **Rename parked, not rejected.** Shortlist in `.notes/rename-shortlist-2026-09-01.md`. It is the first step of any launch (ME-30).
 
