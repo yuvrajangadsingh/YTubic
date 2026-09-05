@@ -1045,11 +1045,13 @@ async fn read_span(
 /// Where a span's bytes come from, and how many of them there are.
 ///
 /// `len` is settled before the caller writes a single header, so
-/// Content-Length and Content-Range are always labelled from what the
-/// body will actually deliver. A disk read is already in memory by the
-/// time we know its length; a passthrough declares its length in the
-/// upstream Content-Range and then streams, so the first byte reaches
-/// the player without waiting for the last one.
+/// Content-Length and Content-Range are labelled from a length the body
+/// is committed to. The guarantee is exact length or a broken transfer,
+/// not exact length always: an upstream that stops early fails the
+/// response instead of completing it at the wrong count. A disk read is
+/// already in memory by the time we know its length; a passthrough
+/// declares its length in the upstream Content-Range and then streams,
+/// so the first byte reaches the player without waiting for the last.
 pub struct SpanBody {
     pub len: usize,
     pub source: SpanSource,
@@ -1072,11 +1074,12 @@ impl SpanBody {
 /// Body producer for a passthrough 206: forward exactly `promised` bytes
 /// from an upstream response the caller has already validated.
 ///
-/// Anything short of `promised` is sent on as an error rather than a
-/// clean end-of-stream. Ending cleanly would hand the client a body
-/// shorter than the Content-Length already on the wire, which reads as a
-/// complete-but-wrong span; an error breaks the transfer instead, and
-/// the media element re-requests the range.
+/// Coming up short sends an error rather than ending the stream. That is
+/// not what stops a short span being served as a complete one: hyper's
+/// HTTP/1 encoder already aborts a clean EOF that lands short of
+/// Content-Length. The error is here to make the failure explicit and to
+/// put the byte counts in the log instead of leaving the encoder to
+/// notice.
 fn spawn_span_pump(
     resp: reqwest::Response,
     promised: usize,
@@ -1086,7 +1089,17 @@ fn spawn_span_pump(
         let mut resp = resp;
         let mut sent = 0usize;
         while sent < promised {
-            match tokio::time::timeout(Duration::from_secs(30), resp.chunk()).await {
+            // Racing the read against the receiver closing means a client
+            // that goes away mid-span releases the upstream response now,
+            // rather than whenever the next chunk or the 30s timeout
+            // lands. Seeking repeatedly against a stalled upstream would
+            // otherwise pile up abandoned requests.
+            let read = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                r = tokio::time::timeout(Duration::from_secs(30), resp.chunk()) => r,
+            };
+            match read {
                 Ok(Ok(Some(mut c))) => {
                     // A server may overshoot the range it declared.
                     c.truncate(promised - sent);
@@ -1100,6 +1113,9 @@ fn spawn_span_pump(
             }
         }
         if sent < promised {
+            // Release the upstream before parking on a send that a slow
+            // receiver may not drain for a while.
+            drop(resp);
             let _ = tx
                 .send(Err(std::io::Error::other(format!(
                     "short body {sent}/{promised}"
@@ -1461,12 +1477,16 @@ mod tests {
 
     /// Overshoot is trimmed, not forwarded: Content-Length is already
     /// set from `promised`, so the extra bytes would overrun it.
+    ///
+    /// `promised` sits well under the body size on purpose. At 100 of 150
+    /// the test would also pass on a socket that happened to split the
+    /// body at exactly 100, without the trim ever running.
     #[tokio::test]
     async fn an_overshooting_upstream_is_trimmed_to_the_promised_length() {
         let url = serve_206(149, 1500, 150, vec![b'z'; 150]).await;
         let resp = reqwest::Client::new().get(&url).send().await.unwrap();
-        let got = drain(spawn_span_pump(resp, 100)).await.unwrap();
-        assert_eq!(got.len(), 100);
+        let got = drain(spawn_span_pump(resp, 10)).await.unwrap();
+        assert_eq!(got, vec![b'z'; 10]);
     }
 
     /// Content-Range promises 100 bytes, Content-Length admits to 40.
