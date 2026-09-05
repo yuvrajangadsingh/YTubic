@@ -7224,7 +7224,6 @@ dependencies = [
  "tower-http",
  "urlencoding",
  "webkit2gtk",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
