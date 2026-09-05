@@ -1,56 +1,36 @@
-// OS media controls via `souvlaki`: on Windows this is the System Media
-// Transport Controls (SMTC) — the media tile in the Quick Settings / volume
-// flyout, the lock screen, and the hardware media keys. Linux maps to MPRIS;
-// macOS maps to Now Playing / MPRemoteCommandCenter. souvlaki does not need a
-// window handle on either platform, so `hwnd: None` is a real backend.
+// OS media controls via `souvlaki`. On Linux this is MPRIS: the desktop's media
+// widget, the lock screen, and the hardware media keys. souvlaki does not need a
+// window handle there, so `hwnd: None` is a real backend.
 //
-// Why we drive this from Rust instead of the webview's `navigator.mediaSession`:
-// the audio plays in an `<audio>` element inside WebView2, so Chromium creates
-// its OWN SMTC session — but that session is owned by the `msedgewebview2.exe`
-// child process, whose app identity Windows can't resolve, so the tile shows
-// "Unknown app" with no icon. There is no supported API to re-attribute a
-// WebView2 media session to the host app (WebView2Feedback #2236, open since
-// 2022). Creating the SMTC ourselves, bound to the host process's main window,
-// makes Windows resolve the tile to YTubic's own executable identity (name +
-// icon). Chromium's competing "Unknown app" tile is suppressed by disabling its
-// media session via `--disable-features=...MediaSessionService` on the main
-// window (see `additionalBrowserArgs` in tauri.conf.json).
+// `init` only runs on Linux (see the cfg on the call in `setup()`). macOS has
+// its own MPRemoteCommandCenter bridge in `now_playing.rs`, and letting both
+// register would fight over the system Now Playing entry.
 //
-// souvlaki's `MediaControls` is COM-backed on Windows: it is neither `Send` nor
-// `Sync`, and its calls must run on the thread that owns the window (the main
-// thread). So we keep it in a main-thread thread-local and only ever touch it
-// from the main thread — the commands below marshal on via
-// `AppHandle::run_on_main_thread`.
+// souvlaki's `MediaControls` has to stay on the thread that created it, so we
+// keep it in a main-thread thread-local and only ever touch it from the main
+// thread. The commands below marshal on via `AppHandle::run_on_main_thread`.
 use std::cell::RefCell;
 use std::time::Duration;
 
 use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
 };
-#[cfg(target_os = "windows")]
-use tauri::Manager;
 use tauri::{AppHandle, Emitter};
 
 thread_local! {
     static CONTROLS: RefCell<Option<MediaControls>> = const { RefCell::new(None) };
     // Signature of the metadata last pushed to the OS. The frontend re-pushes
-    // playback position every couple seconds to keep the SMTC scrubber accurate,
-    // but on Windows `set_metadata` re-uploads the cover art to SMTC (COM work
-    // on the UI thread) and janks a frame. Skip it when the metadata is
-    // unchanged and only update the cheap playback state + position.
+    // playback position every couple seconds to keep the scrubber accurate, but
+    // `set_metadata` re-uploads the cover art and janks a frame. Skip it when
+    // the metadata is unchanged and only update the cheap playback state +
+    // position.
     static LAST_META: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Create the OS media controls and forward button presses to the frontend as
 /// a `media-control` event. MUST be called on the main thread (from `setup()`),
-/// where souvlaki requires to run and the main window's HWND is available.
+/// where souvlaki requires to run.
 pub fn init(app: &AppHandle) {
-    #[cfg(target_os = "windows")]
-    let hwnd: Option<*mut std::ffi::c_void> = app
-        .get_webview_window("main")
-        .and_then(|w| w.hwnd().ok())
-        .map(|h| h.0 as *mut std::ffi::c_void);
-    #[cfg(not(target_os = "windows"))]
     let hwnd: Option<*mut std::ffi::c_void> = None;
 
     let config = PlatformConfig {

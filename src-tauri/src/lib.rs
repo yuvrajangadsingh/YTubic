@@ -5270,16 +5270,14 @@ pub fn run() {
                 tokio::time::sleep(Duration::from_secs(20)).await;
                 run_refresh_loop(refresh_handle).await;
             });
-            // Native media controls: the SMTC tile on Windows (Quick Settings /
-            // volume flyout) and MPRIS on Linux, plus the hardware media keys.
-            // setup() runs on the main thread, which souvlaki requires and where
-            // the main window's HWND is available.
+            // Native media controls: MPRIS on Linux, plus the hardware media
+            // keys. setup() runs on the main thread, which souvlaki requires.
             // macOS is deliberately excluded: it has its own
             // MPRemoteCommandCenter bridge (now_playing.rs), and letting both
             // register would fight over the system Now Playing entry.
             // media_update/media_clear no-op when init never ran (CONTROLS
             // stays None).
-            #[cfg(any(windows, target_os = "linux"))]
+            #[cfg(target_os = "linux")]
             media::init(app.handle());
             if let Err(e) = build_tray(app.handle()) {
                 eprintln!("[tray] build failed: {e}");
