@@ -499,7 +499,20 @@ async fn resolve(ctx: &ResolveCtx) -> Result<Resolved, String> {
                 "[proxy] {}: signed-in extraction returned no formats; retrying anonymously ({e})",
                 ctx.video_id
             );
-            resolve_with(ctx, None, RESOLVE_TIMEOUT).await
+            // Degraded for the same reason the timeout arm below is. This
+            // is the anonymous tier (130k) standing in for the signed-in
+            // one, and a signed-in extraction that returns no formats is
+            // transient, not a property of the video. Unmarked, that 130k
+            // copy became the canonical cached file and every later play
+            // of the track served it instead of resolving signed-in again.
+            let mut r = resolve_with(ctx, None, RESOLVE_TIMEOUT).await?;
+            r.degraded = true;
+            eprintln!(
+                "[proxy] {}: anonymous retry resolved format {} (degraded; not kept as the cached copy)",
+                ctx.video_id,
+                r.format_id.as_deref().unwrap_or("?")
+            );
+            Ok(r)
         }
         // A signed-in resolve that hits the ceiling is not retried the
         // same way. That was tried (2026-09-03) and on 2026-09-04 14:14 it
