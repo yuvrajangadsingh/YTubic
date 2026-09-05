@@ -29,7 +29,6 @@ mod app_nap;
 mod applog;
 mod authfs;
 mod identity;
-mod appid;
 mod cast;
 mod discord;
 mod lastfm;
@@ -5163,12 +5162,6 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Register + pin the app's Windows identity (AppUserModelID) so the SMTC
-    // media tile (and notifications, taskbar) resolve to "YTubic" + icon rather
-    // than "Unknown app". Must run before any window is created. No-op off
-    // Windows.
-    appid::init();
-
     // rustls 0.23 refuses to pick a crypto backend for you when more than one
     // is compiled in, and panics the first time anything opens a TLS socket.
     // Both are: `ring` and `aws-lc-rs` arrive under the same rustls via
