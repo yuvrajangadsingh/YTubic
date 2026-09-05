@@ -1659,19 +1659,30 @@ export function useAudioEngine() {
       /* older backend without the command — nap stays, nothing breaks */
     });
   }, [playing, status]);
-  const { nextVideoId } = usePlaybackStore(
+  const { nextVideoId, nextVideoId2 } = usePlaybackStore(
     useShallow((s) => ({
       nextVideoId:
         s.index >= 0 && s.index + 1 < s.queue.length
           ? s.queue[s.index + 1].videoId
+          : undefined,
+      nextVideoId2:
+        s.index >= 0 && s.index + 2 < s.queue.length
+          ? s.queue[s.index + 2].videoId
           : undefined,
     })),
   );
   // Substitute via source-prefs for the prefetch too — otherwise we'd
   // warm the cache for the wrong stream when the user has switched the
   // upcoming track to its video version.
-  const nextStreamVideoId = useTrackSourceStore((s) =>
-    nextVideoId ? resolveStreamId(nextVideoId, s.byVideoId) : undefined,
+  const { nextStreamVideoId, nextStreamVideoId2 } = useTrackSourceStore(
+    useShallow((s) => ({
+      nextStreamVideoId: nextVideoId
+        ? resolveStreamId(nextVideoId, s.byVideoId)
+        : undefined,
+      nextStreamVideoId2: nextVideoId2
+        ? resolveStreamId(nextVideoId2, s.byVideoId)
+        : undefined,
+    })),
   );
   // Warm the next track. This used to be gated on `status === "ready"`,
   // which the media element only reaches on its `playing` event, so a
@@ -1690,50 +1701,93 @@ export function useAudioEngine() {
   // old gate was really standing in for, is handled properly now by the
   // admission control in stream_proxy.rs: plays never wait, prefetches take
   // a single background slot and yield to them.
+  //
+  // Two tracks deep, not one. Depth 1 only covers the user who lets a track
+  // finish; anyone skipping lands on a cold track roughly every other press,
+  // and a cold track costs a yt-dlp resolve whose median in this app's own
+  // log is 4.9s (p90 11.4s, p99 27.7s), with nothing under 2s.
+  //
+  // This does not double the work. In the steady state, playing track N
+  // warms N+1 and N+2, but N+1 was already warmed as N-1's depth 2, so
+  // `prefetchStream` skips it and exactly one new resolve is spent per
+  // play, the same as depth 1 spent. What changes is the lead time: two
+  // tracks instead of one. The only extra cost is the last warmed track
+  // when the user stops or jumps away, which is one queue slot, not one
+  // per play.
   useEffect(() => {
     if (!playing) return;
-    if (!nextStreamVideoId) return;
+    if (!nextStreamVideoId && !nextStreamVideoId2) return;
     let cancelled = false;
-    let retry: number | undefined;
-    let retriesLeft = PREFETCH_RETRIES;
+    // Every pending timer, so the cleanup can clear the settle timer and
+    // any in-flight retry at either depth with one sweep.
+    const timers = new Set<number>();
+
+    /**
+     * Warm one upcoming track, resolving once it is warm or beyond saving
+     * so the caller can chain the next depth behind it. `offset` is the
+     * track's distance ahead of the current index and is used only to find
+     * its title for the metadata sidecar.
+     */
+    const warm = (
+      id: string,
+      offset: number,
+      retriesLeft: number,
+    ): Promise<void> =>
+      prefetchStream(id).then((outcome) => {
+        if (cancelled) return;
+        if (outcome === "busy") {
+          // Admission control declined; it did no work, so try again.
+          // Bounded on purpose: this used to re-arm on every 429, which is
+          // a retry loop for as long as the resolver stays busy.
+          if (retriesLeft <= 0) return;
+          return new Promise<void>((resolve) => {
+            const t = window.setTimeout(() => {
+              timers.delete(t);
+              resolve(warm(id, offset, retriesLeft - 1));
+            }, PREFETCH_RETRY_MS);
+            timers.add(t);
+          });
+        }
+        if (outcome === "failed") return;
+        // Label the prefetched file too, same reasoning as the play path.
+        // Read the queue live instead of closing over it: out here, a skip
+        // burst wrote one metadata sidecar per skipped track for files it
+        // never fetched.
+        const st = usePlaybackStore.getState();
+        void saveTrackMeta(
+          id,
+          st.index >= 0 && st.index + offset < st.queue.length
+            ? st.queue[st.index + offset]
+            : undefined,
+        );
+      });
+
     // Settle before firing: a burst of skips arms one timer per step and
     // the cleanup clears every one but the last, so twelve skips cost one
     // resolve rather than twelve. The cost is that much less lead time,
     // which is cheap against a median gap between plays of 130s.
     const fire = () => {
       void (async () => {
-        const outcome = await prefetchStream(nextStreamVideoId);
-        if (cancelled) return;
-        if (outcome === "busy") {
-          // Admission control declined; it did no work, so try again.
-          // Bounded on purpose: this re-armed on every 429, so the comment
-          // said "once more" while the code retried for as long as the
-          // resolver stayed busy. Cancelled by the same cleanup if the
-          // target moves on.
-          if (retriesLeft-- <= 0) return;
-          retry = window.setTimeout(fire, PREFETCH_RETRY_MS);
-          return;
+        // Strictly sequential, depth 1 first because that is the track the
+        // user reaches next. /prefetch only answers once its resolve is
+        // done and there is a single background admission slot, so firing
+        // both at once just earns the second one a 429 and a wait.
+        if (nextStreamVideoId) {
+          await warm(nextStreamVideoId, 1, PREFETCH_RETRIES);
         }
-        if (outcome === "failed") return;
-        // Label the prefetched file too — same reasoning as the play path.
-        // Inside the timer on purpose: out here, a skip burst wrote one
-        // metadata sidecar per skipped track for files it never fetched.
-        const st = usePlaybackStore.getState();
-        void saveTrackMeta(
-          nextStreamVideoId,
-          st.index >= 0 && st.index + 1 < st.queue.length
-            ? st.queue[st.index + 1]
-            : undefined,
-        );
+        if (cancelled) return;
+        if (nextStreamVideoId2) {
+          await warm(nextStreamVideoId2, 2, PREFETCH_RETRIES);
+        }
       })();
     };
-    const timer = window.setTimeout(fire, PREFETCH_SETTLE_MS);
+    const settle = window.setTimeout(fire, PREFETCH_SETTLE_MS);
+    timers.add(settle);
     return () => {
       cancelled = true;
-      window.clearTimeout(timer);
-      if (retry !== undefined) window.clearTimeout(retry);
+      for (const t of timers) window.clearTimeout(t);
     };
-  }, [playing, nextStreamVideoId]);
+  }, [playing, nextStreamVideoId, nextStreamVideoId2]);
 
   // Auto-extend the queue with radio tracks when we're near the end, so
   // playback continues past the explicit queue.
