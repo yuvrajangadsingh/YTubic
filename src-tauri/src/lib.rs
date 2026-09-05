@@ -3230,14 +3230,6 @@ fn resolve_stream_ytdlp(app: tauri::AppHandle, video_id: String) -> Result<Strin
         command.arg("--cookies").arg(path);
     }
     command.arg(&url);
-    // Windows: a console-less GUI process spawning the console-subsystem
-    // yt-dlp.exe with default flags makes Windows flash a console window
-    // on every resolve. CREATE_NO_WINDOW suppresses it.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
     let output = command.output().map_err(|e| format!("spawn yt-dlp: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3276,11 +3268,6 @@ fn resolve_hls_stream(app: tauri::AppHandle, video_id: String) -> Result<String,
     ]);
     command.args(ytdlp::js_runtime_args());
     command.arg(&url);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
     let output = command
         .output()
         .map_err(|e| format!("spawn yt-dlp: {e}"))?;
@@ -4221,10 +4208,6 @@ fn spawn_downloader(
             cmd.arg("--cookies").arg(path);
         }
         cmd.arg(&url);
-        // Windows: suppress the console window for the child yt-dlp.exe
-        // (see resolve_stream_ytdlp for rationale).
-        #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn() {
             Ok(c) => c,
             Err(e) => {

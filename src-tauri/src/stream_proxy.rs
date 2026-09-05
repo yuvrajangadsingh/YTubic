@@ -551,10 +551,6 @@ async fn resolve_with(
         cmd.arg("--cookies").arg(path);
     }
     cmd.arg(&url);
-    #[cfg(windows)]
-    {
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
     cmd.stdin(Stdio::null());
     // The wrapping timeout (and a skipped track abandoning this future)
     // drops the child future — without kill_on_drop that leaks a live
@@ -1292,8 +1288,6 @@ mod tests {
     /// the track that is playing.
     #[tokio::test]
     async fn degraded_eviction_keeps_the_playing_track() {
-        // No `rand` here: that crate is only a dependency on macOS and
-        // Linux, and this test compiles on Windows too (CI, 2026-09-04).
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
