@@ -4480,25 +4480,32 @@ async fn proxy_respond(
         Ok(Some(span)) => {
             let w = stream_proxy::window_span(&span);
             match stream_proxy::serve_span(&srv.http, &state, &part_path, &final_path, &w).await {
-                Ok(bytes) => {
-                    // Label the response from what was ACTUALLY delivered
-                    // — a passthrough may legally return a shorter span
-                    // than requested, and headers must never overpromise
-                    // the body.
-                    let end = w.start + bytes.len() as u64 - 1;
+                Ok(body) => {
+                    // Label the response from the length the body has
+                    // committed to, not from the span we asked for. A
+                    // passthrough may legally deliver a shorter span than
+                    // requested, and headers must never overpromise the
+                    // body.
+                    let end = w.start + body.len as u64 - 1;
                     eprintln!(
-                        "[proxy] {video_id}: 206 {}-{end}/{total} ({} bytes, {:.2}s)",
+                        "[proxy] {video_id}: 206 {}-{end}/{total} ({} bytes, {:.2}s to headers)",
                         w.start,
-                        bytes.len(),
+                        body.len,
                         t0.elapsed().as_secs_f32()
                     );
+                    let span_body = match body.source {
+                        stream_proxy::SpanSource::Memory(b) => axum::body::Body::from(b),
+                        stream_proxy::SpanSource::Stream(rx) => axum::body::Body::from_stream(
+                            tokio_stream::wrappers::ReceiverStream::new(rx),
+                        ),
+                    };
                     Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
                         .header(header::CONTENT_TYPE, mime)
-                        .header(header::CONTENT_LENGTH, bytes.len())
+                        .header(header::CONTENT_LENGTH, body.len)
                         .header(header::CONTENT_RANGE, format!("bytes {}-{end}/{total}", w.start))
                         .header(header::ACCEPT_RANGES, "bytes")
-                        .body(axum::body::Body::from(bytes))
+                        .body(span_body)
                         .unwrap()
                         .into_response()
                 }

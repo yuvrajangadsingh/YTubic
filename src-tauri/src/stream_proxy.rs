@@ -1042,16 +1042,91 @@ async fn read_span(
     Ok(buf)
 }
 
+/// Where a span's bytes come from, and how many of them there are.
+///
+/// `len` is settled before the caller writes a single header, so
+/// Content-Length and Content-Range are always labelled from what the
+/// body will actually deliver. A disk read is already in memory by the
+/// time we know its length; a passthrough declares its length in the
+/// upstream Content-Range and then streams, so the first byte reaches
+/// the player without waiting for the last one.
+pub struct SpanBody {
+    pub len: usize,
+    pub source: SpanSource,
+}
+
+pub enum SpanSource {
+    Memory(Vec<u8>),
+    Stream(mpsc::Receiver<Result<Vec<u8>, std::io::Error>>),
+}
+
+impl SpanBody {
+    fn memory(bytes: Vec<u8>) -> Self {
+        SpanBody {
+            len: bytes.len(),
+            source: SpanSource::Memory(bytes),
+        }
+    }
+}
+
+/// Body producer for a passthrough 206: forward exactly `promised` bytes
+/// from an upstream response the caller has already validated.
+///
+/// Anything short of `promised` is sent on as an error rather than a
+/// clean end-of-stream. Ending cleanly would hand the client a body
+/// shorter than the Content-Length already on the wire, which reads as a
+/// complete-but-wrong span; an error breaks the transfer instead, and
+/// the media element re-requests the range.
+fn spawn_span_pump(
+    resp: reqwest::Response,
+    promised: usize,
+) -> mpsc::Receiver<Result<Vec<u8>, std::io::Error>> {
+    let (tx, rx) = mpsc::channel::<Result<Vec<u8>, std::io::Error>>(4);
+    tokio::spawn(async move {
+        let mut resp = resp;
+        let mut sent = 0usize;
+        while sent < promised {
+            match tokio::time::timeout(Duration::from_secs(30), resp.chunk()).await {
+                Ok(Ok(Some(mut c))) => {
+                    // A server may overshoot the range it declared.
+                    c.truncate(promised - sent);
+                    sent += c.len();
+                    if tx.send(Ok(c.to_vec())).await.is_err() {
+                        return; // client went away
+                    }
+                }
+                Ok(Ok(None)) => break,
+                _ => break,
+            }
+        }
+        if sent < promised {
+            let _ = tx
+                .send(Err(std::io::Error::other(format!(
+                    "short body {sent}/{promised}"
+                ))))
+                .await;
+        }
+    });
+    rx
+}
+
 /// Fetch exactly `[start, end]` from the current signed URL, with the
-/// same-URL retry that recovers transient 403s. Bounded by WINDOW so the
-/// whole span fits in memory.
+/// same-URL retry that recovers transient 403s.
+///
+/// The retry covers everything that can go wrong before the body starts:
+/// a connect timeout, a non-206, a Content-Range that does not match
+/// what we asked for. Once one of those checks passes we hand the
+/// response straight to the pump, so a failure partway through the body
+/// is no longer retried here. That is deliberate. Buffering the whole
+/// window to keep the retry meant a far seek waited for the last byte of
+/// up to WINDOW before the player got the first, and a truncated 206
+/// already re-enters this path through the media element's own retry.
 async fn fetch_span(
     client: &reqwest::Client,
     state: &ProxyState,
     start: u64,
     end: u64,
-) -> Result<Vec<u8>, String> {
-    let want = (end - start + 1) as usize;
+) -> Result<SpanBody, String> {
     let mut last = String::new();
     for attempt in 0..=URL_RETRIES {
         if attempt > 0 {
@@ -1103,26 +1178,10 @@ async fn fetch_span(
                 continue;
             }
         };
-        let mut buf = Vec::with_capacity(promised.min(want));
-        let mut resp = resp;
-        let mut ok = true;
-        while buf.len() < promised {
-            match tokio::time::timeout(Duration::from_secs(30), resp.chunk()).await {
-                Ok(Ok(Some(c))) => {
-                    let take = c.len().min(promised - buf.len());
-                    buf.extend_from_slice(&c[..take]);
-                }
-                Ok(Ok(None)) => break,
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok && buf.len() == promised {
-            return Ok(buf);
-        }
-        last = format!("short body {}/{promised}", buf.len());
+        return Ok(SpanBody {
+            len: promised,
+            source: SpanSource::Stream(spawn_span_pump(resp, promised)),
+        });
     }
     Err(last)
 }
@@ -1138,7 +1197,7 @@ pub async fn serve_span(
     part_path: &Path,
     final_path: &Path,
     span: &Span,
-) -> Result<Vec<u8>, String> {
+) -> Result<SpanBody, String> {
     let len = (span.end - span.start + 1) as usize;
     let deadline = tokio::time::Instant::now() + WAIT_BUDGET;
     let mut last_filled = state.filled.load(Ordering::Acquire);
@@ -1149,6 +1208,7 @@ pub async fn serve_span(
         if done || span.end < filled {
             return read_span(part_path, final_path, span.start, len)
                 .await
+                .map(SpanBody::memory)
                 .map_err(|e| format!("disk read: {e}"));
         }
         if state.failed.load(Ordering::Acquire) {
@@ -1174,6 +1234,7 @@ pub async fn serve_span(
                     if state.complete.load(Ordering::Acquire) {
                         return read_span(part_path, final_path, span.start, len)
                             .await
+                            .map(SpanBody::memory)
                             .map_err(|e2| format!("disk read after passthrough: {e2}"));
                     }
                     return Err(e);
@@ -1311,6 +1372,7 @@ mod tests {
         assert!(!dir.join("dropme.webm").exists());
         assert!(!dir.join("dropme.webm.degraded").exists());
     }
+
     use super::*;
 
     #[test]
