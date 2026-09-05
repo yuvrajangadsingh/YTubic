@@ -7,7 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
  * YouTube now serves "client-locked" stream URLs — signed so that only
  * requests matching the issuing client's TLS fingerprint + headers are
  * accepted by googlevideo. Our Rust reqwest proxy consistently got 403;
- * WebView2 direct loads did too. yt-dlp side-steps the whole problem by
+ * direct webview loads did too. yt-dlp side-steps the whole problem by
  * handling the modern PoToken / visitor_data / signature dance and
  * returning a URL that actually plays.
  *

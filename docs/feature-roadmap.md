@@ -5,9 +5,8 @@
 - [x] API-интеграции (Discord Rich Presence, Last.fm)
 - [ ] Crossfade
 - [ ] Queue/playlist view вместо lyrics
-- [ ] Windows controls для музыки (SMTC)
-- [ ] Linux версия
-- [ ] macOS версия
+- [x] Linux версия
+- [x] macOS версия
 - [x] Возможность выбрать разные каналы/субпрофили для одного аккаунта
 - [ ] Auto Mix
 - [ ] Фиксы для светлой темы

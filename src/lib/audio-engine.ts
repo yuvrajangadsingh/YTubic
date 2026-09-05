@@ -29,10 +29,12 @@ import { appLog, mediaState } from "@/lib/app-log";
 
 /**
  * AudioEngine binds the playback store to a singleton HTMLAudioElement and
- * drives native media controls from Rust via souvlaki (SMTC, MPRIS, and macOS
- * Now Playing; see src-tauri/src/media.rs). The webview media session stays
- * disabled on Windows because it belongs to WebView2 and appears as an
- * "Unknown app" duplicate.
+ * drives native media controls. On Linux that runs through Rust and souvlaki
+ * for MPRIS (see src-tauri/src/media.rs), and the webview media session stays
+ * disabled there because it belongs to a separate webview process and shows up
+ * as an "Unknown app" duplicate. macOS is the reverse: the webview's
+ * navigator.mediaSession owns the Now Playing entry and nothing registers from
+ * the Rust side.
  *
  * Mount this hook once, near the root. It owns the <audio> element's lifecycle.
  */
@@ -1270,7 +1272,7 @@ export function useAudioEngine() {
       return;
     }
     if (playing && !premiumOk) {
-      // Resume attempts (play button, Space, SMTC play) on a gated track
+      // Resume attempts (play button, Space, MPRIS play) on a gated track
       // never reach the resolve effect (its deps don't include
       // `playing`), so intercept them here.
       usePlaybackStore.getState().setPlaying(false);
@@ -1425,9 +1427,9 @@ export function useAudioEngine() {
     }
   }, [pendingSeek]);
 
-  // OS media controls are driven from Rust via souvlaki, not
-  // navigator.mediaSession — the webview's own media session shows up as
-  // "Unknown app" because it belongs to the WebView2 child process. Metadata /
+  // On Linux the OS media controls are driven from Rust via souvlaki, not
+  // navigator.mediaSession: the webview's own media session shows up as
+  // "Unknown app" because it belongs to a separate webview process. Metadata /
   // state is pushed by the media_update effect lower down; buttons come back
   // via the media-control listener. See src-tauri/src/media.rs.
 
@@ -1520,11 +1522,11 @@ export function useAudioEngine() {
   // the system transport presses. Two registered command targets meant
   // every press could fire twice.)
 
-  // System media-control / media-key button presses (SMTC on Windows, MPRIS
-  // on Linux) arrive from Rust via souvlaki as a
-  // `media-control` event. Drive the store the same way the old
-  // navigator.mediaSession action handlers did. `cancelled` guards against
-  // StrictMode's mount→unmount→mount double-listen, like the tray listener.
+  // System media-control / media-key button presses (MPRIS on Linux)
+  // arrive from Rust via souvlaki as a `media-control` event. Drive the
+  // store the same way the old navigator.mediaSession action handlers did.
+  // `cancelled` guards against StrictMode's mount→unmount→mount
+  // double-listen, like the tray listener.
   useEffect(() => {
     let cancelled = false;
     let dispose: (() => void) | undefined;
@@ -1582,9 +1584,9 @@ export function useAudioEngine() {
 
   // System media commands on macOS route through WKWebView's media
   // session — upstream removed these handlers when souvlaki took over
-  // on Windows, which left the mac widget's buttons acting on the
-  // element directly and desyncing the store. Mac-only: Windows keeps
-  // the souvlaki media-control path.
+  // on the other platforms, which left the mac widget's buttons acting
+  // on the element directly and desyncing the store. Mac-only: Linux
+  // keeps the souvlaki media-control path.
   useEffect(() => {
     if (typeof navigator === "undefined" || !navigator.mediaSession) return;
     if (!navigator.userAgent.includes("Mac")) return;
