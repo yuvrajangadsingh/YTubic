@@ -1178,6 +1178,17 @@ async fn fetch_span(
                 continue;
             }
         };
+        // A response that declares a body shorter than the range it just
+        // promised is a contradiction visible in the headers, so it still
+        // belongs to the retry. Once the response goes to the pump there
+        // is no retry left, and the caller has already committed to
+        // `promised` bytes.
+        if let Some(declared) = resp.content_length() {
+            if declared < promised as u64 {
+                last = format!("declared body {declared} < promised {promised}");
+                continue;
+            }
+        }
         return Ok(SpanBody {
             len: promised,
             source: SpanSource::Stream(spawn_span_pump(resp, promised)),
@@ -1373,25 +1384,45 @@ mod tests {
         assert!(!dir.join("dropme.webm.degraded").exists());
     }
 
-    /// One-shot raw HTTP server. Answers the first request with a 206
-    /// declaring `declared` bytes, writes `body`, then closes. Lets a
-    /// test hand the pump an upstream that lies about its length.
-    async fn one_shot_206(declared: usize, body: Vec<u8>) -> String {
+    /// Raw HTTP server that answers every connection with the same 206.
+    /// The Content-Range and Content-Length values are set independently
+    /// so a test can hand the code an upstream whose headers contradict
+    /// each other, or whose body contradicts both.
+    async fn serve_206(range_end: u64, total: u64, declared: usize, body: Vec<u8>) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut scratch = [0u8; 1024];
-            let _ = sock.read(&mut scratch).await;
-            let head = format!(
-                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {declared}\r\n\r\n",
-                declared - 1,
-                declared * 10
-            );
-            let _ = sock.write_all(head.as_bytes()).await;
-            let _ = sock.write_all(&body).await;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 1024];
+                    let _ = sock.read(&mut scratch).await;
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{range_end}/{total}\r\nContent-Length: {declared}\r\n\r\n"
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                });
+            }
         });
         format!("http://{addr}/")
+    }
+
+    fn state_for(url: String, total: u64) -> ProxyState {
+        ProxyState {
+            url: Mutex::new(url),
+            total,
+            mime: "audio/mp4".into(),
+            format_id: None,
+            degraded: false,
+            filled: AtomicU64::new(0),
+            complete: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
     }
 
     async fn drain(
@@ -1413,7 +1444,7 @@ mod tests {
     /// Content-Length it was promised and call it a complete span.
     #[tokio::test]
     async fn a_short_upstream_body_errors_instead_of_truncating_silently() {
-        let url = one_shot_206(100, vec![b'x'; 40]).await;
+        let url = serve_206(99, 1000, 100, vec![b'x'; 40]).await;
         let resp = reqwest::Client::new().get(&url).send().await.unwrap();
         let err = drain(spawn_span_pump(resp, 100)).await.unwrap_err();
         assert!(err.contains("short body 40/100"), "got {err}");
@@ -1421,7 +1452,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_exact_upstream_body_delivers_every_promised_byte() {
-        let url = one_shot_206(100, vec![b'y'; 100]).await;
+        let url = serve_206(99, 1000, 100, vec![b'y'; 100]).await;
         let resp = reqwest::Client::new().get(&url).send().await.unwrap();
         let got = drain(spawn_span_pump(resp, 100)).await.unwrap();
         assert_eq!(got.len(), 100);
@@ -1432,10 +1463,38 @@ mod tests {
     /// set from `promised`, so the extra bytes would overrun it.
     #[tokio::test]
     async fn an_overshooting_upstream_is_trimmed_to_the_promised_length() {
-        let url = one_shot_206(150, vec![b'z'; 150]).await;
+        let url = serve_206(149, 1500, 150, vec![b'z'; 150]).await;
         let resp = reqwest::Client::new().get(&url).send().await.unwrap();
         let got = drain(spawn_span_pump(resp, 100)).await.unwrap();
         assert_eq!(got.len(), 100);
+    }
+
+    /// Content-Range promises 100 bytes, Content-Length admits to 40.
+    /// The two disagree in the headers, before a single body byte, so
+    /// this still belongs to the retry: handing it to the pump would
+    /// commit the caller to a Content-Length the body cannot reach.
+    #[tokio::test]
+    async fn a_body_shorter_than_its_own_content_range_is_retried_not_streamed() {
+        let url = serve_206(99, 1000, 40, vec![b'x'; 40]).await;
+        let state = state_for(url, 1000);
+        let err = fetch_span(&reqwest::Client::new(), &state, 0, 99)
+            .await
+            .err()
+            .expect("a body that cannot reach the promised length must not be served");
+        assert!(err.contains("declared body 40 < promised 100"), "got {err}");
+    }
+
+    /// Positive control for the test above: the same harness, headers
+    /// that agree, and the span is served.
+    #[tokio::test]
+    async fn a_consistent_upstream_is_served() {
+        let url = serve_206(99, 1000, 100, vec![b'x'; 100]).await;
+        let state = state_for(url, 1000);
+        let body = fetch_span(&reqwest::Client::new(), &state, 0, 99)
+            .await
+            .expect("headers agree, so this must be served");
+        assert_eq!(body.len, 100);
+        assert!(matches!(body.source, SpanSource::Stream(_)));
     }
 
     use super::*;
