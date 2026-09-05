@@ -9,6 +9,29 @@ time; they are quoted, not rounded up.
 
 ---
 
+## 2026-09-06 · Windows support removed from the code
+
+**Decided:** delete the Windows code, not just the CI job. Gone: the DPAPI
+cookie store, the `CREATE_NO_WINDOW` spawn flags, the WebView2 browser args,
+the AppUserModelID module, the nsis bundle target, the Microsoft Store icons,
+the `windows-sys` dependency and the Windows entry in the release matrix.
+
+**Why:** nothing has built for Windows since the CI job went on 2026-09-04, so
+none of it was compiled anywhere. The gates were the real cost. Most of them
+wrapped the mac and the Linux paths as much as the Windows one, so reading a
+spawn call or the cookie store meant working out which of three platforms each
+arm was for, and deleting the wrong half of one would have broken Linux
+quietly.
+
+**Kept:** Linux. It is the canary that catches non-mac Rust mistakes, and
+`release.yml` is still the only workflow that bundles the deb, rpm and
+AppImage. Two `cfg`s in `lib.rs` still name windows on purpose: the catch-all
+plaintext arms of `encrypt` and `decrypt` for unsupported platforms. Leaving
+the term in makes a Windows build fail at compile time instead of quietly
+writing session cookies in the clear.
+
+---
+
 ## 2026-09-04 · CI runs macOS and Ubuntu only
 
 **Decided:** drop `windows-latest` from the CI matrix and from main's required
