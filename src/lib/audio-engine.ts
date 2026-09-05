@@ -62,8 +62,12 @@ const STORM_HOLD_MS = 5000;
 /// burst; measured skips run about 500ms apart, and the median gap between
 /// plays is 130s, so 2s costs almost nothing in lead time.
 const PREFETCH_SETTLE_MS = 2000;
-/// One retry after admission control declines a prefetch under pressure.
+/// How long to wait before re-firing a prefetch admission control declined.
 const PREFETCH_RETRY_MS = 5000;
+/// How many times a declined prefetch is re-fired before it is dropped. The
+/// resolver is busy because something else is being resolved, so the miss it
+/// would have prevented is usually already happening.
+const PREFETCH_RETRIES = 1;
 let stormActiveUntil = 0;
 let flipTimes: number[] = [];
 // The last play/pause the user asked for while a storm was being held
@@ -1689,6 +1693,7 @@ export function useAudioEngine() {
     if (!nextStreamVideoId) return;
     let cancelled = false;
     let retry: number | undefined;
+    let retriesLeft = PREFETCH_RETRIES;
     // Settle before firing: a burst of skips arms one timer per step and
     // the cleanup clears every one but the last, so twelve skips cost one
     // resolve rather than twelve. The cost is that much less lead time,
@@ -1698,8 +1703,12 @@ export function useAudioEngine() {
         const outcome = await prefetchStream(nextStreamVideoId);
         if (cancelled) return;
         if (outcome === "busy") {
-          // Admission control declined; it did no work, so try once more.
-          // Cancelled by the same cleanup if the target moves on.
+          // Admission control declined; it did no work, so try again.
+          // Bounded on purpose: this re-armed on every 429, so the comment
+          // said "once more" while the code retried for as long as the
+          // resolver stayed busy. Cancelled by the same cleanup if the
+          // target moves on.
+          if (retriesLeft-- <= 0) return;
           retry = window.setTimeout(fire, PREFETCH_RETRY_MS);
           return;
         }
