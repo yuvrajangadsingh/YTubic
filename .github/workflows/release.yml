@@ -1,4 +1,4 @@
-# Builds Windows, Linux, and a universal macOS installer, then publishes a
+# Builds Linux and a universal macOS installer, then publishes a
 # single draft GitHub Release
 # whenever a `v*` tag is pushed. Publish flow:
 #   git tag v0.1.0 && git push origin v0.1.0
@@ -24,10 +24,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Windows
-            os: windows-latest
-            args: ""
-            rust_targets: ""
           - name: macOS Universal
             os: macos-latest
             args: "--target universal-apple-darwin"
@@ -89,9 +85,9 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
-  # The bundler names its output per-packager (`_x64-setup.exe`, `_amd64.deb`,
+  # The bundler names its output per-packager (`_amd64.deb`,
   # `-1.x86_64.rpm`), which doesn't tell a visitor which file is for which OS.
-  # Rename every asset to `YTubic_<version>_<OS>_<arch>.<ext>` once all three
+  # Rename every asset to `YTubic_<version>_<OS>_<arch>.<ext>` once both
   # builds have uploaded. `latest.json` points at the assets by URL, so it is
   # rewritten in the same step — the minisign signatures cover file contents,
   # not names, so they stay valid. Runs after `build` so the manifest is final.
@@ -126,8 +122,6 @@ jobs:
           while read -r id name; do
             case "$name" in
               latest.json)                 continue ;;
-              *-setup.exe)                 new="YTubic_${version}_Windows_x64_Setup.exe" ;;
-              *-setup.exe.sig)             new="YTubic_${version}_Windows_x64_Setup.exe.sig" ;;
               *.app.tar.gz)                new="YTubic_${version}_macOS_Universal.app.tar.gz" ;;
               *.app.tar.gz.sig)            new="YTubic_${version}_macOS_Universal.app.tar.gz.sig" ;;
               *.dmg)                       new="YTubic_${version}_macOS_Universal.dmg" ;;
