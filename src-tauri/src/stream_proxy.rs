@@ -1373,6 +1373,71 @@ mod tests {
         assert!(!dir.join("dropme.webm.degraded").exists());
     }
 
+    /// One-shot raw HTTP server. Answers the first request with a 206
+    /// declaring `declared` bytes, writes `body`, then closes. Lets a
+    /// test hand the pump an upstream that lies about its length.
+    async fn one_shot_206(declared: usize, body: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            let head = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {declared}\r\n\r\n",
+                declared - 1,
+                declared * 10
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body).await;
+        });
+        format!("http://{addr}/")
+    }
+
+    async fn drain(
+        mut rx: mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+    ) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        while let Some(item) = rx.recv().await {
+            match item {
+                Ok(b) => out.extend_from_slice(&b),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Ok(out)
+    }
+
+    /// The headers are already on the wire by the time the body starts,
+    /// so an upstream that stops early must break the transfer. Ending
+    /// cleanly would hand the player a body shorter than the
+    /// Content-Length it was promised and call it a complete span.
+    #[tokio::test]
+    async fn a_short_upstream_body_errors_instead_of_truncating_silently() {
+        let url = one_shot_206(100, vec![b'x'; 40]).await;
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let err = drain(spawn_span_pump(resp, 100)).await.unwrap_err();
+        assert!(err.contains("short body 40/100"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn an_exact_upstream_body_delivers_every_promised_byte() {
+        let url = one_shot_206(100, vec![b'y'; 100]).await;
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let got = drain(spawn_span_pump(resp, 100)).await.unwrap();
+        assert_eq!(got.len(), 100);
+        assert!(got.iter().all(|b| *b == b'y'));
+    }
+
+    /// Overshoot is trimmed, not forwarded: Content-Length is already
+    /// set from `promised`, so the extra bytes would overrun it.
+    #[tokio::test]
+    async fn an_overshooting_upstream_is_trimmed_to_the_promised_length() {
+        let url = one_shot_206(150, vec![b'z'; 150]).await;
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let got = drain(spawn_span_pump(resp, 100)).await.unwrap();
+        assert_eq!(got.len(), 100);
+    }
+
     use super::*;
 
     #[test]
