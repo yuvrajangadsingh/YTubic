@@ -1,60 +1,60 @@
-# Идеи и улучшения из форков
+# Ideas and improvements from forks
 
-Снимок fork-сети `NUber-dev/YTubic` от 15 июля 2026 года. Это список идей для последующего разбора, а не готовый план слияния: крупные ветки конфликтуют с `main`, поэтому изменения следует переносить небольшими тематическими коммитами с тестами.
+A snapshot of the `NUber-dev/YTubic` fork network from July 15, 2026. This is a list of ideas to go through later, not a finished merge plan: the large branches conflict with `main`, so changes should be ported in small topical commits with tests.
 
-## Платформы
+## Platforms
 
-- Linux: `.deb`/`.rpm`/AppImage, CI-релизы, resize frameless-окон и защищённое хранение cookie через Secret Service. Уже адаптировано в локальной Linux-ветке на основе PR #1.
-- macOS: native title bar, Keychain + AES-GCM для cookie, Safari UA для login WebView, universal Intel/Apple Silicon build, Dock/menu bar и системные медиакнопки. PR #27 выглядит наиболее сфокусированной основой; из draft PR #33 стоит брать отдельные улучшения.
+- Linux: `.deb`/`.rpm`/AppImage, CI releases, resizing frameless windows and secure cookie storage through Secret Service. Already adapted in the local Linux branch based on PR #1.
+- macOS: native title bar, Keychain + AES-GCM for cookies, Safari UA for the login WebView, universal Intel/Apple Silicon build, Dock/menu bar and the system media keys. PR #27 looks like the most focused base; individual improvements are worth taking from draft PR #33.
 
-## Плеер
+## Player
 
-- Сохранять последний трек и playhead, восстанавливать их после перезапуска (`ameenalasady`, `5510d22`).
-- Восстанавливать последнюю страницу и scroll position (`ameenalasady`, `f41d57f`).
-- Исправить двойную длительность некоторых потоков на macOS и некорректный seek до загрузки metadata.
-- Добавить fallback между yt-dlp clients (`android_vr`, `ios`) при DRM/403 и fallback с video на audio.
-- Сделать Song/Video настоящим переключением audio/video stream, включая отдельный video cache.
-- Осторожно пропускать длинные пустые outro в extended uploads.
-- Добавить полноэкранный плеер с крупной обложкой, lyrics, ambient-фоном и accent color.
+- Save the last track and playhead, restore them after a restart (`ameenalasady`, `5510d22`).
+- Restore the last page and scroll position (`ameenalasady`, `f41d57f`).
+- Fix the doubled duration of some streams on macOS and the incorrect seek before metadata loads.
+- Add a fallback between yt-dlp clients (`android_vr`, `ios`) on DRM/403 and a fallback from video to audio.
+- Make Song/Video a real audio/video stream switch, including a separate video cache.
+- Carefully skip long empty outros in extended uploads.
+- Add a fullscreen player with a large cover, lyrics, an ambient background and an accent color.
 
 ## Lyrics
 
-- Добавить таймауты провайдеров, чтобы панель не зависала на Loading.
-- Строже отбрасывать lyrics от другой песни: учитывать исполнителя, длительность и remix/live qualifiers.
-- Масштабировать timestamps для sped-up/slowed версий и поддержать ручной offset на трек.
-- Разрешить глобально отключать lyrics и не выполнять сетевые запросы (`ameenalasady`, `022ab82`).
-- Показывать queue вместо пустого состояния, если lyrics отсутствуют.
+- Add provider timeouts so the panel doesn't hang on Loading.
+- Be stricter about dropping lyrics from another song: take the artist, the duration and remix/live qualifiers into account.
+- Scale timestamps for sped-up/slowed versions and support a manual per-track offset.
+- Allow turning lyrics off globally and skipping the network requests (`ameenalasady`, `022ab82`).
+- Show the queue instead of an empty state when there are no lyrics.
 
-## Библиотека и навигация
+## Library and navigation
 
-- Для Library → Songs использовать `FEmusic_liked_videos`, а не общий `LM`, куда могут попадать Shorts и обычные YouTube-видео.
-- Не включать Suggested tracks в настоящее содержимое плейлиста.
-- В поиске открывать album/artist/playlist страницы, а не запускать случайный video из play overlay.
-- Улучшить shuffle исполнителя: полный каталог, новая последовательность при каждом запуске и продолжение станции.
-- Сделать исполнителей и альбомы кликабельными из карточек и плеера.
-- Использовать channel handle для дедупликации аккаунтов, когда YouTube не возвращает email.
+- For Library → Songs use `FEmusic_liked_videos`, not the general `LM`, which can pick up Shorts and regular YouTube videos.
+- Don't include Suggested tracks in the real contents of a playlist.
+- In search, open album/artist/playlist pages instead of starting a random video from the play overlay.
+- Improve artist shuffle: the full catalog, a new order on every start and station continuation.
+- Make artists and albums clickable from cards and from the player.
+- Use the channel handle to dedupe accounts when YouTube doesn't return an email.
 
-## UI и настройки
+## UI and settings
 
-- Добавить refresh Home и опциональную перестановку секций. Перестановку проектировать без обязательной eager-загрузки всего feed.
-- Добавить поиск по музыкальному кэшу и показывать настоящие названия/исполнителей.
-- Добавить lightbox для полноразмерной обложки; переносить вместе с последующими исправлениями выбора изображения.
-- Изменяемые размеры sidebar/player, IndexedDB для активно меняющихся кэшей, ограничение cover cache и удаление auto-dock уже реализованы локально.
+- Add a Home refresh and optional reordering of sections. Design the reordering without requiring an eager load of the whole feed.
+- Add search over the music cache and show the real titles/artists.
+- Add a lightbox for the full-size cover; port it together with the later image selection fixes.
+- Resizable sidebar/player, IndexedDB for the caches that change often, a cover cache limit and the auto-dock removal are already done locally.
 
-## Интеграции и авторизация
+## Integrations and auth
 
-- Рассмотреть импорт cookie из браузеров как отдельный fallback для сломанного WebView login, только после security review.
-- Brand channel switching уже есть в основном приложении; старую реализацию переносить не нужно.
-- Проверить, полностью ли перенесены Last.fm offline retry, очистка `Topic` и avatar account card.
+- Consider importing cookies from browsers as a separate fallback for a broken WebView login, only after a security review.
+- Brand channel switching is already in the main app; the old implementation doesn't need porting.
+- Check whether the Last.fm offline retry, the `Topic` cleanup and the avatar account card were ported in full.
 
-## Не переносить
+## Do not port
 
-- Пользовательский или включённый по умолчанию обход Premium gate.
-- Изменение, которое распознаёт Premium upsell как наличие Premium.
-- Updater public keys из чужих форков.
-- Целые конфликтующие macOS/auth ветки без разбиения и платформенных regression-тестов.
+- A user-facing or default-on bypass of the Premium gate.
+- The change that reads a Premium upsell as having Premium.
+- Updater public keys from other people's forks.
+- Whole conflicting macOS/auth branches without splitting them up and without platform regression tests.
 
-## Источники
+## Sources
 
 - PR #1: <https://github.com/NUber-dev/YTubic/pull/1>
 - PR #3: <https://github.com/NUber-dev/YTubic/pull/3>
