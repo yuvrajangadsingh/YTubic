@@ -46,91 +46,10 @@ fn sanitize_video_id(id: &str) -> bool {
 }
 
 /// Platform-native symmetric "encrypt with current user's credentials"
-/// primitive. On Windows we use DPAPI (CryptProtectData) — the blob is
-/// only decryptable by the same Windows user on the same machine. Linux and
-/// macOS use AES-256-GCM and keep only the random data key in the native
-/// credential store (Secret Service or Keychain).
-///
-/// A fixed `ENTROPY` byte string is mixed in so a *different* app
-/// running as the same user can't trivially pass our blob to
-/// CryptUnprotectData and get our cookies out. This is a small hurdle
-/// against generic credential-stealer malware, not a real boundary —
-/// any attacker with our binary can read the entropy string.
+/// primitive. Linux and macOS use AES-256-GCM over a random data key. Where
+/// that key is kept differs per platform (Secret Service on Linux, a 0600
+/// file on macOS); see `encryption_key` below for why.
 mod secure_store {
-    #[cfg(windows)]
-    // Keeps the historical "ytm-native" tag on purpose: this string is
-    // baked into every existing encrypted cookie jar, and changing it
-    // would orphan them all. It's an opaque salt, not a product name.
-    const ENTROPY: &[u8] = b"ytm-native/cookies.enc v1";
-
-    #[cfg(windows)]
-    pub fn encrypt(plain: &[u8]) -> Result<Vec<u8>, String> {
-        use std::ptr;
-        use windows_sys::Win32::Foundation::LocalFree;
-        use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
-        unsafe {
-            let in_blob = CRYPT_INTEGER_BLOB {
-                cbData: plain.len() as u32,
-                pbData: plain.as_ptr() as *mut u8,
-            };
-            let ent_blob = CRYPT_INTEGER_BLOB {
-                cbData: ENTROPY.len() as u32,
-                pbData: ENTROPY.as_ptr() as *mut u8,
-            };
-            let mut out_blob: CRYPT_INTEGER_BLOB = std::mem::zeroed();
-            let ok = CryptProtectData(
-                &in_blob,
-                ptr::null(),
-                &ent_blob,
-                ptr::null_mut(),
-                ptr::null(),
-                0,
-                &mut out_blob,
-            );
-            if ok == 0 {
-                return Err("CryptProtectData failed".into());
-            }
-            let data =
-                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
-            LocalFree(out_blob.pbData as _);
-            Ok(data)
-        }
-    }
-
-    #[cfg(windows)]
-    pub fn decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
-        use std::ptr;
-        use windows_sys::Win32::Foundation::LocalFree;
-        use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
-        unsafe {
-            let in_blob = CRYPT_INTEGER_BLOB {
-                cbData: encrypted.len() as u32,
-                pbData: encrypted.as_ptr() as *mut u8,
-            };
-            let ent_blob = CRYPT_INTEGER_BLOB {
-                cbData: ENTROPY.len() as u32,
-                pbData: ENTROPY.as_ptr() as *mut u8,
-            };
-            let mut out_blob: CRYPT_INTEGER_BLOB = std::mem::zeroed();
-            let ok = CryptUnprotectData(
-                &in_blob,
-                ptr::null_mut(),
-                &ent_blob,
-                ptr::null_mut(),
-                ptr::null(),
-                0,
-                &mut out_blob,
-            );
-            if ok == 0 {
-                return Err("CryptUnprotectData failed".into());
-            }
-            let data =
-                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
-            LocalFree(out_blob.pbData as _);
-            Ok(data)
-        }
-    }
-
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     const KEYRING_MAGIC: &[u8; 5] = b"YTBC1";
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1440,7 +1359,7 @@ async fn cleanup_login_artifacts(app: &tauri::AppHandle) {
 /// succeeds with whatever Google session is already in the shared
 /// WebView2 user data dir — and there's no way for the user to pick a
 /// different identity. The temp profile is deleted on close (success
-/// or cancellation); our DPAPI-encrypted jar is the canonical store.
+/// or cancellation); our encrypted jar is the canonical store.
 ///
 /// Emits `login-success` (payload: new account id) on success and
 /// `login-cancelled` on close-without-auth.
@@ -1972,8 +1891,8 @@ enum RefreshOutcome {
 /// Can the platform credential store be read right now?
 ///
 /// Only Linux and macOS keep the jar's key outside the process (Secret
-/// Service / Keychain); Windows DPAPI needs no UI session, so there is
-/// nothing to probe there.
+/// Service / Keychain), so they are the only platforms with anything to
+/// probe.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn credential_store_ready() -> Result<(), String> {
     match tokio::task::spawn_blocking(|| secure_store::encrypt(b"probe")).await {
