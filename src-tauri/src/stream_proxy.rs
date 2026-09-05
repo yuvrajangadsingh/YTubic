@@ -1077,9 +1077,10 @@ impl SpanBody {
 /// Coming up short sends an error rather than ending the stream. That is
 /// not what stops a short span being served as a complete one: hyper's
 /// HTTP/1 encoder already aborts a clean EOF that lands short of
-/// Content-Length. The error is here to make the failure explicit and to
-/// put the byte counts in the log instead of leaving the encoder to
-/// notice.
+/// Content-Length. The error is here to make the failure explicit and
+/// to carry the byte counts, instead of leaving the encoder to notice.
+/// Nothing prints it today: axum::serve drops connection errors on the
+/// floor, so the counts are there for whoever needs them next.
 fn spawn_span_pump(
     resp: reqwest::Response,
     promised: usize,
@@ -1129,14 +1130,16 @@ fn spawn_span_pump(
 /// Fetch exactly `[start, end]` from the current signed URL, with the
 /// same-URL retry that recovers transient 403s.
 ///
-/// The retry covers everything that can go wrong before the body starts:
-/// a connect timeout, a non-206, a Content-Range that does not match
-/// what we asked for. Once one of those checks passes we hand the
-/// response straight to the pump, so a failure partway through the body
-/// is no longer retried here. That is deliberate. Buffering the whole
-/// window to keep the retry meant a far seek waited for the last byte of
-/// up to WINDOW before the player got the first, and a truncated 206
-/// already re-enters this path through the media element's own retry.
+/// The retry covers everything decidable from the headers: a connect
+/// timeout, a non-206, a Content-Range that does not match what we
+/// asked for, a Content-Length that undercuts it. Once all of those
+/// pass we hand the response to the pump, and from that point on there
+/// is no retry left, including on a failure at the very first body
+/// read. That is deliberate. Buffering the whole window to keep the
+/// retry meant a far seek waited for the last byte of up to WINDOW
+/// before the player got the first. Recovery from there is the media
+/// element's problem, which is what the module header already says the
+/// contract is.
 async fn fetch_span(
     client: &reqwest::Client,
     state: &ProxyState,
@@ -1400,31 +1403,61 @@ mod tests {
         assert!(!dir.join("dropme.webm.degraded").exists());
     }
 
-    /// Raw HTTP server that answers every connection with the same 206.
-    /// The Content-Range and Content-Length values are set independently
-    /// so a test can hand the code an upstream whose headers contradict
-    /// each other, or whose body contradicts both.
-    async fn serve_206(range_end: u64, total: u64, declared: usize, body: Vec<u8>) -> String {
+    /// One 206 from the fake upstream. The Content-Range end, the total,
+    /// the Content-Length and the body are all set independently so a
+    /// test can hand the code an upstream whose headers contradict each
+    /// other, or whose body contradicts both.
+    #[derive(Clone)]
+    struct Reply {
+        range_end: u64,
+        total: u64,
+        declared: usize,
+        body: Vec<u8>,
+    }
+
+    fn reply(range_end: u64, total: u64, declared: usize, body: Vec<u8>) -> Reply {
+        Reply {
+            range_end,
+            total,
+            declared,
+            body,
+        }
+    }
+
+    /// Raw HTTP server that walks `replies` one connection at a time and
+    /// repeats the last one after that. The returned counter is how many
+    /// requests it has answered, which is the only thing that tells a
+    /// test the retry re-requested rather than gave up.
+    async fn serve_206(replies: Vec<Reply>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
                 };
-                let body = body.clone();
+                let seen = hits.fetch_add(1, Ordering::SeqCst);
+                let r = replies[seen.min(replies.len() - 1)].clone();
                 tokio::spawn(async move {
                     let mut scratch = [0u8; 1024];
                     let _ = sock.read(&mut scratch).await;
-                    let head = format!(
-                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{range_end}/{total}\r\nContent-Length: {declared}\r\n\r\n"
-                    );
-                    let _ = sock.write_all(head.as_bytes()).await;
-                    let _ = sock.write_all(&body).await;
+                    let mut out = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\n\r\n",
+                        r.range_end, r.total, r.declared
+                    )
+                    .into_bytes();
+                    // Head and body in one write so they usually reach
+                    // the client together. Usually, not always: nothing
+                    // stops the kernel splitting them, so no test may
+                    // depend on where the chunk boundaries land.
+                    out.extend_from_slice(&r.body);
+                    let _ = sock.write_all(&out).await;
                 });
             }
         });
-        format!("http://{addr}/")
+        (format!("http://{addr}/"), counter)
     }
 
     fn state_for(url: String, total: u64) -> ProxyState {
@@ -1454,13 +1487,13 @@ mod tests {
         Ok(out)
     }
 
-    /// The headers are already on the wire by the time the body starts,
-    /// so an upstream that stops early must break the transfer. Ending
-    /// cleanly would hand the player a body shorter than the
-    /// Content-Length it was promised and call it a complete span.
+    /// An upstream that stops early has to reach the receiver as an
+    /// error, not as the end of the stream. hyper would refuse the short
+    /// HTTP/1 body on its own; this pins the pump's half of that, and
+    /// the byte counts that come with it.
     #[tokio::test]
     async fn a_short_upstream_body_errors_instead_of_truncating_silently() {
-        let url = serve_206(99, 1000, 100, vec![b'x'; 40]).await;
+        let (url, _) = serve_206(vec![reply(99, 1000, 100, vec![b'x'; 40])]).await;
         let resp = reqwest::Client::new().get(&url).send().await.unwrap();
         let err = drain(spawn_span_pump(resp, 100)).await.unwrap_err();
         assert!(err.contains("short body 40/100"), "got {err}");
@@ -1468,7 +1501,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_exact_upstream_body_delivers_every_promised_byte() {
-        let url = serve_206(99, 1000, 100, vec![b'y'; 100]).await;
+        let (url, _) = serve_206(vec![reply(99, 1000, 100, vec![b'y'; 100])]).await;
         let resp = reqwest::Client::new().get(&url).send().await.unwrap();
         let got = drain(spawn_span_pump(resp, 100)).await.unwrap();
         assert_eq!(got.len(), 100);
@@ -1478,12 +1511,14 @@ mod tests {
     /// Overshoot is trimmed, not forwarded: Content-Length is already
     /// set from `promised`, so the extra bytes would overrun it.
     ///
-    /// `promised` sits well under the body size on purpose. At 100 of 150
-    /// the test would also pass on a socket that happened to split the
-    /// body at exactly 100, without the trim ever running.
+    /// `promised` sits far under the body size on purpose. At 100 of 150
+    /// a socket that split the body at exactly 100 would pass without
+    /// the trim running at all. At 10 that needs a 10-byte first chunk,
+    /// which is unlikely rather than impossible, so what this pins is
+    /// the outcome: never more than `promised`, whatever the framing.
     #[tokio::test]
     async fn an_overshooting_upstream_is_trimmed_to_the_promised_length() {
-        let url = serve_206(149, 1500, 150, vec![b'z'; 150]).await;
+        let (url, _) = serve_206(vec![reply(149, 1500, 150, vec![b'z'; 150])]).await;
         let resp = reqwest::Client::new().get(&url).send().await.unwrap();
         let got = drain(spawn_span_pump(resp, 10)).await.unwrap();
         assert_eq!(got, vec![b'z'; 10]);
@@ -1495,26 +1530,44 @@ mod tests {
     /// commit the caller to a Content-Length the body cannot reach.
     #[tokio::test]
     async fn a_body_shorter_than_its_own_content_range_is_retried_not_streamed() {
-        let url = serve_206(99, 1000, 40, vec![b'x'; 40]).await;
+        let (url, hits) = serve_206(vec![reply(99, 1000, 40, vec![b'x'; 40])]).await;
         let state = state_for(url, 1000);
         let err = fetch_span(&reqwest::Client::new(), &state, 0, 99)
             .await
             .err()
             .expect("a body that cannot reach the promised length must not be served");
         assert!(err.contains("declared body 40 < promised 100"), "got {err}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            URL_RETRIES as usize + 1,
+            "every attempt should have been spent on the retry"
+        );
     }
 
-    /// Positive control for the test above: the same harness, headers
-    /// that agree, and the span is served.
+    /// Rejecting is only half of it. Swapping the guard's `continue` for
+    /// a `return Err` would satisfy the test above, so this one puts a
+    /// good response behind the bad one and checks the retry reaches it:
+    /// two requests, and a body that drains to the promised bytes.
+    ///
+    /// It doubles as the positive control for the test above, since it
+    /// proves the same harness can produce a served span.
     #[tokio::test]
-    async fn a_consistent_upstream_is_served() {
-        let url = serve_206(99, 1000, 100, vec![b'x'; 100]).await;
+    async fn a_rejected_span_is_re_requested_until_one_holds_up() {
+        let (url, hits) = serve_206(vec![
+            reply(99, 1000, 40, vec![b'x'; 40]),
+            reply(99, 1000, 100, vec![b'y'; 100]),
+        ])
+        .await;
         let state = state_for(url, 1000);
         let body = fetch_span(&reqwest::Client::new(), &state, 0, 99)
             .await
-            .expect("headers agree, so this must be served");
+            .expect("the second response is consistent, so the retry must recover");
         assert_eq!(body.len, 100);
-        assert!(matches!(body.source, SpanSource::Stream(_)));
+        let SpanSource::Stream(rx) = body.source else {
+            panic!("a passthrough span has to stream, not sit in memory");
+        };
+        assert_eq!(drain(rx).await.unwrap(), vec![b'y'; 100]);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "expected exactly one retry");
     }
 
     use super::*;
