@@ -529,34 +529,16 @@ async fn write_last_refresh(app: &tauri::AppHandle, id: &str, at: i64) -> Result
 
 /// Browser UA the login and refresh WebViews both present to Google. Kept
 /// identical so the session Google issues to the login window is the
-/// same one the refresh window later renews. The claimed browser must match
-/// the actual webview engine: WebView2 presents Chrome, while WKWebView must
-/// present Safari or Google rejects the sign-in as an insecure browser.
+/// same one the refresh window later renews. These are outbound fingerprints,
+/// not a claim about the host: the non-macOS arm deliberately tells Google it
+/// is Chrome on Windows, while WKWebView must present Safari or Google rejects
+/// the sign-in as an insecure browser.
 #[cfg(not(target_os = "macos"))]
 const YT_LOGIN_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 #[cfg(target_os = "macos")]
 const YT_LOGIN_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
      (KHTML, like Gecko) Version/17.6 Safari/605.1.15";
-
-/// WebView2 browser args shared by the login window and the session-keeper.
-/// Both open the same per-account profile directory, and WebView2 requires
-/// every instance on a shared user-data folder to pass identical args, so
-/// these have to match. They also stop both windows from grabbing the
-/// hardware media keys or running a media session (which would hijack
-/// play/pause from the real player), and block autoplay so a hidden keeper
-/// never starts making sound on its own.
-const YT_WEBVIEW_ARGS: &str = "--disable-features=HardwareMediaKeyHandling,MediaSessionService \
-     --autoplay-policy=user-gesture-required";
-
-/// WebView2 browser args for windows on the DEFAULT user-data folder — the
-/// main window and the floating player. Must stay byte-identical to
-/// `additionalBrowserArgs` in `tauri.conf.json`: WebView2 refuses to create
-/// a second webview on the same user-data folder with different args, so a
-/// mismatch makes `open_player_window` fail and the floating player never
-/// appears. (The first three disabled features are wry's own defaults,
-/// which the conf.json value extends.)
-const APP_WEBVIEW_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,HardwareMediaKeyHandling,MediaSessionService";
 
 /// Legacy single-account path — kept only for migration. New code
 /// should resolve cookies via `active_cookies_path`.
@@ -1417,8 +1399,6 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
         // session was minted under one browser and renewed under another —
         // exactly the login/refresh divergence Google reads as replay.
         .user_agent(YT_LOGIN_UA)
-        // Must match the session-keeper's args (shared profile folder).
-        .additional_browser_args(YT_WEBVIEW_ARGS)
         // Surface the current origin in the title so the user can spot
         // a redirect to an unexpected host (anti-phishing).
         .on_page_load(|win, payload| {
@@ -1678,7 +1658,6 @@ async fn ensure_session_keeper(
         .inner_size(1024.0, 768.0)
         .data_directory(account_webview_dir(app, id))
         .user_agent(YT_LOGIN_UA)
-        .additional_browser_args(YT_WEBVIEW_ARGS)
         // Registered on the webview, so it fires for every later
         // `navigate()` too — which is what lets a refresh tell "reloaded
         // and Google answered" from "offline, nothing happened".
@@ -2315,9 +2294,6 @@ async fn open_player_window(
     // handler entirely is purely upside. The doc string for this
     // method literally calls out HTML5 DnD on Windows as the use case.
     .disable_drag_drop_handler()
-    // Shares the default user-data folder with the main window, so the
-    // args must match the main window's `additionalBrowserArgs` exactly.
-    .additional_browser_args(APP_WEBVIEW_ARGS)
     .build()
     .map_err(|e| e.to_string())?;
     // Dev builds: orange taskbar icon, same as the main window.
