@@ -641,11 +641,14 @@ export function useAudioEngine() {
     };
   }, [streamVideoId, videoId]);
 
-  // True only when the user explicitly switched this track to its video
-  // source — then the stream request carries ?video=1 and the element
-  // has real frames to show.
+  // Whether this track streams video: an explicit per-track switch, or
+  // sticky video mode on a track whose counterpart is already known.
+  // Subscribing to `preferVideo` is what makes the sticky case resolve in
+  // the same render as the track change. Reading it a tick late is what
+  // made every track change tear the companion down and rebuild it, with
+  // the artwork up for as long as the new file took to resolve.
   const wantVideo = useTrackSourceStore((s) =>
-    videoId ? wantsVideoStream(videoId, s.byVideoId) : false,
+    videoId ? wantsVideoStream(videoId, s.byVideoId, s.preferVideo) : false,
   );
 
   // Tracks queued from surfaces without a length (home cards) carry no
@@ -1693,16 +1696,20 @@ export function useAudioEngine() {
   // Substitute via source-prefs for the prefetch too — otherwise we'd
   // warm the cache for the wrong stream when the user has switched the
   // upcoming track to its video version.
-  const { nextStreamVideoId, nextStreamVideoId2 } = useTrackSourceStore(
-    useShallow((s) => ({
-      nextStreamVideoId: nextVideoId
-        ? resolveStreamId(nextVideoId, s.byVideoId)
-        : undefined,
-      nextStreamVideoId2: nextVideoId2
-        ? resolveStreamId(nextVideoId2, s.byVideoId)
-        : undefined,
-    })),
-  );
+  const { nextStreamVideoId, nextStreamVideoId2, nextWantsVideo } =
+    useTrackSourceStore(
+      useShallow((s) => ({
+        nextStreamVideoId: nextVideoId
+          ? resolveStreamId(nextVideoId, s.byVideoId)
+          : undefined,
+        nextStreamVideoId2: nextVideoId2
+          ? resolveStreamId(nextVideoId2, s.byVideoId)
+          : undefined,
+        nextWantsVideo: nextVideoId
+          ? wantsVideoStream(nextVideoId, s.byVideoId, s.preferVideo)
+          : false,
+      })),
+    );
   // Warm the next track. This used to be gated on `status === "ready"`,
   // which the media element only reaches on its `playing` event, so a
   // track skipped BEFORE it made a sound never warmed the next one. That
@@ -1785,6 +1792,17 @@ export function useAudioEngine() {
     // the cleanup clears every one but the last, so twelve skips cost one
     // resolve rather than twelve. The cost is that much less lead time,
     // which is cheap against a median gap between plays of 130s.
+    /**
+     * Warm the companion's file for an upcoming track. Best effort and
+     * unretried: a cold companion still loads on demand, it just shows
+     * the artwork while it does.
+     */
+    const warmVideo = (id: string): Promise<unknown> =>
+      prefetchStream(id, {
+        vonly: true,
+        vonlyHeight: useSettingsStore.getState().videoQuality,
+      });
+
     const fire = () => {
       void (async () => {
         // Strictly sequential, depth 1 first because that is the track the
@@ -1793,6 +1811,15 @@ export function useAudioEngine() {
         // both at once just earns the second one a 429 and a wait.
         if (nextStreamVideoId) {
           await warm(nextStreamVideoId, 1, PREFETCH_RETRIES);
+        }
+        if (cancelled) return;
+        // In video mode the companion needs a second, much larger file,
+        // and nothing was warming it: every track change paid a full
+        // resolve with the artwork up. Depth 1 only, deliberately. A
+        // video-only track is 100-400MB and two of them speculatively in
+        // flight is how the cache filled with 4K files nobody asked for.
+        if (nextWantsVideo && nextStreamVideoId) {
+          await warmVideo(nextStreamVideoId);
         }
         if (cancelled) return;
         if (nextStreamVideoId2) {
@@ -1806,7 +1833,7 @@ export function useAudioEngine() {
       cancelled = true;
       for (const t of timers) window.clearTimeout(t);
     };
-  }, [playing, nextStreamVideoId, nextStreamVideoId2]);
+  }, [playing, nextStreamVideoId, nextStreamVideoId2, nextWantsVideo]);
 
   // Auto-extend the queue with radio tracks when we're near the end, so
   // playback continues past the explicit queue.
