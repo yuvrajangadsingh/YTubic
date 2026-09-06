@@ -1055,6 +1055,9 @@ export function useAudioEngine() {
       companionVideoSingleton = comp;
     }
     const video = comp;
+    // One reload per companion instance, i.e. per track and per variant,
+    // the same budget the master gets through `retryNonce`.
+    let retriedComp = false;
 
     const SNAP_S = 0.3;
     const syncNow = () => {
@@ -1110,11 +1113,49 @@ export function useAudioEngine() {
     const onError = () => {
       if (cancelled) return;
       const err = video.error;
+      const code = err?.code ?? 0;
       appLog(
-        `[comp] error code=${err?.code ?? "?"} msg=${err?.message || "none"} ${mediaState(video)}`,
+        `[comp] error code=${code} msg=${err?.message || "none"} ${mediaState(video)}`,
       );
-      // No high-res track (or it failed to decode): continue audio-only
-      // so the surfaces keep showing artwork instead of a black box.
+      // NETWORK (2) and DECODE (3) mean the byte source broke under a
+      // companion that was playing, not that there is nothing to play.
+      // Seen live: a 199MB vonly tail-stream died 7s in while the
+      // download itself completed fine 9s later, and because this handler
+      // had no retry the track stayed on artwork to the end. Reload once
+      // and rejoin the master. SRC_NOT_SUPPORTED (4) is different: there
+      // is no playable video track, so a retry only costs another resolve.
+      //
+      // Not during a startup hold. That path has its own timeout and its
+      // own fallback, and stretching it delays the audio too.
+      if (!retriedComp && (code === 2 || code === 3) && !videoHoldRef.current) {
+        retriedComp = true;
+        appLog(`[comp] reloading after code=${code}`);
+        // Keep streamKind on video: the surface holds its last frame with
+        // the buffering chip up, which beats dropping to artwork and
+        // flipping back a second later.
+        usePlaybackStore.getState().setVideoBuffering(true);
+        streamUrlFor(streamVideoId, {
+          vonly: true,
+          vonlyHeight: useSettingsStore.getState().videoQuality,
+        })
+          .then((src) => {
+            if (cancelled) return;
+            video.src = src;
+            video.load();
+            // `onLoaded` re-syncs to the master's clock and resumes, so
+            // there is nothing to seek here.
+          })
+          .catch(() => {
+            if (cancelled) return;
+            appLog(`[comp] reload url failed`);
+            const st = usePlaybackStore.getState();
+            st.setVideoBuffering(false);
+            st.setStreamKind("audio");
+          });
+        return;
+      }
+      // No high-res track (or it failed again): continue audio-only so
+      // the surfaces keep showing artwork instead of a black box.
       if (videoHoldRef.current) {
         fallbackHeld("fallback");
       } else {
