@@ -1,8 +1,9 @@
 # Architecture
 
-Written for an agent working in this repo. It answers six things: what the
+A map for anyone about to change this code. It answers six things: what the
 system is, who owns each mutable fact, which dependencies are allowed, how
-data moves, which rules fail silently when broken, and when to stop and ask.
+data moves, which rules fail silently when broken, and when to stop and ask
+instead of guessing.
 
 Line references were correct at the commit that added this file. If a
 reference does not match what you read, trust the code and fix the line here.
@@ -132,6 +133,26 @@ generation token.
 
 **An explicit seek during load updates both the carry and the startup-hold
 target.** Otherwise a later `loadedmetadata` restores an older position.
+
+**`resolveStreamId` and `wantsVideoStream` must answer consistently.** If one
+hands back the video counterpart while the other says audio, the master streams
+the music video's audio track under a UI reading Song, and the toggle is inert
+because it already shows the state you want. Both take `preferVideo` for exactly
+this reason (`track-source.ts:158`, `:181`). Related: one record is aliased under
+BOTH ids, so a song row can read `selected: "video"` with `video` naming the
+other file. Never redirect a row to a different file while the gate says audio.
+
+**A mode is not per-track identity.** Sticky video mode lives in `preferVideo`.
+Writing it into a track's `selected` field is what broke the rule above: the
+mode leaked into per-track state that another function reads without knowing
+about the mode. Seeded state that means "the row was queued as a video" and a
+mode that means "play video versions" are different facts.
+
+**Anything written ahead of the playhead must prefer authoritative data.** The
+counterpart seeding effect bails on `if (byVideoId[id]) return`
+(`audio-engine.ts:717`), so a speculative search result written for an upcoming
+track outranks the real `/next` pairing permanently. Use `track.counterpartId`
+when the queue has it.
 
 **Displayed queue id and stream id are different identities**, and a seeded
 `selected: "video"` is not the same as a user's explicit choice. `wantsVideoStream`
