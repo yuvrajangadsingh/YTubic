@@ -1323,6 +1323,15 @@ pub fn spawn_tail_pump(
                         idle = tokio::time::Instant::now();
                     }
                     Err(e) => {
+                        // Every exit below breaks a response that already
+                        // promised Content-Length: total, so hyper aborts
+                        // the connection and the player sees a network
+                        // error. They used to be silent, which made a
+                        // companion video that vanished mid-song
+                        // impossible to explain from the log.
+                        eprintln!(
+                            "[proxy] tail pump read failed at {sent}/{total}: {e}"
+                        );
                         let _ = tx.send(Err(e)).await;
                         return;
                     }
@@ -1330,12 +1339,16 @@ pub fn spawn_tail_pump(
                 continue;
             }
             if state.failed.load(Ordering::Acquire) {
+                eprintln!("[proxy] tail pump: download failed at {sent}/{total}");
                 let _ = tx
                     .send(Err(std::io::Error::other("download failed")))
                     .await;
                 return;
             }
             if idle.elapsed() > WAIT_BUDGET {
+                eprintln!(
+                    "[proxy] tail pump starved at {sent}/{total} (filled={filled} done={done})"
+                );
                 let _ = tx.send(Err(std::io::Error::other("stalled"))).await;
                 return;
             }
