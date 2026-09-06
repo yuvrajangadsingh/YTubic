@@ -38,12 +38,6 @@ type State = {
   setAlternate: (knownId: string, kind: SourceKind, altId: string) => void;
   /** Flip the active source for a track. */
   setSelected: (anyVideoId: string, selected: SourceKind) => void;
-  /** Point a track at a source WITHOUT claiming the user picked it.
-   *  Seeds an upcoming track while sticky video mode is on:
-   *  `wantsVideoStream` honours a seeded selection only while that mode
-   *  is on, so switching it off still puts every track the user never
-   *  reached back to song. Never overwrites a real choice. */
-  seedSelected: (anyVideoId: string, selected: SourceKind) => void;
   setPreferVideo: (v: boolean) => void;
 };
 
@@ -99,17 +93,6 @@ export const useTrackSourceStore = create<State>()((set) => ({
             return { byVideoId: capByVideoId({ ...s.byVideoId, [id]: fresh }) };
           }
           const updated = { ...existing, selected, chosen: true };
-          const next = { ...s.byVideoId, [existing.song]: updated };
-          if (existing.video) next[existing.video] = updated;
-          return { byVideoId: next };
-        }),
-      seedSelected: (id, selected) =>
-        set((s) => {
-          const existing = s.byVideoId[id];
-          // Nothing to seed onto, or the user already spoke for this
-          // track. An explicit choice outranks the global mode.
-          if (!existing || existing.chosen) return {};
-          const updated = { ...existing, selected };
           const next = { ...s.byVideoId, [existing.song]: updated };
           if (existing.video) next[existing.video] = updated;
           return { byVideoId: next };
@@ -175,10 +158,23 @@ export function initFloatingTrackSourceBridge(): void {
 export function resolveStreamId(
   displayedId: string,
   byVideoId: Record<string, TrackSources>,
+  preferVideo = false,
 ): string {
   const rec = byVideoId[displayedId];
   if (!rec) return displayedId;
-  if (rec.selected === "video" && rec.video) return rec.video;
+  // These two answers have to agree. If this hands back the video id
+  // while `wantsVideoStream` says audio, the master streams the music
+  // video's audio track under a UI that says Song, and the toggle cannot
+  // get back because it is already showing the state you want.
+  if (wantsVideoStream(displayedId, byVideoId, preferVideo) && rec.video) {
+    return rec.video;
+  }
+  // Not streaming video. `selected` still names the default file for a
+  // row that IS a video, so that keeps its own id. It must never
+  // redirect a SONG row to a different file while the gate says audio:
+  // one record is aliased under both ids, so a song row can read
+  // `selected: "video"` with `video` pointing at the other file.
+  if (rec.selected === "video" && rec.video === displayedId) return rec.video;
   return rec.song;
 }
 
@@ -210,5 +206,9 @@ export function wantsVideoStream(
   const rec = byVideoId[displayedId];
   if (!rec) return false;
   if (rec.chosen === true) return rec.selected === "video";
-  return preferVideo && rec.selected === "video" && !!rec.video;
+  // Sticky mode is a mode, not a per-track identity, so it is read from
+  // `preferVideo` rather than written into `selected`. Writing it into
+  // `selected` made turning the mode off leave upcoming tracks pointed
+  // at the video cut's audio with no way back.
+  return preferVideo && !!rec.video;
 }

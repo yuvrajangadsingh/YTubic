@@ -611,7 +611,7 @@ export function useAudioEngine() {
   // below re-runs and re-resolves the stream when the user toggles the
   // source on the currently playing track.
   const streamVideoId = useTrackSourceStore((s) =>
-    videoId ? resolveStreamId(videoId, s.byVideoId) : undefined,
+    videoId ? resolveStreamId(videoId, s.byVideoId, s.preferVideo) : undefined,
   );
 
   // The stream's own length when it isn't the queue row's file.
@@ -1744,10 +1744,10 @@ export function useAudioEngine() {
     useTrackSourceStore(
       useShallow((s) => ({
         nextStreamVideoId: nextVideoId
-          ? resolveStreamId(nextVideoId, s.byVideoId)
+          ? resolveStreamId(nextVideoId, s.byVideoId, s.preferVideo)
           : undefined,
         nextStreamVideoId2: nextVideoId2
-          ? resolveStreamId(nextVideoId2, s.byVideoId)
+          ? resolveStreamId(nextVideoId2, s.byVideoId, s.preferVideo)
           : undefined,
         nextWantsVideo: nextVideoId
           ? wantsVideoStream(nextVideoId, s.byVideoId, s.preferVideo)
@@ -1778,22 +1778,31 @@ export function useAudioEngine() {
     preHuntedRef.current = nextVideoId;
     // A video-native row already IS the video: its own stream carries the
     // audio too. Same rule as the toggle, never blind-search for a clip.
-    if (track.kind === "video") {
-      ts.setAlternate(nextVideoId, "video", nextVideoId);
-      ts.seedSelected(nextVideoId, "video");
+    // Authoritative pairing from /next beats a search every time. The
+    // on-arrival seeding effect above refuses to touch a record that
+    // already exists, so a guess written here would permanently displace
+    // the real counterpart.
+    const paired = track.kind === "video" ? nextVideoId : track.counterpartId;
+    if (paired) {
+      ts.setAlternate(nextVideoId, "video", paired);
       return;
     }
     let cancelled = false;
     void findAlternateVideoId(track, "video")
       .then((altId) => {
         if (cancelled || !altId) return;
-        const now = useTrackSourceStore.getState();
-        now.setAlternate(nextVideoId, "video", altId);
-        now.seedSelected(nextVideoId, "video");
+        useTrackSourceStore.getState().setAlternate(nextVideoId, "video", altId);
         appLog(`[comp] pre-resolved video for ${nextVideoId} -> ${altId}`);
       })
       .catch(() => {
         // No video version is an ordinary answer, not an error.
+      })
+      .finally(() => {
+        // A cancelled hunt threw its answer away, so it must not count as
+        // attempted or the replacement run is suppressed too.
+        if (cancelled && preHuntedRef.current === nextVideoId) {
+          preHuntedRef.current = null;
+        }
       });
     return () => {
       cancelled = true;
