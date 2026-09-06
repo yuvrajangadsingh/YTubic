@@ -835,6 +835,15 @@ export function useAudioEngine() {
     // playing: true) makes the [playing] effect below re-play the OLD src
     // for the duration of the streamUrlFor() round-trip.
     el.removeAttribute("src");
+    // Removing the attribute does not reset the element: it keeps the old
+    // resource and its playhead. This effect runs twice per track change in
+    // video mode (wantVideo settles from the track-source store after the
+    // first run), and the second run compares against the key the first one
+    // already wrote, so it sees sameTrack. A live currentTime here is then
+    // the OUTGOING track's position and gets armed as the incoming track's
+    // carry, starting it mid-song. load() empties the element so only a real
+    // same-track reload has a playhead left to carry.
+    el.load();
     // streamKind is only promoted to "video" after a resolve SUCCEEDS,
     // so reset it at the same moment the src drops. Otherwise a video
     // surface keeps rendering the previous track's last frame through
