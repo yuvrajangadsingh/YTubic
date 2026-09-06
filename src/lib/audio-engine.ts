@@ -309,6 +309,7 @@ export function useAudioEngine() {
     const el = audioRef.current;
     const h = videoHoldRef.current;
     if (!h) return;
+    appLog(`[comp] hold released as ${startup}`);
     window.clearTimeout(h.timer);
     videoHoldRef.current = null;
     const st = usePlaybackStore.getState();
@@ -497,9 +498,7 @@ export function useAudioEngine() {
         const key0 = cur0 ? `${cur0.videoId}:${s0.index}` : null;
         if (s0.playing && key0 && retriedTrackRef.current !== key0) {
           retriedTrackRef.current = key0;
-          if (import.meta.env.DEV) {
-            console.warn("[audio] retrying", key0, "after error:", msg);
-          }
+          appLog(`retrying ${key0} after error: ${msg}`);
           store().setStatus("loading");
           // Small delay so a truly-dead source doesn't hot-loop; also
           // gives the server a beat to tear down the failed download.
@@ -1027,7 +1026,13 @@ export function useAudioEngine() {
   useEffect(() => {
     const master = audioRef.current;
     if (!master) return;
-    if (!wantVideo || !streamVideoId || !premiumOk) return;
+    if (!wantVideo || !streamVideoId || !premiumOk) {
+      appLog(
+        `[comp] off want=${wantVideo} id=${streamVideoId ?? "none"} premium=${premiumOk}`,
+      );
+      return;
+    }
+    appLog(`[comp] on ${streamVideoId} nonce=${retryNonce}`);
     let cancelled = false;
     let comp = companionVideoSingleton;
     if (!comp) {
@@ -1054,6 +1059,9 @@ export function useAudioEngine() {
     };
     const onLoaded = () => {
       if (cancelled) return;
+      appLog(
+        `[comp] loadeddata ${video.videoHeight}p hold=${videoHoldRef.current?.targetSeconds ?? "none"} ${mediaState(video)}`,
+      );
       const st = usePlaybackStore.getState();
       st.setStreamKind("video");
       st.setStreamVideoHeight(video.videoHeight || null);
@@ -1089,6 +1097,10 @@ export function useAudioEngine() {
     };
     const onError = () => {
       if (cancelled) return;
+      const err = video.error;
+      appLog(
+        `[comp] error code=${err?.code ?? "?"} msg=${err?.message || "none"} ${mediaState(video)}`,
+      );
       // No high-res track (or it failed to decode): continue audio-only
       // so the surfaces keep showing artwork instead of a black box.
       if (videoHoldRef.current) {
@@ -1161,11 +1173,15 @@ export function useAudioEngine() {
     })
       .then((src) => {
         if (cancelled) return;
+        appLog(
+          `[comp] src set ${streamVideoId} h=${useSettingsStore.getState().videoQuality}`,
+        );
         video.src = src;
         video.load();
       })
-      .catch(() => {
+      .catch((e) => {
         if (cancelled) return;
+        appLog(`[comp] url failed ${streamVideoId}: ${String(e)}`);
         if (videoHoldRef.current) {
           fallbackHeld("fallback");
         } else {
@@ -1185,6 +1201,7 @@ export function useAudioEngine() {
     let warm: HTMLVideoElement | null = null;
     const switchQuality = async (q: number) => {
       const token = ++switchToken;
+      appLog(`[comp] quality switch -> ${q}`);
       try {
         const src = await streamUrlFor(streamVideoId, {
           vonly: true,
@@ -1203,6 +1220,7 @@ export function useAudioEngine() {
           "loadeddata",
           () => {
             if (cancelled || token !== switchToken) return;
+            appLog(`[comp] swap src -> ${q}`);
             video.src = src;
             video.load();
             w.removeAttribute("src");
@@ -1227,6 +1245,7 @@ export function useAudioEngine() {
 
     return () => {
       cancelled = true;
+      appLog(`[comp] teardown ${streamVideoId} ${mediaState(video)}`);
       unsubQuality();
       if (warm) {
         warm.removeAttribute("src");
