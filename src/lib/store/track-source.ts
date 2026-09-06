@@ -166,16 +166,32 @@ export function resolveStreamId(
 }
 
 /**
- * Whether the stream for `displayedId` should be the actual video file
- * (progressive h264, `?video=1` on the local server) instead of the
- * audio-only download. Requires the user's explicit switch — seeded
- * records with `selected: "video"` (video-native queue items) keep
- * streaming audio-only until the user asks for the video.
+ * Whether the stream for `displayedId` should be the video file instead
+ * of the audio-only download.
+ *
+ * An explicit per-track choice wins in both directions: picking Song on
+ * a track keeps it audio even while the global video mode is on.
+ *
+ * With no explicit choice, sticky video mode counts, but only once the
+ * record already names the video counterpart. Two reasons for that
+ * condition. `resolveStreamId` substitutes the video id only when
+ * `selected` is "video", so claiming video any earlier would ask for a
+ * video-only track of the SONG file. And a track whose counterpart has
+ * yet to be hunted has nothing to stream.
+ *
+ * This does not widen which tracks stream video: PlayerBar's sticky
+ * effect sets `chosen` on exactly these records a tick later anyway. It
+ * moves the decision into the same render as the track change. Before,
+ * the companion effect ran once with video off, and its cleanup put the
+ * artwork back up before the next run rebuilt the whole companion.
  */
 export function wantsVideoStream(
   displayedId: string,
   byVideoId: Record<string, TrackSources>,
+  preferVideo = false,
 ): boolean {
   const rec = byVideoId[displayedId];
-  return !!rec && rec.selected === "video" && rec.chosen === true;
+  if (!rec) return false;
+  if (rec.chosen === true) return rec.selected === "video";
+  return preferVideo && rec.selected === "video" && !!rec.video;
 }
