@@ -38,6 +38,12 @@ type State = {
   setAlternate: (knownId: string, kind: SourceKind, altId: string) => void;
   /** Flip the active source for a track. */
   setSelected: (anyVideoId: string, selected: SourceKind) => void;
+  /** Point a track at a source WITHOUT claiming the user picked it.
+   *  Seeds an upcoming track while sticky video mode is on:
+   *  `wantsVideoStream` honours a seeded selection only while that mode
+   *  is on, so switching it off still puts every track the user never
+   *  reached back to song. Never overwrites a real choice. */
+  seedSelected: (anyVideoId: string, selected: SourceKind) => void;
   setPreferVideo: (v: boolean) => void;
 };
 
@@ -93,6 +99,17 @@ export const useTrackSourceStore = create<State>()((set) => ({
             return { byVideoId: capByVideoId({ ...s.byVideoId, [id]: fresh }) };
           }
           const updated = { ...existing, selected, chosen: true };
+          const next = { ...s.byVideoId, [existing.song]: updated };
+          if (existing.video) next[existing.video] = updated;
+          return { byVideoId: next };
+        }),
+      seedSelected: (id, selected) =>
+        set((s) => {
+          const existing = s.byVideoId[id];
+          // Nothing to seed onto, or the user already spoke for this
+          // track. An explicit choice outranks the global mode.
+          if (!existing || existing.chosen) return {};
+          const updated = { ...existing, selected };
           const next = { ...s.byVideoId, [existing.song]: updated };
           if (existing.video) next[existing.video] = updated;
           return { byVideoId: next };
