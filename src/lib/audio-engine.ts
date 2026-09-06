@@ -20,7 +20,10 @@ import {
   useTrackSourceStore,
   wantsVideoStream,
 } from "@/lib/store/track-source";
-import { findCleanAudioAlternate } from "@/lib/innertube/alternate-source";
+import {
+  findAlternateVideoId,
+  findCleanAudioAlternate,
+} from "@/lib/innertube/alternate-source";
 import { fetchPanelDuration } from "@/lib/innertube/radio";
 import { pickThumbnail } from "@/components/shared/thumbnail";
 import { useLyricsSources } from "@/lib/lyrics/sources";
@@ -1760,6 +1763,52 @@ export function useAudioEngine() {
           : false,
       })),
     );
+  // Sticky video mode is a decision per track, and that decision is data
+  // nobody has until someone hunts the counterpart. PlayerBar hunts only
+  // for the track that is playing, so every advance arrived with no
+  // record at all: the companion's first run saw video off and its
+  // cleanup put the artwork back up, and the byte prefetch below could
+  // not tell it needed the video file either. Both halves were waiting on
+  // a record that gets written a tick too late. Hunt one track ahead so
+  // the decision is already in the store when the track changes.
+  //
+  // Seeded, not chosen: turning the mode off must still put every track
+  // the user never reached back to song.
+  const preferVideo = useTrackSourceStore((s) => s.preferVideo);
+  const preHuntedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!preferVideo || !nextVideoId) return;
+    if (preHuntedRef.current === nextVideoId) return;
+    const ts = useTrackSourceStore.getState();
+    if (ts.byVideoId[nextVideoId]?.video) return;
+    const st = usePlaybackStore.getState();
+    const track = st.index >= 0 ? st.queue[st.index + 1] : undefined;
+    if (!track || track.videoId !== nextVideoId) return;
+    preHuntedRef.current = nextVideoId;
+    // A video-native row already IS the video: its own stream carries the
+    // audio too. Same rule as the toggle, never blind-search for a clip.
+    if (track.kind === "video") {
+      ts.setAlternate(nextVideoId, "video", nextVideoId);
+      ts.seedSelected(nextVideoId, "video");
+      return;
+    }
+    let cancelled = false;
+    void findAlternateVideoId(track, "video")
+      .then((altId) => {
+        if (cancelled || !altId) return;
+        const now = useTrackSourceStore.getState();
+        now.setAlternate(nextVideoId, "video", altId);
+        now.seedSelected(nextVideoId, "video");
+        appLog(`[comp] pre-resolved video for ${nextVideoId} -> ${altId}`);
+      })
+      .catch(() => {
+        // No video version is an ordinary answer, not an error.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [preferVideo, nextVideoId]);
+
   // Warm the next track. This used to be gated on `status === "ready"`,
   // which the media element only reaches on its `playing` event, so a
   // track skipped BEFORE it made a sound never warmed the next one. That
