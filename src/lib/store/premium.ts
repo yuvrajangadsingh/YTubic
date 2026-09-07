@@ -1,9 +1,11 @@
 import { useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { create } from "zustand";
+import { appLog } from "@/lib/app-log";
 import type { PremiumStatus } from "@/lib/innertube/account";
 import {
   authLoggedInQuery,
+  describeAuthError,
   premiumStatusQuery,
 } from "@/lib/store/auth-queries";
 
@@ -65,10 +67,30 @@ export function usePremiumStatusSync(): void {
     // check must not downgrade a paying user: `null` here shuts off
     // caching and arms the Premium gate on every track.
     if (loggedIn.data === false) {
+      appLog("[premium] signed out");
       usePremiumStore.setState({ status: null });
       return;
     }
     if (premium.data === undefined) return;
+    appLog(`[premium] status=${premium.data}`);
     usePremiumStore.getState().setStatus(premium.data);
   }, [loggedIn.data, premium.data]);
+
+  // A failed check leaves the store alone on purpose, so the log is the
+  // only place it can show. The query logs each attempt itself; these
+  // are the gave-up lines. Sep 7 2026: a launch landed on the gate with
+  // nothing in the log to say whether the login probe or the menu fetch
+  // had failed, or what the menu had answered.
+  useEffect(() => {
+    if (loggedIn.error) {
+      appLog(
+        `[premium] login check gave up: ${describeAuthError(loggedIn.error)}`,
+      );
+    }
+  }, [loggedIn.error]);
+  useEffect(() => {
+    if (premium.error) {
+      appLog(`[premium] check gave up: ${describeAuthError(premium.error)}`);
+    }
+  }, [premium.error]);
 }
