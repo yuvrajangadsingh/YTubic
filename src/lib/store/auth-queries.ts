@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { appLog } from "@/lib/app-log";
 import {
   fetchAccountInfo,
   fetchPremiumStatus,
@@ -24,12 +25,48 @@ import {
  * moment it ignored. The backoff is capped at 30 s because a failing
  * auth check usually means the machine is offline, and hammering
  * authenticated reloads is the pattern that gets sessions revoked.
+ *
+ * `refetchOnWindowFocus` is on here against the app-wide default. A
+ * settled failure holds no data, so it counts as stale and a focus
+ * re-asks; a good answer stays fresh for its staleTime and is left
+ * alone. Without it the only ways back from a failed check were a
+ * reconnect event or the periodic cookie refresh.
  */
 const AUTH_RETRY = {
   retry: 3,
   retryDelay: (attempt: number) => Math.min(1000 * 2 ** attempt, 30_000),
   refetchOnReconnect: "always",
+  refetchOnWindowFocus: true,
 } as const;
+
+/**
+ * What a failed auth check may put in the app log. InnerTube errors
+ * embed up to 300 chars of the response body, and a body is whatever
+ * the server or something in between chose to send, so keep the
+ * endpoint and status and drop the rest. Headers never reach an error
+ * message; this is about not trusting what does.
+ */
+export function describeAuthError(e: unknown): string {
+  // A parse error quotes the offending text, so a 200 that is not JSON
+  // (a captive portal, a proxy error page) would put its body here.
+  if (e instanceof SyntaxError) return "response was not JSON";
+  const msg = e instanceof Error ? e.message : String(e);
+  if (
+    /JSON Parse error|in JSON at position|Unexpected (token|identifier)/.test(
+      msg,
+    )
+  ) {
+    return "response was not JSON";
+  }
+  return msg
+    .replace(/(HTTP \d{3}):[\s\S]*$/, "$1")
+    .replace(/\s+/g, " ")
+    .slice(0, 200);
+}
+
+function secondsSince(t0: number): string {
+  return `${((Date.now() - t0) / 1000).toFixed(1)}s`;
+}
 
 /**
  * Does the stored jar hold credentials this client can sign requests
@@ -60,11 +97,49 @@ export function accountInfoQuery(enabled: boolean) {
   };
 }
 
-/** Premium membership, from the same menu. Doesn't churn in a session. */
+/**
+ * Premium membership, from the same menu. Doesn't churn in a session.
+ *
+ * Only enabled once `is_logged_in` is an authoritative `true`. That is
+ * a local read of the jar, not a word from Google, so an anonymous menu
+ * here means the credentials were not honoured this time: a rotated
+ * cookie, an expired session, or a layout change that moved the header.
+ * None of those is a verdict. Returning `null` for it cached an
+ * unusable answer as a fresh success for the whole staleTime, with no
+ * retry and nothing to refetch on. That is the most likely reading of
+ * the Sep 7 2026 launch that sat on "Checking…" until a cookie refresh
+ * re-asked, though the log of that build could not say what the first
+ * check answered, which is what the lines below are for. Throwing puts
+ * it on the retry, focus and session-refreshed paths, same as an HTTP
+ * failure.
+ *
+ * One line per attempt, with elapsed time: a start with no finish is a
+ * hang, and a same-value re-check still leaves a trace.
+ */
 export function premiumStatusQuery(enabled: boolean) {
   return {
     queryKey: ["premium-status"],
-    queryFn: (): Promise<PremiumStatus> => fetchPremiumStatus(),
+    queryFn: async (): Promise<PremiumStatus> => {
+      const t0 = Date.now();
+      appLog("[premium] check start");
+      let status: PremiumStatus;
+      try {
+        status = await fetchPremiumStatus();
+      } catch (e) {
+        appLog(
+          `[premium] check failed in ${secondsSince(t0)}: ${describeAuthError(e)}`,
+        );
+        throw e;
+      }
+      if (status === null) {
+        appLog(`[premium] check failed in ${secondsSince(t0)}: anonymous menu`);
+        throw new Error(
+          "account menu answered signed out with a signed-in jar",
+        );
+      }
+      appLog(`[premium] check done in ${secondsSince(t0)}: ${status}`);
+      return status;
+    },
     enabled,
     staleTime: 30 * 60 * 1000,
     ...AUTH_RETRY,
