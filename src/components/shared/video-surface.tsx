@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef } from "react";
 import { getVideoSurfaceElement } from "@/lib/audio-engine";
 import { usePlaybackStore } from "@/lib/store/playback";
+import { videoQualityTier } from "@/lib/video-quality-tier";
 import {
   useSettingsStore,
   type VideoQuality,
@@ -62,17 +63,21 @@ function qualityLabel(q: VideoQuality): string {
 
 /**
  * Live "1080p" badge over a video surface, doubling as the quality
- * picker (YouTube-style). The label is the companion element's REAL
- * decoded height, not the requested cap, so a video with nothing above
- * 480p reads 480p even on the Auto setting. Picking a quality re-caps
+ * picker (YouTube-style). The label is the rung the companion element's
+ * REAL decoded frame belongs to (videoQualityTier), not the requested
+ * cap, so a video with nothing above 480p reads 480p even on the Auto
+ * setting. The menu reasons in raw rows instead, because the backend
+ * caps formats by raw height. Picking a quality re-caps
  * the vonly stream; the audio master never rebuffers, so the swap is
  * gapless apart from the frames reloading.
  */
 export function VideoQualityBadge({ className }: { className?: string }) {
-  const height = usePlaybackStore((s) => s.streamVideoHeight);
+  const size = usePlaybackStore((s) => s.streamVideoSize);
   const quality = useSettingsStore((s) => s.videoQuality);
   const setQuality = useSettingsStore((s) => s.setVideoQuality);
-  if (!height) return null;
+  if (!size) return null;
+  const height = size.height;
+  const label = videoQualityTier(size.width, size.height) ?? height;
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -89,7 +94,7 @@ export function VideoQualityBadge({ className }: { className?: string }) {
             className,
           )}
         >
-          {height}p
+          {label}p
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="min-w-36">

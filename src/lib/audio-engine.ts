@@ -11,6 +11,7 @@ import {
   streamUrlFor,
 } from "@/lib/stream";
 import { usePlaybackStore, type QueueTrack } from "@/lib/store/playback";
+import { videoQualityTier } from "@/lib/video-quality-tier";
 import { isCasting, useCastStore } from "@/lib/store/cast";
 import { usePremiumStore } from "@/lib/store/premium";
 import { useSettingsStore } from "@/lib/store/settings";
@@ -1077,12 +1078,15 @@ export function useAudioEngine() {
     };
     const onLoaded = () => {
       if (cancelled) return;
+      const { videoWidth: vw, videoHeight: vh } = video;
       appLog(
-        `[comp] loadeddata ${video.videoHeight}p hold=${videoHoldRef.current?.targetSeconds ?? "none"} ${mediaState(video)}`,
+        `[comp] loadeddata ${vw}x${vh} ${videoQualityTier(vw, vh) ?? "?"}p hold=${videoHoldRef.current?.targetSeconds ?? "none"} ${mediaState(video)}`,
       );
       const st = usePlaybackStore.getState();
       st.setStreamKind("video");
-      st.setStreamVideoHeight(video.videoHeight || null);
+      st.setStreamVideoSize(
+        vw > 0 && vh > 0 ? { width: vw, height: vh } : null,
+      );
       const h = videoHoldRef.current;
       if (h) {
         // Carried start: frames-at-0 are the wrong frames. Seek to the
@@ -1321,7 +1325,7 @@ export function useAudioEngine() {
       video.load();
       const st = usePlaybackStore.getState();
       st.setStreamKind("audio");
-      st.setStreamVideoHeight(null);
+      st.setStreamVideoSize(null);
       st.setVideoBuffering(false);
       // A pending hold dies with this companion instance, SILENTLY (no
       // play call: on a track change the old src is still on the master
