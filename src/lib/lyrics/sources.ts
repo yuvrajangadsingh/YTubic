@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { fetchLrclibLyrics } from "@/lib/lyrics/lrclib";
 import { fetchMusixmatchLyrics } from "@/lib/lyrics/musixmatch";
@@ -259,35 +259,98 @@ export function useLyricsSources(
   }
 
   const isLoading = SOURCE_ORDER.some((s) => queries[s].isLoading);
+  // Every source has answered, one way or the other. Not `!isFetching`: a
+  // query that is disabled, paused offline or still restoring from the
+  // persisted cache is pending with nothing in flight, and counting that as
+  // an answer reports "no source had it" before anyone has spoken.
+  const settled = SOURCE_ORDER.every(
+    (s) => queries[s].isSuccess || queries[s].isError,
+  );
 
-  // Which source is on screen right now, and whether the race is over.
-  // Both are plain strings so the effect below can depend on them without
-  // depending on the query objects, which are new on every render.
-  const shown = best ? `${best} ${queries[best].data?.kind ?? "?"}` : "";
-  const settled =
-    !isLoading && SOURCE_ORDER.every((s) => !queries[s].isFetching);
-  const videoId = track?.videoId;
-  const lastLogged = useRef("");
+  return { queries, best, isLoading, settled };
+}
+
+/**
+ * `shown` is the pick already written for `videoId`: a source and kind, ""
+ * once "nothing found" has been written, and null when this track has had
+ * no line yet. "" and null have to stay distinct or the empty result reads
+ * as already logged and is never written at all.
+ */
+type SelectionLogState = { videoId: string; shown: string | null };
+
+/**
+ * Module scope rather than a ref: `useLyricsSources` has two callers, the
+ * panel and the audio engine, and each hook instance owns its own refs and
+ * effects. Per-instance state wrote the same pick once per caller.
+ */
+let selectionLog: SelectionLogState = { videoId: "", shown: null };
+
+/** Reset between tests. */
+export function resetLyricsSelectionLog(): void {
+  selectionLog = { videoId: "", shown: null };
+}
+
+/**
+ * The line a change of pick should write, and the state to carry forward.
+ * Pure so the sequencing can be tested without mounting anything, the same
+ * reason `shouldRetryLyricsQuery` lives outside its hook.
+ *
+ * `shown` is what the panel is rendering, "" for nothing. A track change
+ * resets even on the silent path: without that, leaving a track before any
+ * provider answered and coming straight back to a cached hit compared the
+ * cached pick against the pick from the previous visit and dropped it as
+ * unchanged.
+ */
+export function nextSelectionLine(
+  prev: SelectionLogState,
+  next: { videoId: string; shown: string; settled: boolean },
+): { state: SelectionLogState; line: string | null } {
+  const state =
+    prev.videoId === next.videoId
+      ? prev
+      : { videoId: next.videoId, shown: null };
+  // Silent until there is something to say: a pick, or every source having
+  // answered with nothing.
+  if (!next.shown && !next.settled) return { state, line: null };
+  if (state.shown === next.shown) return { state, line: null };
+  const carried = { videoId: next.videoId, shown: next.shown };
+  if (!next.shown) {
+    return { state: carried, line: `[lyrics] no source had ${next.videoId}` };
+  }
+  return {
+    state: carried,
+    line:
+      state.shown === null
+        ? `[lyrics] showing ${next.shown} for ${next.videoId}`
+        : `[lyrics] switched to ${next.shown} for ${next.videoId}`,
+  };
+}
+
+/**
+ * One line whenever the words on screen change source.
+ *
+ * Takes what the panel renders, not the race winner. The user can pin a
+ * source in the panel, and a log naming the winner would name a provider
+ * nobody is reading. Four providers race and the pick is re-derived as the
+ * slower ones land, so the panel can legitimately show one source's words
+ * and then another's a second later; that is the half of the story the
+ * per-attempt lines cannot tell.
+ */
+export function useLyricsSelectionLog(
+  videoId: string | undefined,
+  source: LyricsSource | null,
+  lyrics: Lyrics | null,
+  settled: boolean,
+): void {
+  const shown = source && lyrics ? `${source} ${lyrics.kind}` : "";
   useEffect(() => {
     if (!videoId) return;
-    // Silent until there is something to say: a winner, or every source
-    // having answered with nothing. Otherwise every track change would
-    // log an empty pick before the first provider returns.
-    if (!shown && !settled) return;
-    const key = `${videoId} ${shown}`;
-    if (lastLogged.current === key) return;
-    const sameTrack = lastLogged.current.startsWith(`${videoId} `);
-    lastLogged.current = key;
-    if (!shown) {
-      appLog(`[lyrics] no source had ${videoId}`);
-      return;
-    }
-    appLog(
-      sameTrack
-        ? `[lyrics] switched to ${shown} for ${videoId}`
-        : `[lyrics] showing ${shown} for ${videoId}`,
-    );
-  }, [shown, settled, videoId]);
-
-  return { queries, best, isLoading };
+    const { state, line } = nextSelectionLine(selectionLog, {
+      videoId,
+      shown,
+      settled,
+    });
+    selectionLog = state;
+    if (line) appLog(line);
+  }, [videoId, shown, settled]);
 }

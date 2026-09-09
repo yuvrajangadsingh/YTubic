@@ -18,6 +18,7 @@ import type { Lyrics, TimedLine } from "@/lib/lyrics/types";
 import {
   SOURCE_LABELS,
   SOURCE_ORDER,
+  useLyricsSelectionLog,
   useLyricsSources,
   type LyricsSource,
 } from "@/lib/lyrics/sources";
@@ -198,7 +199,10 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
     setAutoOffset(0);
   };
 
-  const { queries, best, isLoading } = useLyricsSources(track, !!track);
+  const { queries, best, isLoading, settled } = useLyricsSources(
+    track,
+    !!track,
+  );
 
   // Auto-alignment for uploads with a padded intro: when the playing
   // file is a few seconds longer than the recording the timings were
@@ -232,6 +236,7 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
 
   const activeSource: LyricsSource | null = pref === "auto" ? best : pref;
   const active = activeSource ? (queries[activeSource].data ?? null) : null;
+  useLyricsSelectionLog(videoId, activeSource, active, settled);
 
   const recordDurationSec =
     active?.kind === "timed" ? active.recordDurationSec : undefined;
