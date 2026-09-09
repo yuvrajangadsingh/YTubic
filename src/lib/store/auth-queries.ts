@@ -78,8 +78,14 @@ export const authLoggedInQuery = {
   queryKey: ["auth-logged-in"],
   queryFn: () => invoke<boolean>("is_logged_in"),
   staleTime: 30_000,
+  // Reading the jar is IPC to our own process. The default online-only
+  // policy pauses a query the moment the browser reports offline, without
+  // ever calling Rust, and offline is exactly when the answer matters:
+  // it is what tells the Premium gate it may stand in with the last
+  // verdict instead of holding playback.
+  networkMode: "always",
   ...AUTH_RETRY,
-};
+} as const;
 
 /**
  * Which stored account is active, read straight off disk. A local invoke,
@@ -90,7 +96,9 @@ export const activeAccountIdQuery = {
   queryKey: ["active-account-id"],
   queryFn: () => invoke<string | null>("get_active_account_id"),
   staleTime: 30_000,
-};
+  // Local read, same reason as above.
+  networkMode: "always",
+} as const;
 
 /**
  * The signed-in identity, straight from `/account_menu`. Gate it on an
