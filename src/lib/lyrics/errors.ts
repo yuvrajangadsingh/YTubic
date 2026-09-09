@@ -35,6 +35,20 @@ export class LyricsRateLimitError extends Error {
   }
 }
 
+/**
+ * What a failed lyrics fetch may put in the app log. Provider errors can
+ * carry a slice of the response body, and a body is whatever the server or
+ * something in between chose to send, so keep the shape and drop the rest.
+ */
+export function describeLyricsError(e: unknown): string {
+  if (e instanceof SyntaxError) return "response was not JSON";
+  const msg = e instanceof Error ? e.message : String(e);
+  return msg
+    .replace(/(HTTP \d{3})[\s\S]*$/, "$1")
+    .replace(/\s+/g, " ")
+    .slice(0, 120);
+}
+
 /** How many times React Query re-runs a failed lyrics query on its own. */
 const AUTO_RETRIES = 1;
 
