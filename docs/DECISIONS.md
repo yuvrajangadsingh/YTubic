@@ -91,7 +91,7 @@ second for minutes (500+ cycles the second time). Every "element playing under
 a paused store" line came before any `play()` of ours, so the flips were
 WebKit's, released as a burst of media commands it had been holding, and the
 app was echoing each one. The first breaker only gated OS commands, which
-changed nothing and swallowed real presses (Codex review finding #11).
+changed nothing and swallowed real presses (review finding #11).
 
 **Status:** in. Not reproducible on demand; the log lines `play/pause storm`,
 `storm persisted` and `storm settled` are the evidence to look for.
@@ -109,7 +109,7 @@ it. Play resolves never wait.
 
 **Why:** resolves that overlapped another resolve exceeded 15 seconds twice as
 often as lone ones (9% vs 4.4%), and nothing capped concurrent yt-dlp
-processes. Codex's review of the first version found two holes: a timed-out
+processes. A review of the first version found two holes: a timed-out
 wait proceeded *without* a permit (so every queued prefetch stampeded at once),
 and a play joining a queued prefetch inherited background priority and could
 wait 45 seconds before resolving.
@@ -140,7 +140,7 @@ is the anonymous tier (130k) on a play that was already slow. His choice over
 path hangs too (measured: 2 of 5 plain connections to youtube.com failing, the
 others taking up to 7.5s). No app-side change produces sound through that.
 
-**Rejected:** caching the anonymous winner. Codex pointed out that it would make
+**Rejected:** caching the anonymous winner. The review pointed out it would make
 every later replay of that track 130k. Hence the marker and eviction, with the
 marker committed before the rename so a crash cannot leave an unmarked low-tier
 file as the permanent copy.
@@ -315,7 +315,7 @@ measurement doc is kept in `docs/` as evidence.
 
 ---
 
-## 2026-09-01 · Auth hardened, Codex-reviewed
+## 2026-09-01 · Auth hardened and reviewed
 
 **Decided:** exact cookie-name predicate for "signed in" (`__Secure-3PAPISID`
 or `SAPISID`, the cookies the frontend signs with), atomic jar writes (unique
@@ -327,7 +327,7 @@ treated as "defer", not "failed".
 **Why:** the refresh timer was measured stalling across sleep (gaps of 142 and
 177 minutes on a 20-minute monotonic timer), and the previous sign-in check was
 looser than what the app actually needs to sign requests. Ten blockers from the
-Codex review were repaired before merge.
+the review were repaired before merge.
 
 **Still unverified:** the sleep/wake path. The Mac has not slept once since
 this landed.
