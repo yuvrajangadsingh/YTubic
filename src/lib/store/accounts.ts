@@ -5,7 +5,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { resetInnertube } from "@/lib/innertube/client";
 import { fetchChannelList } from "@/lib/innertube/channels";
-import { accountInfoQuery, authLoggedInQuery } from "@/lib/store/auth-queries";
+import {
+  accountInfoQuery,
+  activeAccountIdQuery,
+  authLoggedInQuery,
+} from "@/lib/store/auth-queries";
 import { clearPrefetchMemo } from "@/lib/stream";
 import { openChannelPicker } from "@/lib/store/channel-picker";
 import { usePlaybackStore } from "@/lib/store/playback";
@@ -244,11 +248,7 @@ export function useAccountMetaBackfill(): void {
   const loggedIn = useQuery(authLoggedInQuery);
   const account = useQuery(accountInfoQuery(loggedIn.data === true));
 
-  const activeId = useQuery({
-    queryKey: ["active-account-id"],
-    queryFn: () => invoke<string | null>("get_active_account_id"),
-    staleTime: 30_000,
-  });
+  const activeId = useQuery(activeAccountIdQuery);
 
   const id = activeId.data ?? null;
   const name = account.data?.name ?? "";
