@@ -4,10 +4,16 @@ import { create } from "zustand";
 import { appLog } from "@/lib/app-log";
 import type { PremiumStatus } from "@/lib/innertube/account";
 import {
+  activeAccountIdQuery,
   authLoggedInQuery,
   describeAuthError,
   premiumStatusQuery,
 } from "@/lib/store/auth-queries";
+import {
+  clearPremiumVerdict,
+  readPremiumVerdict,
+  writePremiumVerdict,
+} from "@/lib/store/premium-record";
 
 type State = {
   /**
@@ -30,11 +36,17 @@ type State = {
  * from the conservative `null` and only flips to "premium" once the
  * authoritative check completes.
  *
- * Nothing is persisted: `status` is rederived on every launch so a
- * Premium → Free downgrade outside the app takes effect on the next
- * start. There is deliberately NO user-facing override: playback
- * itself is Premium-gated, so a manual "I have Premium" switch would
- * be a one-click bypass of the gate. Misdetection is covered by
+ * The store itself holds nothing across launches. What survives is the
+ * last verdict the live check produced, in `premium-record`, and it is
+ * only ever read to stand in while a fresh check is in flight: a launch
+ * used to sit on the gate for as long as `/account_menu` took, and that
+ * has been 76 s on a bad link. The record is bound to the active account
+ * id and expires after a day, so a downgrade made elsewhere takes effect
+ * on the next check that lands rather than never.
+ *
+ * There is still deliberately NO user-facing override: playback itself
+ * is Premium-gated, so a manual "I have Premium" switch would be a
+ * one-click bypass of the gate. Misdetection is covered by
  * fetchPremiumStatus failing open to "premium" when its patterns
  * don't match, plus the Re-check button on the Storage tab. (An
  * override used to exist and was persisted under the "ytm-premium"
@@ -59,6 +71,7 @@ export function isPremium(): boolean {
  */
 export function usePremiumStatusSync(): void {
   const loggedIn = useQuery(authLoggedInQuery);
+  const activeId = useQuery(activeAccountIdQuery);
   const premium = useQuery(premiumStatusQuery(loggedIn.data === true));
 
   useEffect(() => {
@@ -68,6 +81,9 @@ export function usePremiumStatusSync(): void {
     // caching and arms the Premium gate on every track.
     if (loggedIn.data === false) {
       appLog("[premium] signed out");
+      // The one event that settles the question. Anything else, a failed
+      // check included, leaves the record to stand its day out.
+      clearPremiumVerdict();
       usePremiumStore.setState({ status: null });
       return;
     }
@@ -75,6 +91,29 @@ export function usePremiumStatusSync(): void {
     appLog(`[premium] status=${premium.data}`);
     usePremiumStore.getState().setStatus(premium.data);
   }, [loggedIn.data, premium.data]);
+
+  // Record every live answer against the account it was asked about. Its
+  // own effect so a late-arriving account id doesn't re-run the logging
+  // above; `login-success` resets the premium query, so the id and the
+  // verdict here always belong to the same account.
+  useEffect(() => {
+    if (premium.data === undefined) return;
+    writePremiumVerdict(activeId.data, premium.data, Date.now());
+  }, [activeId.data, premium.data]);
+
+  // Stand in with the recorded verdict until the live one lands. Runs
+  // only while the store is still `null`, so it can neither overwrite an
+  // answer nor fire twice, and a live answer always wins the moment it
+  // arrives.
+  useEffect(() => {
+    if (loggedIn.data !== true) return;
+    if (premium.data !== undefined) return;
+    if (usePremiumStore.getState().status !== null) return;
+    const stored = readPremiumVerdict(activeId.data, Date.now());
+    if (!stored) return;
+    appLog(`[premium] standing in with stored ${stored} until the check lands`);
+    usePremiumStore.setState({ status: stored });
+  }, [loggedIn.data, activeId.data, premium.data]);
 
   // A failed check leaves the store alone on purpose, so the log is the
   // only place it can show. The query logs each attempt itself; these
