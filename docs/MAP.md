@@ -48,7 +48,7 @@ Next track is prefetched. 64% of plays start from disk and are instant.
 - **Media keys after a long pause are WebKit's problem**, not fixable from the page; the fix is native audio in Rust (ME-34).
 - **macOS is the only shipped platform.** Windows dropped Sep 2026: the CI job, the release job and the Windows-only Rust paths all went with it. CI runs macOS + Ubuntu.
 - **Releases**: `release/x.y.z` branch → PR to main → merge → the workflow builds a signed DMG and `latest.json` as a draft → publish by hand. The updater key is ours (`298F8824CAC01DC8`).
-- **Rename parked, not rejected.** Shortlist in `.notes/rename-shortlist-2026-09-01.md`. It is the first step of any launch (ME-30).
+- **Rename parked, not rejected.** Shortlist is a local working note. It is the first step of any launch (ME-30).
 
 ## How to ship
 

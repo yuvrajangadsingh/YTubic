@@ -29,6 +29,11 @@ src/routeTree.gen.ts
 .tanstack/
 .claude/
 
+# Working notes. BRANCHING.md is the one that describes the repo to
+# anyone reading it; the rest are scratch and stay local.
+.notes/*
+!.notes/BRANCHING.md
+
 # Rust / Tauri
 src-tauri/target/
 src-tauri/gen/
