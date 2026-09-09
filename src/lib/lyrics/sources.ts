@@ -1,10 +1,15 @@
+import { useEffect, useRef } from "react";
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { fetchLrclibLyrics } from "@/lib/lyrics/lrclib";
 import { fetchMusixmatchLyrics } from "@/lib/lyrics/musixmatch";
 import { fetchGeniusLyrics } from "@/lib/lyrics/genius";
 import { fetchYtMusicLyrics } from "@/lib/lyrics/ytmusic";
 import { rejectSiteChrome } from "@/lib/lyrics/plausibility";
-import { shouldRetryLyricsQuery } from "@/lib/lyrics/errors";
+import {
+  describeLyricsError,
+  shouldRetryLyricsQuery,
+} from "@/lib/lyrics/errors";
+import { appLog } from "@/lib/app-log";
 import { cleanTrackTitle, lyricsArtist } from "@/lib/track-meta";
 import type { Lyrics } from "@/lib/lyrics/types";
 import type { QueueTrack } from "@/lib/store/playback";
@@ -53,6 +58,45 @@ function lyricsTimeoutSignal(ms: number): AbortSignal {
   return controller.signal;
 }
 
+function lineCount(l: Lyrics): number {
+  return l.kind === "timed"
+    ? l.lines.length
+    : l.text.split("\n").filter((line) => line.trim()).length;
+}
+
+/**
+ * One line per provider attempt, and one when the pick moves.
+ *
+ * Four providers race and the winner is re-derived as the slower ones
+ * land, so a panel can legitimately show one source's words and then
+ * another's a second later. Answering "why did it change" needs both
+ * halves: which provider answered with what, and when the pick moved.
+ * None of this path logged anything before.
+ */
+function logAttempt(
+  source: LyricsSource,
+  run: () => Promise<Lyrics | null>,
+): Promise<Lyrics | null> {
+  const t0 = Date.now();
+  const secs = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
+  return run().then(
+    (lyrics) => {
+      appLog(
+        lyrics
+          ? `[lyrics] ${source} ${lyrics.kind} in ${secs()}: ${lineCount(lyrics)} lines`
+          : `[lyrics] ${source} no match in ${secs()}`,
+      );
+      return lyrics;
+    },
+    (e: unknown) => {
+      appLog(
+        `[lyrics] ${source} failed in ${secs()}: ${describeLyricsError(e)}`,
+      );
+      throw e;
+    },
+  );
+}
+
 /**
  * Fire every lyric query in parallel, plus a derived "best" selection.
  * Auto-pick rule: first source (in `SOURCE_ORDER`) that has any lyrics,
@@ -99,10 +143,12 @@ export function useLyricsSources(
     // v1 entries that hydrate from the persisted cache without running it.
     queryKey: ["lyrics", "ytmusic-v2", track?.videoId],
     queryFn: () =>
-      fetchYtMusicLyrics(
-        track!.videoId,
-        lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
-      ).then(rejectSiteChrome("YouTube Music")),
+      logAttempt("ytmusic", () =>
+        fetchYtMusicLyrics(
+          track!.videoId,
+          lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
+        ).then(rejectSiteChrome("YouTube Music")),
+      ),
     enabled: !!track?.videoId && enabled,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
@@ -136,15 +182,17 @@ export function useLyricsSources(
       track?.duration,
     ],
     queryFn: () =>
-      fetchLrclibLyrics(
-        {
-          title: title!,
-          artist: artistName,
-          album: track?.album,
-          duration: track?.duration,
-        },
-        lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
-      ).then(rejectSiteChrome("LRCLIB")),
+      logAttempt("lrclib", () =>
+        fetchLrclibLyrics(
+          {
+            title: title!,
+            artist: artistName,
+            album: track?.album,
+            duration: track?.duration,
+          },
+          lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
+        ).then(rejectSiteChrome("LRCLIB")),
+      ),
     enabled: !!track && enabled && verifiable,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
@@ -154,14 +202,16 @@ export function useLyricsSources(
     // v4: site-chrome gate; orphan v3 entries that bypass it from the cache.
     queryKey: ["lyrics", "musixmatch-v4", title, artistName, track?.duration],
     queryFn: () =>
-      fetchMusixmatchLyrics(
-        {
-          title: title!,
-          artist: artistName,
-          duration: track?.duration,
-        },
-        lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
-      ).then(rejectSiteChrome("Musixmatch")),
+      logAttempt("musixmatch", () =>
+        fetchMusixmatchLyrics(
+          {
+            title: title!,
+            artist: artistName,
+            duration: track?.duration,
+          },
+          lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
+        ).then(rejectSiteChrome("Musixmatch")),
+      ),
     enabled: !!track && enabled && verifiable,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
@@ -171,13 +221,15 @@ export function useLyricsSources(
     // v4: site-chrome gate; orphan v3 entries that bypass it from the cache.
     queryKey: ["lyrics", "genius-v4", title, artistName],
     queryFn: () =>
-      fetchGeniusLyrics(
-        {
-          title: title!,
-          artist: artistName,
-        },
-        lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
-      ).then(rejectSiteChrome("Genius")),
+      logAttempt("genius", () =>
+        fetchGeniusLyrics(
+          {
+            title: title!,
+            artist: artistName,
+          },
+          lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
+        ).then(rejectSiteChrome("Genius")),
+      ),
     enabled: !!track && enabled && verifiable,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
@@ -207,6 +259,35 @@ export function useLyricsSources(
   }
 
   const isLoading = SOURCE_ORDER.some((s) => queries[s].isLoading);
+
+  // Which source is on screen right now, and whether the race is over.
+  // Both are plain strings so the effect below can depend on them without
+  // depending on the query objects, which are new on every render.
+  const shown = best ? `${best} ${queries[best].data?.kind ?? "?"}` : "";
+  const settled =
+    !isLoading && SOURCE_ORDER.every((s) => !queries[s].isFetching);
+  const videoId = track?.videoId;
+  const lastLogged = useRef("");
+  useEffect(() => {
+    if (!videoId) return;
+    // Silent until there is something to say: a winner, or every source
+    // having answered with nothing. Otherwise every track change would
+    // log an empty pick before the first provider returns.
+    if (!shown && !settled) return;
+    const key = `${videoId} ${shown}`;
+    if (lastLogged.current === key) return;
+    const sameTrack = lastLogged.current.startsWith(`${videoId} `);
+    lastLogged.current = key;
+    if (!shown) {
+      appLog(`[lyrics] no source had ${videoId}`);
+      return;
+    }
+    appLog(
+      sameTrack
+        ? `[lyrics] switched to ${shown} for ${videoId}`
+        : `[lyrics] showing ${shown} for ${videoId}`,
+    );
+  }, [shown, settled, videoId]);
 
   return { queries, best, isLoading };
 }

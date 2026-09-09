@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { LyricsRateLimitError, shouldRetryLyricsQuery } from "./errors";
+import {
+  describeLyricsError,
+  LyricsRateLimitError,
+  shouldRetryLyricsQuery,
+} from "./errors";
 
 // `vi.resetModules()` gives the providers a fresh copy of ./errors, so the
 // class they throw is not the one imported above. `setup` hands back the
@@ -199,5 +203,46 @@ describe("a real answer is still an answer", () => {
       url.includes("/api/get") ? { status: 404 } : { body: [] },
     );
     await expect(fetchLrclibLyrics(TRACK)).resolves.toBeNull();
+  });
+});
+
+/**
+ * The log line a failed provider produces. Provider errors quote response
+ * bodies, and the app log is a file on disk, so the body has to go.
+ */
+describe("describeLyricsError", () => {
+  it("keeps the status and drops the body after it", () => {
+    expect(
+      describeLyricsError(
+        new Error("Musixmatch HTTP 503: <html>upstream said no</html>"),
+      ),
+    ).toBe("Musixmatch HTTP 503");
+  });
+
+  it("never quotes the body a JSON parse choked on", () => {
+    const parsed = (() => {
+      try {
+        JSON.parse("sessionToken_abc123");
+        return null;
+      } catch (e) {
+        return e;
+      }
+    })();
+    const line = describeLyricsError(parsed);
+    expect(line).not.toContain("sessionToken_abc123");
+    expect(line).toBe("response was not JSON");
+  });
+
+  it("flattens newlines and caps the length", () => {
+    const line = describeLyricsError(new Error(`a\n\n  b${"x".repeat(400)}`));
+    expect(line).not.toContain("\n");
+    expect(line.length).toBeLessThanOrEqual(120);
+    expect(line.startsWith("a b")).toBe(true);
+  });
+
+  it("passes a plain message through", () => {
+    expect(describeLyricsError(new Error("lyrics fetch timed out"))).toBe(
+      "lyrics fetch timed out",
+    );
   });
 });
