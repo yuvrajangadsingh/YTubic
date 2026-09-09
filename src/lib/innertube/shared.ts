@@ -294,7 +294,7 @@ const SLOW_POST_MS = 3_000;
 export async function innertubePost(
   endpoint: string,
   body: Record<string, unknown>,
-  opts: { auth?: AuthMode } = {},
+  opts: { auth?: AuthMode; connectTimeoutMs?: number } = {},
 ): Promise<YtNode> {
   // `endpoint` may already carry query params (reload continuations are
   // passed as `browse?ctoken=…` — the server ignores them in the body).
@@ -332,10 +332,16 @@ export async function innertubePost(
     const visitorHeader: Record<string, string> = visitor
       ? { "X-Goog-Visitor-Id": visitor }
       : {};
+    // A fresh init object every call: the HTTP plugin deletes
+    // `connectTimeout` off whatever it is handed before building the
+    // Request, so a hoisted literal would lose the cap after one use.
     const res = await tauriFetch(url, {
       method: "POST",
       headers: { ...BASE_HEADERS, ...visitorHeader, ...auth },
       body: JSON.stringify({ context: buildContext(), ...body }),
+      ...(opts.connectTimeoutMs === undefined
+        ? {}
+        : { connectTimeout: opts.connectTimeoutMs }),
     });
     enter("cookies");
 
