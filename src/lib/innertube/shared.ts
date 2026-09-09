@@ -335,6 +335,7 @@ export async function innertubePost(
      * `AuthIdentityMismatchError` before anything goes out.
      */
     forAccount?: string | null;
+    connectTimeoutMs?: number;
   } = {},
 ): Promise<YtNode> {
   // `endpoint` may already carry query params (reload continuations are
@@ -373,10 +374,16 @@ export async function innertubePost(
     const visitorHeader: Record<string, string> = visitor
       ? { "X-Goog-Visitor-Id": visitor }
       : {};
+    // A fresh init object every call: the HTTP plugin deletes
+    // `connectTimeout` off whatever it is handed before building the
+    // Request, so a hoisted literal would lose the cap after one use.
     const res = await tauriFetch(url, {
       method: "POST",
       headers: { ...BASE_HEADERS, ...visitorHeader, ...auth },
       body: JSON.stringify({ context: buildContext(), ...body }),
+      ...(opts.connectTimeoutMs === undefined
+        ? {}
+        : { connectTimeout: opts.connectTimeoutMs }),
     });
     enter("cookies");
 
