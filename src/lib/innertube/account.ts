@@ -1,5 +1,22 @@
 import { innertubePost, type YtNode } from "./shared";
 
+/**
+ * Cap on opening the connection for the two account-menu calls, which
+ * sit in front of playback: the Premium gate holds every track until
+ * this answers. Without a cap the OS decides, and on a lossy link that
+ * is the SYN retransmit ladder, which is where the 67-76s checks of
+ * Sep 2026 landed. Every connect that succeeded during a measured loss
+ * burst (curl to music.youtube.com, this machine, 2026-09-09) finished
+ * inside 4.1s, so 5s cuts the tail without cutting a
+ * connection that was going to work. A cut attempt costs one retry and
+ * a fresh connection; the old behaviour cost 76s with no way out.
+ *
+ * Connection only. The plugin exposes no total-request cap, and its
+ * AbortSignal path leaks resource-table entries on this version, so a
+ * request that connects and then stalls is still unbounded.
+ */
+const ACCOUNT_MENU_CONNECT_TIMEOUT_MS = 5_000;
+
 export type AccountInfo = {
   name: string;
   email: string;
@@ -35,7 +52,7 @@ export async function fetchAccountInfo(): Promise<AccountInfo | null> {
   const json: YtNode = await innertubePost(
     "account/account_menu",
     {},
-    { auth: "required" },
+    { auth: "required", connectTimeoutMs: ACCOUNT_MENU_CONNECT_TIMEOUT_MS },
   );
 
   const header: YtNode | undefined =
@@ -88,7 +105,7 @@ export async function fetchPremiumStatus(): Promise<PremiumStatus> {
   const json: YtNode = await innertubePost(
     "account/account_menu",
     {},
-    { auth: "required" },
+    { auth: "required", connectTimeoutMs: ACCOUNT_MENU_CONNECT_TIMEOUT_MS },
   );
 
   const popup: YtNode | undefined =
