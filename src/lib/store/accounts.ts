@@ -104,6 +104,11 @@ export function useLoginSuccessListener(): void {
       // the data first, so the effect only ever sees a fresh pair.
       void qc.resetQueries({ queryKey: ["active-account-id"] });
       void qc.resetQueries({ queryKey: ["account-info"] });
+      // The Premium verdict belongs to the account that was active a
+      // moment ago, and it is now recorded against the active account id.
+      // Left in the cache it would be paired with the new id and stored
+      // as that account's answer, where it would stand for a day.
+      void qc.resetQueries({ queryKey: ["premium-status"] });
       // A Google account can hold several YouTube channels, and the
       // library/likes belong to the channel rather than the account.
       // Right after a fresh sign-in is the moment to offer the choice,
