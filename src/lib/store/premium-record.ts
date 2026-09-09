@@ -32,18 +32,24 @@ const KEY = "ytm:premium-verdict";
 const TRUST_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /**
- * The stored verdict for `accountId`, or null if there isn't a usable one.
+ * The stored verdict for `accountId` and the moment it stops counting, or
+ * null if there isn't a usable one.
  *
  * Bound to the account id rather than to the jar: the id is a local read
  * that answers in about a millisecond, so it is the only identity
  * available before `/account_menu` returns, which is exactly the window
  * this covers. A verdict recorded for one account is never handed to
  * another.
+ *
+ * A local cache, not an entitlement check. Anything running in this
+ * webview can write this key, and a correctly shaped forgery is accepted.
+ * The gate it feeds is a convenience over Google's own answer, which is
+ * what actually decides what the account can stream.
  */
-export function readPremiumVerdict(
+export function standInVerdict(
   accountId: string | null | undefined,
   now: number,
-): PremiumVerdict | null {
+): { status: PremiumVerdict; until: number } | null {
   if (!accountId) return null;
   // `StateStorage` permits a promise; this implementation is synchronous.
   const raw = safeLocalStorage.getItem(KEY) as string | null;
@@ -65,7 +71,7 @@ export function readPremiumVerdict(
   // A clock that moved backwards puts the record in the future, and a
   // negative age would pass a plain upper bound and never expire.
   if (age < 0 || age > TRUST_WINDOW_MS) return null;
-  return rec.status;
+  return { status: rec.status, until: rec.checkedAt + TRUST_WINDOW_MS };
 }
 
 /** Record a verdict the live check actually produced. */

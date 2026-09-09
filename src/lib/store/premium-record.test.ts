@@ -11,7 +11,7 @@ const store = new Map<string, string>();
   },
 };
 
-const { readPremiumVerdict, writePremiumVerdict, clearPremiumVerdict } =
+const { standInVerdict, writePremiumVerdict, clearPremiumVerdict } =
   await import("@/lib/store/premium-record");
 
 const KEY = "ytm:premium-verdict";
@@ -28,36 +28,36 @@ beforeEach(() => store.clear());
 describe("premium verdict record", () => {
   it("reads back what was written for the same account", () => {
     writePremiumVerdict("acct-1", "premium", T0);
-    expect(readPremiumVerdict("acct-1", T0 + 60_000)).toBe("premium");
+    expect(standInVerdict("acct-1", T0 + 60_000)?.status).toBe("premium");
   });
 
   it("keeps a free verdict too", () => {
     writePremiumVerdict("acct-1", "free", T0);
-    expect(readPremiumVerdict("acct-1", T0)).toBe("free");
+    expect(standInVerdict("acct-1", T0)?.status).toBe("free");
   });
 
   it("never hands one account's verdict to another", () => {
     writePremiumVerdict("acct-1", "premium", T0);
-    expect(readPremiumVerdict("acct-2", T0)).toBeNull();
+    expect(standInVerdict("acct-2", T0)).toBeNull();
   });
 
   it("expires after a day", () => {
     writePremiumVerdict("acct-1", "premium", T0);
-    expect(readPremiumVerdict("acct-1", T0 + DAY - 1)).toBe("premium");
-    expect(readPremiumVerdict("acct-1", T0 + DAY + 1)).toBeNull();
+    expect(standInVerdict("acct-1", T0 + DAY - 1)?.status).toBe("premium");
+    expect(standInVerdict("acct-1", T0 + DAY + 1)).toBeNull();
   });
 
   // A negative age passes any plain upper bound, so a machine whose clock
   // ran backwards would have trusted the record for good.
   it("refuses a record dated in the future", () => {
     writePremiumVerdict("acct-1", "premium", T0);
-    expect(readPremiumVerdict("acct-1", T0 - 1)).toBeNull();
+    expect(standInVerdict("acct-1", T0 - 1)).toBeNull();
   });
 
   it("has nothing to say without an account id", () => {
     writePremiumVerdict("acct-1", "premium", T0);
-    expect(readPremiumVerdict(null, T0)).toBeNull();
-    expect(readPremiumVerdict(undefined, T0)).toBeNull();
+    expect(standInVerdict(null, T0)).toBeNull();
+    expect(standInVerdict(undefined, T0)).toBeNull();
   });
 
   it("records nothing when the account id is unknown", () => {
@@ -72,11 +72,11 @@ describe("premium verdict record", () => {
 
   it("survives junk in the slot", () => {
     store.set(KEY, "not json");
-    expect(readPremiumVerdict("acct-1", T0)).toBeNull();
+    expect(standInVerdict("acct-1", T0)).toBeNull();
     store.set(KEY, "null");
-    expect(readPremiumVerdict("acct-1", T0)).toBeNull();
+    expect(standInVerdict("acct-1", T0)).toBeNull();
     store.set(KEY, JSON.stringify({ accountId: "acct-1" }));
-    expect(readPremiumVerdict("acct-1", T0)).toBeNull();
+    expect(standInVerdict("acct-1", T0)).toBeNull();
   });
 
   // The old "ytm-premium" key held a user-facing override, and its shape
@@ -86,7 +86,7 @@ describe("premium verdict record", () => {
       KEY,
       JSON.stringify({ accountId: "acct-1", status: true, checkedAt: T0 }),
     );
-    expect(readPremiumVerdict("acct-1", T0)).toBeNull();
+    expect(standInVerdict("acct-1", T0)).toBeNull();
   });
 
   it("refuses a record with no usable timestamp", () => {
@@ -98,12 +98,19 @@ describe("premium verdict record", () => {
         checkedAt: "yesterday",
       }),
     );
-    expect(readPremiumVerdict("acct-1", T0)).toBeNull();
+    expect(standInVerdict("acct-1", T0)).toBeNull();
+  });
+
+  // The deadline has to ride along with the verdict: an applied stand-in
+  // has nothing else to expire it on a machine that stays offline.
+  it("hands back the moment the verdict stops counting", () => {
+    writePremiumVerdict("acct-1", "premium", T0);
+    expect(standInVerdict("acct-1", T0 + 60_000)?.until).toBe(T0 + DAY);
   });
 
   it("clears on sign-out", () => {
     writePremiumVerdict("acct-1", "premium", T0);
     clearPremiumVerdict();
-    expect(readPremiumVerdict("acct-1", T0)).toBeNull();
+    expect(standInVerdict("acct-1", T0)).toBeNull();
   });
 });
