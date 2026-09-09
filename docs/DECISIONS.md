@@ -339,7 +339,7 @@ this landed.
 **Decided:** keep the name for now. 36 candidates were generated and judged;
 the clear ones were radif, sneck and chapbook; the judge's order was radif,
 gamak, sneck, chapbook, tarz. Full shortlist and icon directions in
-`.notes/rename-shortlist-2026-09-01.md`. Reopened as ME-30 on Sep 4 as the
+a local working note. Reopened as ME-30 on Sep 4 as the
 first step of any launch.
 
 ---
