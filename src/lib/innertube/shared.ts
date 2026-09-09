@@ -1,6 +1,7 @@
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { invoke } from "@tauri-apps/api/core";
 import type { ShelfItem, ShelfMore, Thumbnail } from "./types";
+import { appLog } from "@/lib/app-log";
 
 export type YtNode = Record<string, any>;
 
@@ -313,6 +314,16 @@ export async function authHeaders(
   return headers;
 }
 
+/**
+ * Above this, a POST logs where its time went. The Premium check's
+ * 67-76s outliers (Sep 2026) were recorded as one number wrapped around
+ * the whole call, which covers a jar read over IPC, the request, the
+ * cookie merge (it takes the account's mutation lock) and the body
+ * parse. One number cannot name the phase that stalled, and each phase
+ * has a different fix. Fast calls stay silent.
+ */
+const SLOW_POST_MS = 3_000;
+
 export async function innertubePost(
   endpoint: string,
   body: Record<string, unknown>,
@@ -331,28 +342,61 @@ export async function innertubePost(
   const url = `https://music.youtube.com/youtubei/v1/${endpoint}${
     endpoint.includes("?") ? "&" : "?"
   }prettyPrint=false`;
-  const auth = await authHeaders(opts.auth, opts.forAccount);
-  const visitor = loadVisitorData();
-  const visitorHeader: Record<string, string> = visitor
-    ? { "X-Goog-Visitor-Id": visitor }
-    : {};
-  const res = await tauriFetch(url, {
-    method: "POST",
-    headers: { ...BASE_HEADERS, ...visitorHeader, ...auth },
-    body: JSON.stringify({ context: buildContext(), ...body }),
-  });
+  const started = Date.now();
+  const done: string[] = [];
+  let phase = "auth";
+  let phaseStart = started;
+  const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+  const enter = (next: string) => {
+    const now = Date.now();
+    done.push(`${phase} ${secs(now - phaseStart)}`);
+    phase = next;
+    phaseStart = now;
+  };
+  const reportIfSlow = (outcome: string) => {
+    const total = Date.now() - started;
+    if (total < SLOW_POST_MS) return;
+    // Close whatever was still running: on a failure that phase is the
+    // one that stalled, and phases never reached simply do not appear.
+    // Carrying unfinished marks at the start time instead put the whole
+    // elapsed on `body` and a negative number on the phase that threw.
+    const parts = [...done, `${phase} ${secs(Date.now() - phaseStart)}`];
+    appLog(
+      `[innertube] ${endpoint} ${outcome} in ${secs(total)}: ${parts.join(" ")}`,
+    );
+  };
 
-  // Before the error bail: Google rotates cookies on 4xx responses too.
-  await captureSetCookies(res);
+  try {
+    const auth = await authHeaders(opts.auth, opts.forAccount);
+    enter("fetch");
+    const visitor = loadVisitorData();
+    const visitorHeader: Record<string, string> = visitor
+      ? { "X-Goog-Visitor-Id": visitor }
+      : {};
+    const res = await tauriFetch(url, {
+      method: "POST",
+      headers: { ...BASE_HEADERS, ...visitorHeader, ...auth },
+      body: JSON.stringify({ context: buildContext(), ...body }),
+    });
+    enter("cookies");
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new InnerTubeHttpError(endpoint, res.status, text.slice(0, 300));
+    // Before the error bail: Google rotates cookies on 4xx responses too.
+    await captureSetCookies(res);
+    enter("body");
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new InnerTubeHttpError(endpoint, res.status, text.slice(0, 300));
+    }
+
+    const json = (await res.json()) as YtNode;
+    captureVisitorData(json);
+    reportIfSlow("ok");
+    return json;
+  } catch (e) {
+    reportIfSlow("failed");
+    throw e;
   }
-
-  const json = (await res.json()) as YtNode;
-  captureVisitorData(json);
-  return json;
 }
 
 /**
