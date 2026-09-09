@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { motion } from "motion/react";
@@ -57,6 +64,24 @@ const FULLSCREEN_LYRICS_VIEWPORT_RATIO = 0.22;
  * blink. Failed loads bubble up so the caller can advance its
  * candidate list.
  */
+/**
+ * The stage paints its own text colours instead of inheriting the theme.
+ *
+ * Two reasons. It is always dark, so light mode would otherwise put
+ * near-black text on it. And the theme's secondary grey cannot be read
+ * over art-tinted ground at any scrim that leaves the art visible: over a
+ * white cover under the old 30% scrim it measured 1.23:1, and the title
+ * itself only 2.02:1 (Chaar Diwaari, "Banda Kaam Ka", which is a white
+ * sleeve). #D9D9D9 against the stage the 65% scrim now produces measures
+ * 4.93:1, and 4.34:1 if the noise layer above it is treated as solid
+ * white rather than the +-5/255 dither it is.
+ */
+const STAGE_PALETTE = {
+  "--background": "oklch(0.145 0 0)",
+  "--foreground": "oklch(0.985 0 0)",
+  "--muted-foreground": "oklch(0.882 0 0)",
+} as CSSProperties;
+
 function AmbientBackdrop({
   url,
   onError,
@@ -384,7 +409,7 @@ export function FullscreenPlayer({ onClose }: { onClose: () => void }) {
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         transition={{ duration: 0.18, ease: "easeOut" }}
-        style={accentStyle}
+        style={{ ...accentStyle, ...STAGE_PALETTE }}
         className={cn(
           "fixed inset-0 z-50 flex flex-col overflow-hidden bg-background",
           chromeHidden && "cursor-none",
@@ -402,9 +427,15 @@ export function FullscreenPlayer({ onClose }: { onClose: () => void }) {
             setFailedArt((prev) => new Set(prev).add(failed))
           }
         />
-        {/* Light scrim only — Apple Music's fullscreen keeps the blurred
-            art vivid and bright; a heavy black wash buried it. */}
-        <div aria-hidden className="absolute inset-0 bg-black/30" />
+        {/* Apple Music keeps the blurred art vivid, and 30% was picked to
+            match that. It only works on art that is dark to begin with: a
+            white sleeve came through this scrim at luminance 0.45 and
+            every label on the stage disappeared. 65% is what the text
+            above the art needs, and it is a fixed number on purpose. A
+            scrim measured off the artwork would still leave a bright
+            patch under the labels on a half-dark cover, since blur-[80px]
+            does not average a 1400px stage into one colour. */}
+        <div aria-hidden className="absolute inset-0 bg-black/65" />
         {/* On notched MacBooks a native-fullscreen Space reserves a black
             band beside the camera housing that apps cannot paint. Fade
             the backdrop to black toward the top edge so that band blends
