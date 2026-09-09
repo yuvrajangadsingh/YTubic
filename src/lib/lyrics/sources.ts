@@ -136,6 +136,11 @@ export function useLyricsSources(
   // all, so all three text providers stay disabled, and YTM returns 47
   // line-synced lines for it.
   const verifiable = !!artistName?.trim();
+  // The two enablement conditions, named once: the settled check below
+  // has to know which providers were ever going to be asked, and reading
+  // that off a second copy of the expressions would drift.
+  const askYtMusic = !!track?.videoId && enabled;
+  const askByText = !!track && enabled && verifiable;
 
   // Keyed on the videoId alone. No title, no artist, nothing to normalise.
   const ytmusic = useQuery({
@@ -149,7 +154,7 @@ export function useLyricsSources(
           lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
         ).then(rejectSiteChrome("YouTube Music")),
       ),
-    enabled: !!track?.videoId && enabled,
+    enabled: askYtMusic,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
   });
@@ -193,7 +198,7 @@ export function useLyricsSources(
           lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
         ).then(rejectSiteChrome("LRCLIB")),
       ),
-    enabled: !!track && enabled && verifiable,
+    enabled: askByText,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
   });
@@ -212,7 +217,7 @@ export function useLyricsSources(
           lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
         ).then(rejectSiteChrome("Musixmatch")),
       ),
-    enabled: !!track && enabled && verifiable,
+    enabled: askByText,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
   });
@@ -230,7 +235,7 @@ export function useLyricsSources(
           lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
         ).then(rejectSiteChrome("Genius")),
       ),
-    enabled: !!track && enabled && verifiable,
+    enabled: askByText,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
   });
@@ -263,9 +268,13 @@ export function useLyricsSources(
   // query that is disabled, paused offline or still restoring from the
   // persisted cache is pending with nothing in flight, and counting that as
   // an answer reports "no source had it" before anyone has spoken.
-  const settled = SOURCE_ORDER.every(
-    (s) => queries[s].isSuccess || queries[s].isError,
-  );
+  const settled = SOURCE_ORDER.every((s) => {
+    // A provider that was never enabled is not going to answer. Waiting
+    // on one means the "nothing found" line never appears at all, which
+    // is the state a track with no artist string sits in.
+    if (!(s === "ytmusic" ? askYtMusic : askByText)) return true;
+    return queries[s].isSuccess || queries[s].isError;
+  });
 
   return { queries, best, isLoading, settled };
 }
@@ -291,39 +300,32 @@ export function resetLyricsSelectionLog(): void {
 }
 
 /**
- * The line a change of pick should write, and the state to carry forward.
+ * What a change of pick should announce, and the state to carry forward.
  * Pure so the sequencing can be tested without mounting anything, the same
- * reason `shouldRetryLyricsQuery` lives outside its hook.
+ * reason `shouldRetryLyricsQuery` lives outside its hook. The wording is
+ * the hook's business; this only decides whether there is anything to say.
  *
- * `shown` is what the panel is rendering, "" for nothing. A track change
- * resets even on the silent path: without that, leaving a track before any
- * provider answered and coming straight back to a cached hit compared the
- * cached pick against the pick from the previous visit and dropped it as
- * unchanged.
+ * `shown` describes what the panel is rendering, "" for no source at all.
+ * A track change resets even on the silent path: without that, leaving a
+ * track before any provider answered and coming straight back to a cached
+ * hit compared the cached pick against the pick from the previous visit
+ * and dropped it as unchanged.
  */
 export function nextSelectionLine(
   prev: SelectionLogState,
   next: { videoId: string; shown: string; settled: boolean },
-): { state: SelectionLogState; line: string | null } {
+): { state: SelectionLogState; event: "first" | "switch" | "none" | null } {
   const state =
     prev.videoId === next.videoId
       ? prev
       : { videoId: next.videoId, shown: null };
-  // Silent until there is something to say: a pick, or every source having
-  // answered with nothing.
-  if (!next.shown && !next.settled) return { state, line: null };
-  if (state.shown === next.shown) return { state, line: null };
+  // Silent until there is something to say: a pick, or every provider
+  // that was going to run having answered with nothing.
+  if (!next.shown && !next.settled) return { state, event: null };
+  if (state.shown === next.shown) return { state, event: null };
   const carried = { videoId: next.videoId, shown: next.shown };
-  if (!next.shown) {
-    return { state: carried, line: `[lyrics] no source had ${next.videoId}` };
-  }
-  return {
-    state: carried,
-    line:
-      state.shown === null
-        ? `[lyrics] showing ${next.shown} for ${next.videoId}`
-        : `[lyrics] switched to ${next.shown} for ${next.videoId}`,
-  };
+  if (!next.shown) return { state: carried, event: "none" };
+  return { state: carried, event: state.shown === null ? "first" : "switch" };
 }
 
 /**
@@ -342,15 +344,35 @@ export function useLyricsSelectionLog(
   lyrics: Lyrics | null,
   settled: boolean,
 ): void {
-  const shown = source && lyrics ? `${source} ${lyrics.kind}` : "";
+  // "none" rather than "" when a source is selected but holds nothing:
+  // pinning Genius on a track Genius does not have is a different event
+  // from no provider having it, and the two must not share a key.
+  const shown = source ? `${source} ${lyrics ? lyrics.kind : "none"}` : "";
+  const missing = !!source && !lyrics;
   useEffect(() => {
-    if (!videoId) return;
-    const { state, line } = nextSelectionLine(selectionLog, {
+    if (!videoId) {
+      // Nothing playing. Reset, or a cached pick on the way back to the
+      // track that was playing before reads as unchanged and is dropped.
+      selectionLog = { videoId: "", shown: null };
+      return;
+    }
+    const { state, event } = nextSelectionLine(selectionLog, {
       videoId,
       shown,
       settled,
     });
     selectionLog = state;
-    if (line) appLog(line);
-  }, [videoId, shown, settled]);
+    if (!event) return;
+    if (event === "none") {
+      appLog(`[lyrics] no source had ${videoId}`);
+    } else if (missing) {
+      appLog(`[lyrics] ${source} has nothing for ${videoId}`);
+    } else {
+      appLog(
+        event === "first"
+          ? `[lyrics] showing ${shown} for ${videoId}`
+          : `[lyrics] switched to ${shown} for ${videoId}`,
+      );
+    }
+  }, [videoId, shown, settled, source, missing]);
 }
