@@ -211,12 +211,21 @@ describe("a real answer is still an answer", () => {
  * bodies, and the app log is a file on disk, so the body has to go.
  */
 describe("describeLyricsError", () => {
-  it("keeps the status and drops the body after it", () => {
+  it("keeps the status and nothing else", () => {
     expect(
       describeLyricsError(
         new Error("Musixmatch HTTP 503: <html>upstream said no</html>"),
       ),
-    ).toBe("Musixmatch HTTP 503");
+    ).toBe("HTTP 503");
+    expect(describeLyricsError(new Error("LRCLIB /get 404"))).toBe("HTTP 404");
+  });
+
+  it("names a rate limit without quoting the token", () => {
+    expect(
+      describeLyricsError(
+        new LyricsRateLimitError("Musixmatch token UpgradeOnly_abc123"),
+      ),
+    ).toBe("rate limited");
   });
 
   it("never quotes the body a JSON parse choked on", () => {
@@ -228,53 +237,64 @@ describe("describeLyricsError", () => {
         return e;
       }
     })();
-    const line = describeLyricsError(parsed);
-    expect(line).not.toContain("sessionToken_abc123");
-    expect(line).toBe("response was not JSON");
-  });
-
-  it("flattens newlines and caps the length", () => {
-    const line = describeLyricsError(new Error(`a\n\n  b${"x".repeat(400)}`));
-    expect(line).not.toContain("\n");
-    expect(line.length).toBeLessThanOrEqual(120);
-    expect(line.startsWith("a b")).toBe(true);
-  });
-
-  it("passes a plain message through", () => {
-    expect(describeLyricsError(new Error("lyrics fetch timed out"))).toBe(
-      "lyrics fetch timed out",
-    );
-  });
-
-  // A transport failure names the URL it was given, and a lyrics URL carries
-  // the track being looked up plus, on Musixmatch, the signed token.
-  it("keeps the host of a URL and drops its path and query", () => {
-    expect(
-      describeLyricsError(
-        new Error(
-          "error sending request for url (https://apic-desktop.musixmatch.com/ws/1.1/track.get?usertoken=abc123&q=x)",
-        ),
-      ),
-    ).toBe("error sending request for url (apic-desktop.musixmatch.com)");
-  });
-
-  it("redacts an address the provider echoed back", () => {
-    const line = describeLyricsError(
-      new Error("Genius rejected signup for nobody@example.com"),
-    );
-    expect(line).not.toContain("nobody@example.com");
-    expect(line).toContain("<email>");
+    expect(describeLyricsError(parsed)).toBe("response was not JSON");
   });
 
   // A provider that re-wraps its parse failure, or one thrown in another
   // realm, is not an `instanceof SyntaxError` here.
   it("catches a parse failure that is not a SyntaxError instance", () => {
-    const line = describeLyricsError(
-      new Error(
-        "Unexpected token 's', \"sessionToken_abc123\" is not valid JSON",
+    expect(
+      describeLyricsError(
+        new Error(
+          "Unexpected token 's', \"sessionToken_abc123\" is not valid JSON",
+        ),
       ),
+    ).toBe("response was not JSON");
+  });
+
+  /**
+   * The reason this is a whitelist. Every one of these walked through a
+   * redact-the-bad-parts version: credentials in a URL authority, an IPv6
+   * host (the bracket ends the host, so the query survived), a data: URL,
+   * and a body quoted before the status rather than after it.
+   */
+  it.each([
+    [
+      "credentials in the authority",
+      "sending request for url (https://user:secret@127.0.0.1/x)",
+    ],
+    [
+      "an IPv6 host",
+      "sending request for url (https://[::1]:8080/ws?usertoken=secret)",
+    ],
+    ["a data payload", "failed on data:text/plain;base64,c2VjcmV0VG9rZW4="],
+    ["a blob url", "failed on blob:null/9f8e-secretToken"],
+    [
+      "a body before the status",
+      'server said {"key":"secretToken"} then HTTP 503',
+    ],
+    ["a bare token", "rejected token sk_live_secretToken0123456789"],
+    ["an address", "Genius rejected signup for nobody@example.com"],
+  ])("quotes nothing from %s", (_what, message) => {
+    const line = describeLyricsError(new Error(message));
+    expect(line).not.toMatch(/secret/i);
+    expect(line).not.toContain("@");
+    expect(line).not.toContain("nobody");
+  });
+
+  it("stays cheap on a long message", () => {
+    const started = Date.now();
+    describeLyricsError(new Error("x".repeat(64 * 1024)));
+    expect(Date.now() - started).toBeLessThan(50);
+  });
+
+  it("falls back to the error class, never the message", () => {
+    class ProviderGone extends Error {
+      override name = "ProviderGone";
+    }
+    expect(describeLyricsError(new ProviderGone("host down at 10.0.0.4"))).toBe(
+      "ProviderGone",
     );
-    expect(line).not.toContain("sessionToken_abc123");
-    expect(line).toBe("response was not JSON");
+    expect(describeLyricsError(new Error("something odd"))).toBe("failed");
   });
 });
