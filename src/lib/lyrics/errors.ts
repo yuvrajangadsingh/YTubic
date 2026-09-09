@@ -36,37 +36,47 @@ export class LyricsRateLimitError extends Error {
 }
 
 /**
- * What a failed lyrics fetch may put in the app log. Two parts of a provider
- * error are written by somebody else: the slice of response body an error
- * carries, and the URL a transport-level failure names. A body is whatever
- * the server or something in between chose to send, and a lyrics URL carries
- * the search terms plus, on the token-signed providers, the token itself.
- * Keep the shape, the host and the status; drop the rest.
+ * What a failed lyrics fetch may put in the app log.
+ *
+ * A whitelist, not a scrub. Everything an error carries past its own class
+ * was written by somebody else: a slice of response body, the URL the
+ * transport was handed (which holds the search terms and, on Musixmatch,
+ * the signed token), whatever a library decided to quote. Redacting that
+ * is a losing game; credentials in a URL authority, IPv6 hosts, data:
+ * payloads and bare tokens all walked through an earlier version of this.
+ *
+ * So the output vocabulary is fixed and nothing from the message is ever
+ * copied into it. The provider's name is already on the log line the
+ * caller writes, so all this has to add is what went wrong.
  */
 export function describeLyricsError(e: unknown): string {
-  // A parse error quotes the offending text, so a 200 that is not JSON (a
-  // captive portal, a proxy error page) would put its body here. `instanceof`
-  // alone misses one thrown across a realm or re-wrapped by a provider, so
-  // the message shape is checked too.
+  if (e instanceof LyricsRateLimitError) return "rate limited";
   if (e instanceof SyntaxError) return "response was not JSON";
-  const msg = e instanceof Error ? e.message : String(e);
+  // Bound the input before any pattern touches it. An error can carry a
+  // whole error page, and this runs on the renderer thread.
+  const msg = (e instanceof Error ? e.message : String(e)).slice(0, 200);
   if (
-    /JSON Parse error|in JSON at position|Unexpected (token|identifier)/.test(
+    /JSON Parse error|in JSON at position|Unexpected (token|identifier)|not valid JSON/i.test(
       msg,
     )
   ) {
     return "response was not JSON";
   }
-  return (
-    msg
-      // Host only. The path and query hold the track being looked up and,
-      // on Musixmatch, the signed session token.
-      .replace(/https?:\/\/([^\s/?#)"'\]]+)[^\s)"'\]]*/gi, "$1")
-      .replace(/[^\s<>()"']+@[^\s<>()"']+\.[a-z]{2,}/gi, "<email>")
-      .replace(/(HTTP \d{3})[\s\S]*$/, "$1")
-      .replace(/\s+/g, " ")
-      .slice(0, 120)
-  );
+  if (/abort|timed?\s?out/i.test(msg)) return "timed out";
+  // Our own throws end in the status ("LRCLIB /get 404"); anything else
+  // has to say HTTP for it to count, so a three-digit number inside a
+  // body cannot be mistaken for one.
+  const trailing = /\b([45]\d{2})\s*$/.exec(msg);
+  if (trailing) return `HTTP ${trailing[1]}`;
+  const labelled = /\bHTTP\s+([1-5]\d{2})\b/i.exec(msg);
+  if (labelled) return `HTTP ${labelled[1]}`;
+  if (/error sending request|failed to fetch|network|connect/i.test(msg)) {
+    return "network error";
+  }
+  // The class name is written by our code or a runtime, never by a
+  // server. Still bounded, in case something exotic sets its own.
+  const name = e instanceof Error ? e.name : "";
+  return /^[A-Za-z]{1,40}$/.test(name) && name !== "Error" ? name : "failed";
 }
 
 /** How many times React Query re-runs a failed lyrics query on its own. */
