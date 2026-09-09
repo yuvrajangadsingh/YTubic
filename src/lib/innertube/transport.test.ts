@@ -15,6 +15,7 @@ import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { invoke } from "@tauri-apps/api/core";
 import { appLog } from "@/lib/app-log";
 import { innertubePost, resetAuthCache } from "./shared";
+import { fetchAccountInfo } from "./account";
 
 const fetchMock = vi.mocked(tauriFetch);
 const invokeMock = vi.mocked(invoke);
@@ -51,6 +52,41 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+describe("innertubePost connect cap", () => {
+  it("hands the cap to the HTTP plugin", async () => {
+    await innertubePost("account/account_menu", {}, { connectTimeoutMs: 5000 });
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ connectTimeout: 5000 });
+  });
+
+  it("leaves an ordinary browse uncapped", async () => {
+    await innertubePost("browse", { browseId: "FEmusic_home" });
+    expect(fetchMock.mock.calls[0][1]).not.toHaveProperty("connectTimeout");
+  });
+
+  it("caps the real account-menu caller, not just a hand-passed option", async () => {
+    await fetchAccountInfo();
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ connectTimeout: 5000 });
+  });
+
+  it("still caps the second call after the plugin strips the field", async () => {
+    // The plugin really does `delete init.connectTimeout` before building
+    // its Request, so a hoisted literal would lose the cap after one use.
+    const capsSeen: unknown[] = [];
+    const inits: unknown[] = [];
+    fetchMock.mockImplementation(async (_url: unknown, init: unknown) => {
+      const bag = init as Record<string, unknown>;
+      capsSeen.push(bag.connectTimeout);
+      inits.push(init);
+      delete bag.connectTimeout;
+      return ok();
+    });
+    await fetchAccountInfo();
+    await fetchAccountInfo();
+    expect(capsSeen).toEqual([5000, 5000]);
+    expect(inits[0]).not.toBe(inits[1]);
+  });
 });
 
 describe("innertubePost phase timings", () => {
