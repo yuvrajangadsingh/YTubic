@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { create } from "zustand";
 import { appLog } from "@/lib/app-log";
@@ -11,7 +11,7 @@ import {
 } from "@/lib/store/auth-queries";
 import {
   clearPremiumVerdict,
-  readPremiumVerdict,
+  standInVerdict,
   writePremiumVerdict,
 } from "@/lib/store/premium-record";
 
@@ -21,6 +21,13 @@ type State = {
    * haven't checked yet *or* when the user is not signed in.
    */
   status: PremiumStatus;
+  /**
+   * When a stood-in `status` stops counting, or null when the status came
+   * from a live check. Checking the record's age at read time is not
+   * enough on its own: once seeded, a status with nothing to expire it
+   * outlives its window on a machine that stays offline or asleep.
+   */
+  standInUntil: number | null;
   setStatus: (status: PremiumStatus) => void;
 };
 
@@ -54,12 +61,19 @@ type State = {
  */
 export const usePremiumStore = create<State>()((set) => ({
   status: null,
-  setStatus: (status) => set({ status }),
+  standInUntil: null,
+  // A live answer always clears the stand-in deadline with it.
+  setStatus: (status) => set({ status, standInUntil: null }),
 }));
 
 /** Synchronous read for non-React callers (stream.ts, audio-engine). */
 export function isPremium(): boolean {
-  return usePremiumStore.getState().status === "premium";
+  const { status, standInUntil } = usePremiumStore.getState();
+  if (status !== "premium") return false;
+  // The timer below normally clears this first. It cannot be relied on
+  // across sleep, so the deadline is enforced here as well, at the moment
+  // the answer is actually used.
+  return standInUntil === null || Date.now() <= standInUntil;
 }
 
 /**
@@ -84,7 +98,7 @@ export function usePremiumStatusSync(): void {
       // The one event that settles the question. Anything else, a failed
       // check included, leaves the record to stand its day out.
       clearPremiumVerdict();
-      usePremiumStore.setState({ status: null });
+      usePremiumStore.setState({ status: null, standInUntil: null });
       return;
     }
     if (premium.data === undefined) return;
@@ -92,14 +106,38 @@ export function usePremiumStatusSync(): void {
     usePremiumStore.getState().setStatus(premium.data);
   }, [loggedIn.data, premium.data]);
 
-  // Record every live answer against the account it was asked about. Its
-  // own effect so a late-arriving account id doesn't re-run the logging
-  // above; `login-success` resets the premium query, so the id and the
-  // verdict here always belong to the same account.
+  // Declared BEFORE the seeding effect so that on the render where the id
+  // flips, the old account's answer is gone by the time seeding looks.
+  //
+  // Signing in to a second account resets the premium QUERY but leaves the
+  // store holding the previous account's answer, and the full reset only
+  // arrives once the metadata backfill completes. In between, a slow or
+  // failed check for the new account left the old verdict standing, and
+  // the seeding guard below reads a non-null status as "already answered".
+  const seenAccount = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    if (activeId.data === undefined) return;
+    const previous = seenAccount.current;
+    seenAccount.current = activeId.data;
+    if (previous === undefined || previous === activeId.data) return;
+    appLog("[premium] active account changed, dropping the held status");
+    usePremiumStore.setState({ status: null, standInUntil: null });
+  }, [activeId.data]);
+
+  // Record every live answer against the account it was asked about, at
+  // the time the answer actually landed. Keyed on `dataUpdatedAt` and not
+  // on the value: a recheck that confirms the same verdict has to push the
+  // record's age out, or a long session expires a verdict it just
+  // reconfirmed. Its own effect so a late-arriving account id doesn't
+  // re-run the logging above.
   useEffect(() => {
     if (premium.data === undefined) return;
-    writePremiumVerdict(activeId.data, premium.data, Date.now());
-  }, [activeId.data, premium.data]);
+    writePremiumVerdict(
+      activeId.data,
+      premium.data,
+      premium.dataUpdatedAt || Date.now(),
+    );
+  }, [activeId.data, premium.data, premium.dataUpdatedAt]);
 
   // Stand in with the recorded verdict until the live one lands. Runs
   // only while the store is still `null`, so it can neither overwrite an
@@ -109,10 +147,27 @@ export function usePremiumStatusSync(): void {
     if (loggedIn.data !== true) return;
     if (premium.data !== undefined) return;
     if (usePremiumStore.getState().status !== null) return;
-    const stored = readPremiumVerdict(activeId.data, Date.now());
-    if (!stored) return;
-    appLog(`[premium] standing in with stored ${stored} until the check lands`);
-    usePremiumStore.setState({ status: stored });
+    const now = Date.now();
+    const stood = standInVerdict(activeId.data, now);
+    if (!stood) return;
+    appLog(
+      `[premium] standing in with stored ${stood.status} until the check lands`,
+    );
+    usePremiumStore.setState({
+      status: stood.status,
+      standInUntil: stood.until,
+    });
+    // Follow the deadline in the UI too. `isPremium` enforces it on read
+    // for the case this timer sleeps through.
+    const timer = window.setTimeout(
+      () => {
+        if (usePremiumStore.getState().standInUntil === null) return;
+        appLog("[premium] stored verdict expired, back to unknown");
+        usePremiumStore.setState({ status: null, standInUntil: null });
+      },
+      Math.max(0, stood.until - now),
+    );
+    return () => window.clearTimeout(timer);
   }, [loggedIn.data, activeId.data, premium.data]);
 
   // A failed check leaves the store alone on purpose, so the log is the
