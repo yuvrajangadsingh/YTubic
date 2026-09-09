@@ -36,17 +36,37 @@ export class LyricsRateLimitError extends Error {
 }
 
 /**
- * What a failed lyrics fetch may put in the app log. Provider errors can
- * carry a slice of the response body, and a body is whatever the server or
- * something in between chose to send, so keep the shape and drop the rest.
+ * What a failed lyrics fetch may put in the app log. Two parts of a provider
+ * error are written by somebody else: the slice of response body an error
+ * carries, and the URL a transport-level failure names. A body is whatever
+ * the server or something in between chose to send, and a lyrics URL carries
+ * the search terms plus, on the token-signed providers, the token itself.
+ * Keep the shape, the host and the status; drop the rest.
  */
 export function describeLyricsError(e: unknown): string {
+  // A parse error quotes the offending text, so a 200 that is not JSON (a
+  // captive portal, a proxy error page) would put its body here. `instanceof`
+  // alone misses one thrown across a realm or re-wrapped by a provider, so
+  // the message shape is checked too.
   if (e instanceof SyntaxError) return "response was not JSON";
   const msg = e instanceof Error ? e.message : String(e);
-  return msg
-    .replace(/(HTTP \d{3})[\s\S]*$/, "$1")
-    .replace(/\s+/g, " ")
-    .slice(0, 120);
+  if (
+    /JSON Parse error|in JSON at position|Unexpected (token|identifier)/.test(
+      msg,
+    )
+  ) {
+    return "response was not JSON";
+  }
+  return (
+    msg
+      // Host only. The path and query hold the track being looked up and,
+      // on Musixmatch, the signed session token.
+      .replace(/https?:\/\/([^\s/?#)"'\]]+)[^\s)"'\]]*/gi, "$1")
+      .replace(/[^\s<>()"']+@[^\s<>()"']+\.[a-z]{2,}/gi, "<email>")
+      .replace(/(HTTP \d{3})[\s\S]*$/, "$1")
+      .replace(/\s+/g, " ")
+      .slice(0, 120)
+  );
 }
 
 /** How many times React Query re-runs a failed lyrics query on its own. */

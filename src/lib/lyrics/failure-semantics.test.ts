@@ -245,4 +245,36 @@ describe("describeLyricsError", () => {
       "lyrics fetch timed out",
     );
   });
+
+  // A transport failure names the URL it was given, and a lyrics URL carries
+  // the track being looked up plus, on Musixmatch, the signed token.
+  it("keeps the host of a URL and drops its path and query", () => {
+    expect(
+      describeLyricsError(
+        new Error(
+          "error sending request for url (https://apic-desktop.musixmatch.com/ws/1.1/track.get?usertoken=abc123&q=x)",
+        ),
+      ),
+    ).toBe("error sending request for url (apic-desktop.musixmatch.com)");
+  });
+
+  it("redacts an address the provider echoed back", () => {
+    const line = describeLyricsError(
+      new Error("Genius rejected signup for nobody@example.com"),
+    );
+    expect(line).not.toContain("nobody@example.com");
+    expect(line).toContain("<email>");
+  });
+
+  // A provider that re-wraps its parse failure, or one thrown in another
+  // realm, is not an `instanceof SyntaxError` here.
+  it("catches a parse failure that is not a SyntaxError instance", () => {
+    const line = describeLyricsError(
+      new Error(
+        "Unexpected token 's', \"sessionToken_abc123\" is not valid JSON",
+      ),
+    );
+    expect(line).not.toContain("sessionToken_abc123");
+    expect(line).toBe("response was not JSON");
+  });
 });
