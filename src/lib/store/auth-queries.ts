@@ -82,6 +82,17 @@ export const authLoggedInQuery = {
 };
 
 /**
+ * Which stored account is active, read straight off disk. A local invoke,
+ * so it answers in about a millisecond even with no network at all, and it
+ * is the only account identity available before `/account_menu` returns.
+ */
+export const activeAccountIdQuery = {
+  queryKey: ["active-account-id"],
+  queryFn: () => invoke<string | null>("get_active_account_id"),
+  staleTime: 30_000,
+};
+
+/**
  * The signed-in identity, straight from `/account_menu`. Gate it on an
  * authoritative `is_logged_in === true`: firing it while the credential
  * check is unknown sends an anonymous probe whose anonymous answer then
