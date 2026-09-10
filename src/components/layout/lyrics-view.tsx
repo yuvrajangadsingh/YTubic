@@ -236,7 +236,12 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
 
   const activeSource: LyricsSource | null = pref === "auto" ? best : pref;
   const active = activeSource ? (queries[activeSource].data ?? null) : null;
-  useLyricsSelectionLog(videoId, activeSource, active, settled);
+  // Whether the SELECTED provider has answered, which is not the same as
+  // the race being over: a pinned provider still loading is not a miss.
+  const activeQuery = activeSource ? queries[activeSource] : null;
+  const activeSettled =
+    !activeQuery || activeQuery.isSuccess || activeQuery.isError;
+  useLyricsSelectionLog(videoId, activeSource, active, settled, activeSettled);
 
   const recordDurationSec =
     active?.kind === "timed" ? active.recordDurationSec : undefined;
