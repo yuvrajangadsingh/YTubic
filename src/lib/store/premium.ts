@@ -141,13 +141,17 @@ export function usePremiumStatusSync(): void {
   // reconfirmed. Its own effect so a late-arriving account id doesn't
   // re-run the logging above.
   useEffect(() => {
+    // Not while signed out: disabling the query does not cancel a request
+    // already in flight, and its late answer would put back the record
+    // the sign-out just cleared.
+    if (loggedIn.data !== true) return;
     if (premium.data === undefined) return;
     writePremiumVerdict(
       activeId.data,
       premium.data,
       premium.dataUpdatedAt || Date.now(),
     );
-  }, [activeId.data, premium.data, premium.dataUpdatedAt]);
+  }, [loggedIn.data, activeId.data, premium.data, premium.dataUpdatedAt]);
 
   // Stand in with the recorded verdict until the live one lands. Runs
   // only while the store is still `null`, so it can neither overwrite an
