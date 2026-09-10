@@ -1613,15 +1613,18 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
 /// provisional navigation never reaches.
 static KEEPER_PAGE_LOADS: AtomicU64 = AtomicU64::new(0);
 
-/// Closes the wrapped window when dropped. macOS only: see
-/// `refresh_account_cookies` for why the keeper is not kept open there.
-#[cfg(target_os = "macos")]
-struct CloseOnDrop(tauri::WebviewWindow);
+/// Replaces the keeper's page with about:blank when dropped, if armed. See
+/// `refresh_account_cookies` for why the page goes and the window stays.
+struct ParkKeeperOnDrop(Option<tauri::WebviewWindow>);
 
-#[cfg(target_os = "macos")]
-impl Drop for CloseOnDrop {
+impl Drop for ParkKeeperOnDrop {
     fn drop(&mut self) {
-        let _ = self.0.close();
+        if let Some(win) = self.0.take() {
+            // `replace`, not a navigation: a navigation leaves the old page
+            // reachable by "back", and a page that is reachable can sit in
+            // the back-forward cache with its memory intact.
+            let _ = win.eval("location.replace('about:blank')");
+        }
     }
 }
 
@@ -1629,11 +1632,10 @@ impl Drop for CloseOnDrop {
 /// music.youtube.com that reuses the account's persisted profile. As a
 /// real browser engine it stays authenticated from the stored session and
 /// keeps the server-side session (and its rotating cookies) warm, which
-/// plain HTTP replay cannot do. Reused if one is already open; any keeper
-/// left over from a previously-active account is closed first, so at most
-/// one runs at a time. Whether a keeper stays open between refreshes is
-/// per platform, see `refresh_account_cookies`. Returns (window,
-/// just_created).
+/// plain HTTP replay cannot do. Built ONCE and reused; any keeper left
+/// over from a previously-active account is closed first, so at most one
+/// runs at a time. Between refreshes the window stays but its page does
+/// not, see `refresh_account_cookies`. Returns (window, just_created).
 async fn ensure_session_keeper(
     app: &tauri::AppHandle,
     id: &str,
@@ -1655,14 +1657,15 @@ async fn ensure_session_keeper(
     let url = "https://music.youtube.com/"
         .parse::<tauri::Url>()
         .map_err(|e| e.to_string())?;
-    // Hidden, undecorated, focus-less, off-screen, no taskbar entry. On
-    // Windows it is built once and reused (not re-created every cycle), so
-    // there is no recurring window creation for WebView2 to flash on screen;
-    // on macOS it is closed after each capture and this builder runs again
-    // next time. The window-state plugin is told to never restore keeper
-    // windows (see `with_filter` in `run`), so a saved "visible" state can't
-    // drag it back on-screen next launch either. The webview still loads and
-    // keeps the session alive regardless of visibility or position.
+    // Hidden, undecorated, focus-less, off-screen, no taskbar entry. Built
+    // once and reused (not re-created every cycle): there is no recurring
+    // window creation to flash on screen, and wry activates the app every
+    // time it builds a webview, hidden or not, which is not something to
+    // repeat every twenty minutes. The window-state plugin is told to never
+    // restore keeper windows (see `with_filter` in `run`), so a saved
+    // "visible" state can't drag it back on-screen next launch either. The
+    // webview still loads and keeps the session alive regardless of
+    // visibility or position.
     let win = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
         .title("YTubic session keeper")
         .visible(false)
@@ -1677,7 +1680,11 @@ async fn ensure_session_keeper(
         // `navigate()` too — which is what lets a refresh tell "reloaded
         // and Google answered" from "offline, nothing happened".
         .on_page_load(|_win, payload| {
-            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+            // Only Google counts: the page is parked on about:blank between
+            // refreshes, and that load must not read as "reached Google".
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
+                && payload.url().host_str() == Some("music.youtube.com")
+            {
                 KEEPER_PAGE_LOADS.fetch_add(1, Ordering::Relaxed);
             }
         })
@@ -1695,15 +1702,17 @@ async fn ensure_session_keeper(
 /// requests (which renews the session and rotates its short-lived
 /// cookies), reads the full cookie set, and overwrites `cookies.enc`.
 ///
-/// What happens to the keeper afterwards is per platform. On macOS it is
-/// closed once this function returns: the WebContent process behind a page
-/// nobody looks at was measured at 260 MB ten minutes after launch and
-/// 1.0 GB after eight and a half idle hours (Sep 10 2026), and
-/// the session lives in the profile directory, not in the window, so the
-/// next refresh builds a fresh keeper and finds it signed in exactly as
-/// the first one after launch does. On Windows the keeper is left open:
-/// WebView2 can show the host window when an external page finishes
-/// loading, and one build per launch is the smallest exposure to that.
+/// Once a refresh has seen the keeper reach Google, the page is replaced
+/// with about:blank on the way out. Left on music.youtube.com between
+/// refreshes, the WebContent process behind a page nobody looks at was
+/// measured at 260 MB ten minutes after launch and 1.0 GB after eight and
+/// a half idle hours (Sep 10 2026). The window itself stays: wry activates
+/// the app whenever it builds a webview, so closing and rebuilding one
+/// every twenty minutes is not free. The session is in WebKit's cookie
+/// store, which the page does not own, and the next refresh navigates
+/// back and finds it signed in the same way the first load after a launch
+/// does. A refresh that saw no page load leaves the page alone, since it
+/// may still be loading.
 ///
 /// This is what survives Google's ~2h leash on *extracted* cookies: the
 /// bound browser session behind the keeper stays live, so the snapshot we
@@ -1737,11 +1746,9 @@ async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOut
         }
         Err(e) => return RefreshOutcome::Failed(e),
     };
-    // Closed on every way out of this function, snapshot or not. Dropping
-    // the guard queues the close on the event loop, after the poll below
-    // has taken what it needs.
-    #[cfg(target_os = "macos")]
-    let _close_keeper = CloseOnDrop(win.clone());
+    // Armed further down, once this refresh has seen a page load; dropped
+    // on every way out of this function after that.
+    let mut park = ParkKeeperOnDrop(None);
     // A reused keeper is reloaded to force fresh authenticated traffic; a
     // just-created one is already loading the URL from the builder.
     if !created {
@@ -1854,6 +1861,12 @@ async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOut
     // requiring both would fail a legitimate cycle in which Google happened
     // to rotate nothing.
     let reloaded = KEEPER_PAGE_LOADS.load(Ordering::Relaxed) > loads_before;
+    // Only a keeper that finished loading is parked. One that did not may
+    // still be mid-renewal, and blanking it would cut off exactly what the
+    // next attempt is waiting for.
+    if reloaded {
+        park.0 = Some(win.clone());
+    }
     let renewed = previous
         .as_deref()
         .is_none_or(|p| session::jars_differ(p, &snapshot));
