@@ -299,6 +299,8 @@ type SelectionLogState = { videoId: string; shown: string | null };
  * effects. Per-instance state wrote the same pick once per caller.
  */
 let selectionLog: SelectionLogState = { videoId: "", shown: null };
+/** Views currently logging; the state above outlives all but the last. */
+let logViews = 0;
 
 /** Reset between tests. */
 export function resetLyricsSelectionLog(): void {
@@ -378,17 +380,21 @@ export function useLyricsSelectionLog(
 ): void {
   const shown = selectionKey(source, lyrics, sourceState);
   const hasLyrics = !!lyrics;
-  // Unmount-only, so it runs when the shell drops the player on an empty
-  // queue and not on every dependency change. That gap is unobservable
-  // from inside the hook: nothing is mounted to see it, and without this
-  // the pick from before the gap survives and swallows the announcement
-  // when the same track is played again from cache.
-  useEffect(
-    () => () => {
-      selectionLog = { videoId: "", shown: null };
-    },
-    [],
-  );
+  // Reset when the LAST view leaves, which is what happens when the shell
+  // drops the player on an empty queue, and not on every dependency
+  // change. That gap is unobservable from inside the hook: nothing is
+  // mounted to see it, and without this the pick from before the gap
+  // survives and swallows the announcement when the same track is played
+  // again from cache. Last and not first: the player bar stays mounted
+  // behind the fullscreen player, and resetting when fullscreen closed
+  // made the bar announce its unchanged pick a second time.
+  useEffect(() => {
+    logViews += 1;
+    return () => {
+      logViews -= 1;
+      if (logViews === 0) selectionLog = { videoId: "", shown: null };
+    };
+  }, []);
   useEffect(() => {
     if (!videoId) return;
     const { state, event } = nextSelectionLine(selectionLog, {
