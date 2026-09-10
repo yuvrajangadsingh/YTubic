@@ -527,13 +527,20 @@ export function FullscreenPlayer({ onClose }: { onClose: () => void }) {
             )}
           >
             {streamKind === "video" ? (
+              // Backed like the chevron: the frame sits above both scrims,
+              // and where the bottom gradient reaches these labels a white
+              // frame left the title at 1.36:1 and the artist line at
+              // 1.22:1. 65% black (the artwork stage's own scrim) puts the
+              // title and the transport icons at 6.98:1 and the muted
+              // artist and time labels at 4.89:1 over pure white; the
+              // gradient beneath only adds to that.
               <div
                 className={cn(
-                  "relative flex w-[min(44rem,84vw)] min-w-0 flex-col gap-0.5 pb-1 text-center transition-opacity duration-500",
+                  "relative flex w-[min(44rem,84vw)] min-w-0 flex-col gap-0.5 rounded-2xl bg-black/65 px-6 pb-3 pt-4 text-center transition-opacity duration-500",
                   chromeHidden && "pointer-events-none opacity-0",
                 )}
               >
-                <VideoQualityBadge className="absolute -top-1 right-0" />
+                <VideoQualityBadge className="absolute right-3 top-3" />
                 <span className="max-w-full truncate text-xl font-semibold">
                   {track.title}
                 </span>
