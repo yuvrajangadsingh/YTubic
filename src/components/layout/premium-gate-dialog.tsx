@@ -62,7 +62,10 @@ export function PremiumGateDialog() {
   }, [open, premiumOk, setOpen]);
 
   const signedOut = loggedIn.data === false;
-  const fetching = loggedIn.isFetching || premium.isFetching;
+  // The id read is local and quick, but the check cannot start before
+  // it lands, and the dialog called that moment a failure.
+  const fetching =
+    loggedIn.isFetching || activeId.isFetching || premium.isFetching;
   // While the persisted cache restores, every query sits pending and
   // idle: no data, no fetch, no error. That is not a verdict either.
   const restoring = useIsRestoring();
@@ -93,6 +96,7 @@ export function PremiumGateDialog() {
     // Cookie header first or the refetch goes out with the stale one.
     resetInnertube();
     void qc.invalidateQueries({ queryKey: ["auth-logged-in"] });
+    void qc.invalidateQueries({ queryKey: ["active-account-id"] });
     void qc.invalidateQueries({ queryKey: ["premium-status"] });
   };
 
