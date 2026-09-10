@@ -65,6 +65,18 @@ export function describeAuthError(e: unknown): string {
     .slice(0, 200);
 }
 
+/**
+ * A request refused for naming a different account than the credentials
+ * on hand will not pass on retry: the id query is about to re-key the
+ * observer, and the backoff only delays that.
+ */
+function retryUnlessMismatch(failureCount: number, error: unknown): boolean {
+  return (
+    !(error instanceof AuthIdentityMismatchError) &&
+    failureCount < AUTH_RETRY.retry
+  );
+}
+
 function secondsSince(t0: number): string {
   return `${((Date.now() - t0) / 1000).toFixed(1)}s`;
 }
@@ -113,14 +125,26 @@ export const activeAccountIdQuery = {
  * authoritative `is_logged_in === true`: firing it while the credential
  * check is unknown sends an anonymous probe whose anonymous answer then
  * looks like a real sign-out.
+ *
+ * Keyed by, and bound to, the account id, same as `premiumStatusQuery`.
+ * The meta backfill pairs this answer with the active id and hands the
+ * pair to `update_account_meta`, which merges accounts by identity: an
+ * answer fetched for the previous account under the new id was that
+ * command's way of folding the new account into the old one, jar and
+ * all. `undefined` is "not read yet" and holds the query until it is.
  */
-export function accountInfoQuery(enabled: boolean) {
+export function accountInfoQuery(
+  enabled: boolean,
+  accountId: string | null | undefined,
+) {
   return {
-    queryKey: ["account-info"],
-    queryFn: (): Promise<AccountInfo | null> => fetchAccountInfo(),
-    enabled,
+    queryKey: ["account-info", accountId ?? null],
+    queryFn: (): Promise<AccountInfo | null> =>
+      fetchAccountInfo(accountId ?? null),
+    enabled: enabled && accountId !== undefined,
     staleTime: 5 * 60_000,
     ...AUTH_RETRY,
+    retry: retryUnlessMismatch,
   };
 }
 
@@ -182,11 +206,6 @@ export function premiumStatusQuery(
     enabled: enabled && accountId !== undefined,
     staleTime: 30 * 60 * 1000,
     ...AUTH_RETRY,
-    // A request refused for naming a different account than the
-    // credentials on hand will not pass on retry: the id query is about
-    // to re-key this observer, and the backoff only delays that.
-    retry: (failureCount: number, error: unknown) =>
-      !(error instanceof AuthIdentityMismatchError) &&
-      failureCount < AUTH_RETRY.retry,
+    retry: retryUnlessMismatch,
   };
 }

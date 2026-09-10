@@ -79,7 +79,11 @@ import {
   credentialState,
   liveAccountState,
 } from "@/lib/auth-presence";
-import { accountInfoQuery, authLoggedInQuery } from "@/lib/store/auth-queries";
+import {
+  accountInfoQuery,
+  activeAccountIdQuery,
+  authLoggedInQuery,
+} from "@/lib/store/auth-queries";
 import { usePremiumStore } from "@/lib/store/premium";
 import {
   removeAccount,
@@ -463,7 +467,10 @@ function UserProfile() {
   const [confirmSignOut, setConfirmSignOut] = useState(false);
   const loggedIn = useQuery(authLoggedInQuery);
   const credentials = credentialState(loggedIn.data, loggedIn.isError);
-  const account = useQuery(accountInfoQuery(credentials === "authenticated"));
+  const activeId = useQuery(activeAccountIdQuery);
+  const account = useQuery(
+    accountInfoQuery(credentials === "authenticated", activeId.data),
+  );
   const accounts = useAccounts();
   const premiumStatus = usePremiumStore((s) => s.status);
 
