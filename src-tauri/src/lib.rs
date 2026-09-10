@@ -1703,11 +1703,13 @@ impl Drop for ParkKeeperOnReturn {
 /// plain HTTP replay cannot do. Built ONCE and reused; any keeper left
 /// over from a previously-active account is closed first, so at most one
 /// runs at a time. Between refreshes the window stays but its page does
-/// not, see `refresh_account_cookies`. Returns (window, just_created).
+/// not, see `refresh_account_cookies`. Returns the window and, for a
+/// keeper built by this call, the `KEEPER_PAGE_LOADS` baseline its first
+/// load counts against; `None` for a reused one.
 async fn ensure_session_keeper(
     app: &tauri::AppHandle,
     id: &str,
-) -> Result<(tauri::WebviewWindow, bool), String> {
+) -> Result<(tauri::WebviewWindow, Option<u64>), String> {
     if !account_webview_dir(app, id).exists() {
         return Err(format!("no persisted profile for {id}"));
     }
@@ -1720,7 +1722,7 @@ async fn ensure_session_keeper(
         }
     }
     if let Some(win) = app.get_webview_window(&label) {
-        return Ok((win, false));
+        return Ok((win, None));
     }
     let url = "https://music.youtube.com/"
         .parse::<tauri::Url>()
@@ -1728,9 +1730,20 @@ async fn ensure_session_keeper(
     // Activity, see the park. `build` names the webview about to exist:
     // its callbacks carry it, and a park runs only once this build has
     // committed, since wry queues evals until then and a keeper this one
-    // replaces may still report a commit of its own.
-    KEEPER_ACTIVITY.fetch_add(1, Ordering::Relaxed);
-    let build = KEEPER_BUILD_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+    // replaces may still report a commit of its own. Bumped on the main
+    // thread in the same step as the liveness baseline is read: the
+    // replaced keeper's callbacks run there too, so each one either counts
+    // before the baseline or is retired, never in between.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.run_on_main_thread(move || {
+        KEEPER_ACTIVITY.fetch_add(1, Ordering::Relaxed);
+        let build = KEEPER_BUILD_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = tx.send((build, KEEPER_PAGE_LOADS.load(Ordering::Relaxed)));
+    })
+    .map_err(|e| format!("session-keeper main thread: {e}"))?;
+    let (build, loads_before) = rx
+        .await
+        .map_err(|_| "session-keeper main thread went away".to_string())?;
     // Hidden, undecorated, focus-less, off-screen, no taskbar entry. Built
     // once and reused (not re-created every cycle): there is no recurring
     // window creation to flash on screen, and wry activates the app every
@@ -1787,7 +1800,7 @@ async fn ensure_session_keeper(
     // build arms a park like any other activity.
     let page = win.clone();
     let _ = win.run_on_main_thread(move || arm_keeper_park(page));
-    Ok((win, true))
+    Ok((win, Some(loads_before)))
 }
 
 /// Refresh the replayed cookie snapshot for `id` from its live session-
@@ -1834,15 +1847,20 @@ async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOut
         return RefreshOutcome::Deferred(e);
     }
 
-    // Read before the keeper exists, so a just-built one's first load counts.
+    // Read before the keeper is touched, so a load it finishes from here on
+    // counts. A keeper built by this call hands back its own baseline, read
+    // on the main thread in the step that retired the previous keeper's
+    // callbacks, so none of theirs can slip in between.
     let loads_before = KEEPER_PAGE_LOADS.load(Ordering::Relaxed);
-    let (win, created) = match ensure_session_keeper(app, id).await {
+    let (win, built) = match ensure_session_keeper(app, id).await {
         Ok(v) => v,
         Err(e) if session::is_environment_unavailable(&e) => {
             return RefreshOutcome::Deferred(e)
         }
         Err(e) => return RefreshOutcome::Failed(e),
     };
+    let created = built.is_some();
+    let loads_before = built.unwrap_or(loads_before);
     // Returning is activity too, whichever way, see `ParkKeeperOnReturn`.
     let _park_on_return = ParkKeeperOnReturn(win.clone());
     // A reused keeper is reloaded to force fresh authenticated traffic; a
