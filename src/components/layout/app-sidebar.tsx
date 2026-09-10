@@ -23,6 +23,7 @@ import {
   LogOutIcon,
   ExternalLinkIcon,
   CheckIcon,
+  RefreshCwIcon,
 } from "lucide-react";
 import {
   Sidebar,
@@ -415,6 +416,30 @@ function SidebarPlaylists({
               </ContextMenu>
             </SidebarMenuItem>
           ))}
+
+          {/* A failed browse used to be invisible: the rows above read
+              `library.data ?? []`, so a launch before the network was up
+              (Sep 10 2026) showed only Liked songs for eight hours and
+              nothing re-asked. The window-focus refetch covers the usual
+              way back; this row covers the rest and says what happened. */}
+          {library.isError ? (
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                tooltip="Couldn't load playlists"
+                className={MENU_BTN_CLS}
+                onClick={() => void library.refetch()}
+              >
+                <RefreshCwIcon
+                  className={library.isFetching ? "animate-spin" : undefined}
+                />
+                <span>
+                  {library.isFetching
+                    ? "Loading playlists…"
+                    : "Couldn't load playlists. Retry"}
+                </span>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          ) : null}
         </SidebarMenu>
       </SidebarGroupContent>
     </SidebarGroup>
