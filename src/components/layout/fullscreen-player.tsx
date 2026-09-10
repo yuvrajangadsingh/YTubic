@@ -82,7 +82,8 @@ const STAGE_PALETTE = {
   "--muted-foreground": "oklch(0.882 0 0)",
   // The lyrics nudge pill is `bg-surface-active/70`, and light mode's
   // surface is white at 85%: over the dark stage its grey text fell to
-  // 1.23:1. This is the dark theme's value, 8.8:1 for the same text.
+  // 1.23:1. This is the dark theme's value: 8.8:1 for the same text at
+  // full opacity, 5.4:1 through the pill's resting 70% group opacity.
   "--surface-active": "oklch(0 0 0 / 60%)",
 } as CSSProperties;
 
