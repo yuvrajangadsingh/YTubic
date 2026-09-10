@@ -96,8 +96,14 @@ export const activeAccountIdQuery = {
   queryKey: ["active-account-id"],
   queryFn: () => invoke<string | null>("get_active_account_id"),
   staleTime: 30_000,
-  // Local read, same reason as above.
+  // Local read, same reason as above. `networkMode: "always"` also turns
+  // the reconnect refetch off by default, so it is put back here along
+  // with focus: a read that fails answers `null`, which is a success as
+  // far as the cache knows, and would otherwise stand until the next
+  // mount. Both triggers cost one disk read.
   networkMode: "always",
+  refetchOnReconnect: true,
+  refetchOnWindowFocus: true,
 } as const;
 
 /**
