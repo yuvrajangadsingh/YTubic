@@ -120,4 +120,8 @@ describe("selectionKey", () => {
   it("keeps a source that was never asked apart from a miss", () => {
     expect(selectionKey("genius", null, "skipped")).toBe("genius skipped");
   });
+
+  it("keeps a source that failed apart from a miss", () => {
+    expect(selectionKey("genius", null, "failed")).toBe("genius failed");
+  });
 });

@@ -349,7 +349,7 @@ export function nextSelectionLine(
  * per-attempt lines cannot tell.
  */
 /** What the selected provider's query is doing, as far as the log cares. */
-export type SelectedSourceState = "loading" | "settled" | "skipped";
+export type SelectedSourceState = "loading" | "settled" | "skipped" | "failed";
 
 /**
  * The dedup key for what the panel is rendering, "" for nothing.
@@ -361,6 +361,8 @@ export type SelectedSourceState = "loading" | "settled" | "skipped";
  * a switch. "skipped" is the third case: a pinned provider the track gave
  * nothing to search by, which is not a miss and not "no source had"
  * either, since the race may well have a winner the pin is hiding.
+ * "failed" is the fourth: a provider that errored out, a timeout or a
+ * 503, which is not a miss either, and was logged as one.
  */
 export function selectionKey(
   source: LyricsSource | null,
@@ -370,7 +372,7 @@ export function selectionKey(
   if (!source) return "";
   if (lyrics) return `${source} ${lyrics.kind}`;
   if (sourceState === "loading") return "";
-  return `${source} ${sourceState === "settled" ? "none" : "skipped"}`;
+  return `${source} ${sourceState === "settled" ? "none" : sourceState}`;
 }
 
 export function useLyricsSelectionLog(
@@ -379,6 +381,8 @@ export function useLyricsSelectionLog(
   lyrics: Lyrics | null,
   settled: boolean,
   sourceState: SelectedSourceState,
+  /** The providers that errored out, joined, "" for none. */
+  failed: string,
 ): void {
   const shown = selectionKey(source, lyrics, sourceState);
   const hasLyrics = !!lyrics;
@@ -419,7 +423,11 @@ export function useLyricsSelectionLog(
     selectionLog = state;
     if (!event) return;
     if (event === "none") {
-      appLog(`[lyrics] no source had ${videoId}`);
+      // An empty race in which something errored out is not every source
+      // having looked and found nothing; say which ones never answered.
+      appLog(
+        `[lyrics] no source had ${videoId}${failed ? ` (failed: ${failed})` : ""}`,
+      );
     } else if (hasLyrics) {
       appLog(
         event === "first"
@@ -428,8 +436,10 @@ export function useLyricsSelectionLog(
       );
     } else if (sourceState === "skipped") {
       appLog(`[lyrics] ${source} was not asked for ${videoId}`);
+    } else if (sourceState === "failed") {
+      appLog(`[lyrics] ${source} failed for ${videoId}`);
     } else {
       appLog(`[lyrics] ${source} has nothing for ${videoId}`);
     }
-  }, [videoId, shown, settled, source, hasLyrics, sourceState]);
+  }, [videoId, shown, settled, source, hasLyrics, sourceState, failed]);
 }

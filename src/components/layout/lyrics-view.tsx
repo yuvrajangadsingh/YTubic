@@ -239,16 +239,28 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
   const active = activeSource ? (queries[activeSource].data ?? null) : null;
   // Whether the SELECTED provider has answered, which is not the same as
   // the race being over: a pinned provider still loading is not a miss,
-  // and one that was never asked (a track with no artist to search by)
-  // is not a miss either.
+  // one that was never asked (a track with no artist to search by) is
+  // not a miss either, and neither is one that errored out.
   const activeQuery = activeSource ? queries[activeSource] : null;
   const activeState: SelectedSourceState =
-    !activeQuery || activeQuery.isSuccess || activeQuery.isError
+    !activeQuery || activeQuery.isSuccess
       ? "settled"
-      : activeQuery.isEnabled
-        ? "loading"
-        : "skipped";
-  useLyricsSelectionLog(videoId, activeSource, active, settled, activeState);
+      : activeQuery.isError
+        ? "failed"
+        : activeQuery.isEnabled
+          ? "loading"
+          : "skipped";
+  const failedSources = SOURCE_ORDER.filter((s) => queries[s].isError).join(
+    ", ",
+  );
+  useLyricsSelectionLog(
+    videoId,
+    activeSource,
+    active,
+    settled,
+    activeState,
+    failedSources,
+  );
 
   const recordDurationSec =
     active?.kind === "timed" ? active.recordDurationSec : undefined;
