@@ -9,6 +9,7 @@ import {
   normalizeTitleForMatch,
 } from "@/lib/lyrics/match";
 import { cleanTrackTitle, reattributedFromTitle } from "@/lib/track-meta";
+import { LyricsHttpError } from "@/lib/lyrics/errors";
 
 /**
  * LRCLIB (https://lrclib.net) — free, open lyrics database with synced
@@ -142,7 +143,7 @@ async function lrclibGet(
     signal,
   });
   if (r.status === 404) return null;
-  if (!r.ok) throw new Error(`LRCLIB /get ${r.status}`);
+  if (!r.ok) throw new LyricsHttpError(r.status, "LRCLIB /get");
   return (await r.json()) as LrclibRecord;
 }
 
@@ -160,7 +161,7 @@ async function lrclibSearch(
     headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
     signal,
   });
-  if (!r.ok) throw new Error(`LRCLIB /search ${r.status}`);
+  if (!r.ok) throw new LyricsHttpError(r.status, "LRCLIB /search");
   const results = (await r.json()) as LrclibRecord[];
   if (!Array.isArray(results) || results.length === 0) return null;
   // /search is fuzzy and will confidently return a completely different
