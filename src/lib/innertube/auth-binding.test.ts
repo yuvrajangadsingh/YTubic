@@ -67,6 +67,35 @@ describe("innertubePost bound to an account", () => {
     expect(tauriFetch).toHaveBeenCalledTimes(1);
   });
 
+  it("re-reads the context once before refusing", async () => {
+    // The startup dedup can remap ids without an accounts-changed event,
+    // leaving a cached context older than the key that asks.
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(context("A"))
+      .mockResolvedValueOnce(context("B"));
+    vi.mocked(tauriFetch).mockResolvedValue(
+      new Response("{}", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    await expect(
+      innertubePost("account/account_menu", {}, {
+        auth: "required",
+        forAccount: "B",
+      }),
+    ).resolves.toEqual({});
+    expect(tauriFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not send a bound request anonymously when the read fails", async () => {
+    vi.mocked(invoke).mockRejectedValue(new Error("keychain locked"));
+    await expect(
+      innertubePost("browse", {}, { forAccount: "A" }),
+    ).rejects.toThrow(/auth context unavailable/);
+    expect(tauriFetch).not.toHaveBeenCalled();
+  });
+
   it("binds to nothing when no account is named", async () => {
     vi.mocked(invoke).mockResolvedValue(context("A"));
     vi.mocked(tauriFetch).mockResolvedValue(

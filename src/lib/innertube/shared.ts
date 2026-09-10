@@ -280,17 +280,23 @@ export async function authHeaders(
   mode: AuthMode = "optional",
   forAccount?: string | null,
 ): Promise<Record<string, string>> {
+  // A bound request never goes out anonymous: an unreadable context is
+  // an error for it whatever the mode, and so is an anonymous one.
+  const bound = forAccount !== undefined;
   let ctx: AuthContext;
   try {
     ctx = await loadAuthContext();
   } catch (e) {
-    if (mode === "required") throw e;
+    if (mode === "required" || bound) throw e;
     return {};
   }
-  // Checked before the cookie, so a request bound to an account is
-  // refused on an anonymous context too, whatever the mode.
-  if (forAccount !== undefined && ctx.accountId !== forAccount) {
-    throw new AuthIdentityMismatchError();
+  if (bound && ctx.accountId !== forAccount) {
+    // The cache can be older than the key: the startup dedup remaps
+    // account ids with no accounts-changed event to reset it. One fresh
+    // read before refusing, so a mismatch is only ever a live one.
+    resetAuthCache();
+    ctx = await loadAuthContext();
+    if (ctx.accountId !== forAccount) throw new AuthIdentityMismatchError();
   }
   const { cookie, pageId } = ctx;
   if (!cookie) return {};
