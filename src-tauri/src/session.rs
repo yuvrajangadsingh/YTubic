@@ -464,6 +464,13 @@ impl RetryState {
         self.forced_due
     }
 
+    /// The last attempt failed or deferred and nothing has committed since.
+    /// The retry clock itself cannot say this: it is already in the past
+    /// by the time an attempt is allowed.
+    pub fn is_retrying(&self) -> bool {
+        self.failures > 0 || self.defers > 0
+    }
+
     /// Called once an attempt actually starts, so a wake cannot keep forcing
     /// attempts after the one it asked for.
     pub fn on_attempt(&mut self) {

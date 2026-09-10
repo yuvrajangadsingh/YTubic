@@ -529,8 +529,9 @@ async fn write_last_refresh(app: &tauri::AppHandle, id: &str, at: i64) -> Result
 
 /// `refresh-interval-mins` in the app data dir, see
 /// `session::parse_interval_override`. Read every pass of the refresh loop,
-/// so writing or deleting the file lands within a tick and needs no
-/// rebuild; missing or unreadable means the default.
+/// so writing or deleting the file lands on the next pass (after a running
+/// attempt and its tick) and needs no rebuild; missing or unreadable means
+/// the default.
 async fn refresh_interval_secs(app: &tauri::AppHandle) -> i64 {
     let path = app
         .path()
@@ -2156,6 +2157,8 @@ async fn run_refresh_loop(app: tauri::AppHandle) {
 
     loop {
         let now = now_ts();
+        // A change re-rolls the jitter too, so the deadline can move by up
+        // to a minute either way on top of the change itself.
         let wanted = refresh_interval_secs(&app).await;
         if wanted != base {
             eprintln!("[refresh] interval {} min (was {})", wanted / 60, base / 60);
@@ -2212,13 +2215,17 @@ async fn run_refresh_loop(app: tauri::AppHandle) {
                     // one (a wake can pull an attempt forward).
                     let why = if retry.forced_due() {
                         "wake"
-                    } else if retry.next_attempt_at() > 0 {
+                    } else if retry.is_retrying() {
                         "retry"
                     } else {
                         "due"
                     };
+                    // A stamp from the future is a backward clock jump, which
+                    // `due_at` already treats as due; say so rather than
+                    // printing a negative age.
                     let age = match last {
-                        Some(t) => format!("{}m", now.saturating_sub(t) / 60),
+                        Some(t) if t > now => "future".to_string(),
+                        Some(t) => format!("{}m", (now - t) / 60),
                         None => "none".to_string(),
                     };
                     eprintln!(
