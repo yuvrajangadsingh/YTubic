@@ -1,12 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/plugin-http", () => ({ fetch: vi.fn() }));
 vi.mock("@/lib/app-log", () => ({ appLog: vi.fn() }));
 vi.mock("@/lib/innertube/account", () => ({
   fetchPremiumStatus: vi.fn(),
 }));
 
 import { fetchPremiumStatus } from "@/lib/innertube/account";
+import { AuthIdentityMismatchError } from "@/lib/innertube/shared";
 import {
   describeAuthError,
   premiumStatusQuery,
@@ -25,6 +27,22 @@ describe("premiumStatusQuery", () => {
     expect(premiumStatusQuery(true, undefined).enabled).toBe(false);
     expect(premiumStatusQuery(true, null).enabled).toBe(true);
     expect(premiumStatusQuery(false, "acct").enabled).toBe(false);
+  });
+
+  it("asks for the answer bound to the account in its key", async () => {
+    vi.mocked(fetchPremiumStatus).mockResolvedValueOnce("premium");
+    await premiumStatusQuery(true, "acct").queryFn();
+    expect(fetchPremiumStatus).toHaveBeenLastCalledWith("acct");
+    vi.mocked(fetchPremiumStatus).mockResolvedValueOnce("premium");
+    await premiumStatusQuery(true, null).queryFn();
+    expect(fetchPremiumStatus).toHaveBeenLastCalledWith(null);
+  });
+
+  it("does not retry a request refused for naming another account", () => {
+    const { retry } = premiumStatusQuery(true, "acct");
+    expect(retry(0, new AuthIdentityMismatchError())).toBe(false);
+    expect(retry(0, new Error("HTTP 503"))).toBe(true);
+    expect(retry(3, new Error("HTTP 503"))).toBe(false);
   });
 
   it("passes a real verdict through", async () => {
