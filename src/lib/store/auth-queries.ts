@@ -98,12 +98,13 @@ export const activeAccountIdQuery = {
   staleTime: 30_000,
   // Local read, same reason as above. `networkMode: "always"` also turns
   // the reconnect refetch off by default, so it is put back here along
-  // with focus: a read that fails answers `null`, which is a success as
-  // far as the cache knows, and would otherwise stand until the next
-  // mount. Both triggers cost one disk read.
+  // with focus, and both as "always": a read that fails answers `null`,
+  // which is a fresh success as far as the cache knows, so a stale-only
+  // refetch a second later would skip it and it would stand until the
+  // next mount. Each trigger costs one disk read.
   networkMode: "always",
-  refetchOnReconnect: true,
-  refetchOnWindowFocus: true,
+  refetchOnReconnect: "always",
+  refetchOnWindowFocus: "always",
 } as const;
 
 /**
