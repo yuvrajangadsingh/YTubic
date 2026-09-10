@@ -424,14 +424,17 @@ function SidebarPlaylists({
               way back; this row covers the rest and says what happened.
               Gated on a confirmed login because refetch() ignores
               `enabled`, and an anonymous library browse answers with the
-              explore page, which would land in the library cache. While
-              the retry runs the query is pending again, so the row goes
-              away and comes back only if the retry fails too. */}
+              explore page, which would land in the library cache. With no
+              data the retry puts the query back to pending, so the row
+              goes away and comes back only if the retry fails too; with
+              stale data retained the row stays, so it is disabled while
+              a fetch is running rather than restarting it. */}
           {loggedIn.data === true && library.isError ? (
             <SidebarMenuItem>
               <SidebarMenuButton
                 tooltip="Couldn't load playlists"
                 className={MENU_BTN_CLS}
+                disabled={library.isFetching}
                 onClick={() => void library.refetch()}
               >
                 <RefreshCwIcon />
