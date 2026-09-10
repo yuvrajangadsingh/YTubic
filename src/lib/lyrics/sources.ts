@@ -301,6 +301,8 @@ type SelectionLogState = { videoId: string; shown: string | null };
 let selectionLog: SelectionLogState = { videoId: "", shown: null };
 /** Views currently logging; the state above outlives all but the last. */
 let logViews = 0;
+/** The reset waiting on the last view's departure, see the hook. */
+let resetAfterLastView: ReturnType<typeof setTimeout> | undefined;
 
 /** Reset between tests. */
 export function resetLyricsSelectionLog(): void {
@@ -390,9 +392,21 @@ export function useLyricsSelectionLog(
   // made the bar announce its unchanged pick a second time.
   useEffect(() => {
     logViews += 1;
+    if (resetAfterLastView !== undefined) {
+      clearTimeout(resetAfterLastView);
+      resetAfterLastView = undefined;
+    }
     return () => {
       logViews -= 1;
-      if (logViews === 0) selectionLog = { videoId: "", shown: null };
+      if (logViews !== 0) return;
+      // A tick later, not now: StrictMode runs this cleanup and then the
+      // setup again on the same mount, and a reset in between announced
+      // a cached pick twice. A view mounting before the tick cancels
+      // it, and nothing outside StrictMode mounts that fast.
+      resetAfterLastView = setTimeout(() => {
+        resetAfterLastView = undefined;
+        selectionLog = { videoId: "", shown: null };
+      }, 0);
     };
   }, []);
   useEffect(() => {
