@@ -36,19 +36,37 @@ export class LyricsRateLimitError extends Error {
 }
 
 /**
+ * The requests a `LyricsHttpError` can name, in our own words. The
+ * describer prints the entry from this list, never the value it was
+ * handed, so an object wearing the class's prototype cannot get a string
+ * of its own into the log.
+ */
+export const LYRICS_OPS = [
+  "Genius search",
+  "Genius page",
+  "Musixmatch token.get",
+  "Musixmatch track.search",
+  "Musixmatch track.subtitle.get",
+  "Musixmatch track.lyrics.get",
+  "LRCLIB /get",
+  "LRCLIB /search",
+  "YouTube Music browse",
+] as const;
+export type LyricsOp = (typeof LYRICS_OPS)[number];
+
+/**
  * A response status the caller decided is a failure, carrying the number
  * itself rather than a sentence containing it.
  *
- * `op` names the request in our own words ("Genius search"), set at the
- * throw site from a literal. Between them they are everything the log
- * needs, and neither is written by a server, which is the point: reading
- * a status back out of an error message meant reading whatever else the
- * message happened to contain.
+ * `op` names the request, from the list above. Between them they are
+ * everything the log needs, and neither is written by a server, which is
+ * the point: reading a status back out of an error message meant reading
+ * whatever else the message happened to contain.
  */
 export class LyricsHttpError extends Error {
   constructor(
     readonly status: number,
-    readonly op: string,
+    readonly op: LyricsOp,
   ) {
     super(`${op} ${status}`);
     this.name = "LyricsHttpError";
@@ -81,11 +99,12 @@ export class LyricsTimeoutError extends Error {
 export function describeLyricsError(e: unknown): string {
   if (e instanceof LyricsRateLimitError) return "rate limited";
   if (e instanceof LyricsHttpError) {
-    if (!Number.isInteger(e.status)) return "http error";
-    // `op` is a literal at every throw site. Shape-checked anyway, so
-    // that stays true if someone later passes something interpolated.
-    const op = /^[\w ./-]{1,40}$/.test(e.op) ? `${e.op} ` : "";
-    return `${op}HTTP ${e.status}`;
+    // Each property is read once. A getter can answer differently on the
+    // second read, and the value checked has to be the value printed.
+    const { status, op } = e;
+    if (!isHttpStatus(status)) return "http error";
+    const known = LYRICS_OPS.find((ours) => ours === op);
+    return known ? `${known} HTTP ${status}` : `HTTP ${status}`;
   }
   if (e instanceof LyricsTimeoutError) return "timed out";
   if (e instanceof SyntaxError) return "response was not JSON";
@@ -99,6 +118,10 @@ export function describeLyricsError(e: unknown): string {
     return "timed out";
   }
   return "failed";
+}
+
+function isHttpStatus(n: unknown): n is number {
+  return typeof n === "number" && Number.isInteger(n) && n >= 100 && n <= 599;
 }
 
 /** How many times React Query re-runs a failed lyrics query on its own. */
