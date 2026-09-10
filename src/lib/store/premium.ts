@@ -88,26 +88,12 @@ export function usePremiumStatusSync(): void {
   const activeId = useQuery(activeAccountIdQuery);
   const premium = useQuery(premiumStatusQuery(loggedIn.data === true));
 
-  useEffect(() => {
-    // Only an authoritative "signed out" clears the status. `undefined`
-    // covers both "still checking" and "the check failed", and a failed
-    // check must not downgrade a paying user: `null` here shuts off
-    // caching and arms the Premium gate on every track.
-    if (loggedIn.data === false) {
-      appLog("[premium] signed out");
-      // The one event that settles the question. Anything else, a failed
-      // check included, leaves the record to stand its day out.
-      clearPremiumVerdict();
-      usePremiumStore.setState({ status: null, standInUntil: null });
-      return;
-    }
-    if (premium.data === undefined) return;
-    appLog(`[premium] status=${premium.data}`);
-    usePremiumStore.getState().setStatus(premium.data);
-  }, [loggedIn.data, premium.data]);
-
-  // Declared BEFORE the seeding effect so that on the render where the id
-  // flips, the old account's answer is gone by the time seeding looks.
+  // Declared FIRST. On the render where the id flips, the old account's
+  // answer has to be gone before the mirror and the seeding below look,
+  // and the mirror re-runs on the same change (it lists the id as a
+  // dependency), so a live answer that landed ahead of its id is put back
+  // rather than lost. With the mirror ahead of this, the clear ran last
+  // and the store sat on `null` until the next recheck, half an hour on.
   //
   // Signing in to a second account resets the premium QUERY but leaves the
   // store holding the previous account's answer, and the full reset only
@@ -123,6 +109,28 @@ export function usePremiumStatusSync(): void {
     appLog("[premium] active account changed, dropping the held status");
     usePremiumStore.setState({ status: null, standInUntil: null });
   }, [activeId.data]);
+
+  useEffect(() => {
+    // Only an authoritative "signed out" clears the status. `undefined`
+    // covers both "still checking" and "the check failed", and a failed
+    // check must not downgrade a paying user: `null` here shuts off
+    // caching and arms the Premium gate on every track.
+    //
+    // `activeId.data` is a dependency so this re-applies the live answer
+    // after the account-change clear above, which can run in the same
+    // commit as, or after, the answer it clears.
+    if (loggedIn.data === false) {
+      appLog("[premium] signed out");
+      // The one event that settles the question. Anything else, a failed
+      // check included, leaves the record to stand its day out.
+      clearPremiumVerdict();
+      usePremiumStore.setState({ status: null, standInUntil: null });
+      return;
+    }
+    if (premium.data === undefined) return;
+    appLog(`[premium] status=${premium.data}`);
+    usePremiumStore.getState().setStatus(premium.data);
+  }, [loggedIn.data, activeId.data, premium.data]);
 
   // Record every live answer against the account it was asked about, at
   // the time the answer actually landed. Keyed on `dataUpdatedAt` and not
