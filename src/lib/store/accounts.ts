@@ -109,6 +109,10 @@ export function useLoginSuccessListener(): void {
       // Left in the cache it would be paired with the new id and stored
       // as that account's answer, where it would stand for a day.
       void qc.resetQueries({ queryKey: ["premium-status"] });
+      // The store holds that same verdict, and nothing clears it until
+      // the new id lands. A slow id read left the previous account's
+      // Premium active, with no deadline, for as long as the read took.
+      usePremiumStore.setState({ status: null, standInUntil: null });
       // A Google account can hold several YouTube channels, and the
       // library/likes belong to the channel rather than the account.
       // Right after a fresh sign-in is the moment to offer the choice,
@@ -201,7 +205,7 @@ export function useAccountsChangedListener(): void {
       //    per-track Song↔Video preferences, cached Premium status.
       useSearchHistory.getState().clear();
       useTrackSourceStore.setState({ byVideoId: {} });
-      usePremiumStore.setState({ status: null });
+      usePremiumStore.setState({ status: null, standInUntil: null });
 
       // 4. In-memory caches that wrap network state.
       resetInnertube();
