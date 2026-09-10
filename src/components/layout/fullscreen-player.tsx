@@ -73,13 +73,17 @@ const FULLSCREEN_LYRICS_VIEWPORT_RATIO = 0.22;
  * white cover under the old 30% scrim it measured 1.23:1, and the title
  * itself only 2.02:1 (Chaar Diwaari, "Banda Kaam Ka", which is a white
  * sleeve). #D9D9D9 against the stage the 65% scrim now produces measures
- * 4.93:1, and 4.34:1 if the noise layer above it is treated as solid
+ * 4.89:1, and 4.31:1 if the noise layer above it is treated as solid
  * white rather than the +-5/255 dither it is.
  */
 const STAGE_PALETTE = {
   "--background": "oklch(0.145 0 0)",
   "--foreground": "oklch(0.985 0 0)",
   "--muted-foreground": "oklch(0.882 0 0)",
+  // The lyrics nudge pill is `bg-surface-active/70`, and light mode's
+  // surface is white at 85%: over the dark stage its grey text fell to
+  // 1.23:1. This is the dark theme's value, 8.8:1 for the same text.
+  "--surface-active": "oklch(0 0 0 / 60%)",
 } as CSSProperties;
 
 function AmbientBackdrop({
@@ -410,8 +414,13 @@ export function FullscreenPlayer({ onClose }: { onClose: () => void }) {
         animate={{ opacity: 1 }}
         transition={{ duration: 0.18, ease: "easeOut" }}
         style={{ ...accentStyle, ...STAGE_PALETTE }}
+        // text-foreground is not redundant with the palette: the title,
+        // the transport icons and the chevron inherit the body's colour,
+        // which the theme has already resolved by the time it reaches
+        // them, so the token override alone left them near-black in
+        // light mode (2.84:1 over a white sleeve).
         className={cn(
-          "fixed inset-0 z-50 flex flex-col overflow-hidden bg-background",
+          "fixed inset-0 z-50 flex flex-col overflow-hidden bg-background text-foreground",
           chromeHidden && "cursor-none",
         )}
         role="dialog"
