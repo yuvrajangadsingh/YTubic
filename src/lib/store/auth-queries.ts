@@ -1,3 +1,5 @@
+import { useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import { appLog } from "@/lib/app-log";
 import {
@@ -68,7 +70,8 @@ export function describeAuthError(e: unknown): string {
 /**
  * A request refused for naming a different account than the credentials
  * on hand will not pass on retry: the id query is about to re-key the
- * observer, and the backoff only delays that.
+ * observer (or is re-read on the refusal, see
+ * `useRereadActiveIdOnMismatch`), and the backoff only delays that.
  */
 function retryUnlessMismatch(failureCount: number, error: unknown): boolean {
   return (
@@ -119,6 +122,22 @@ export const activeAccountIdQuery = {
   refetchOnReconnect: "always",
   refetchOnWindowFocus: "always",
 } as const;
+
+/**
+ * A request refused for naming a different account than the jar's means
+ * the key's id is behind the jar's. Usually the id query is already
+ * re-reading (a switch, a sign-in); the exception is the startup dedup,
+ * which remaps ids on disk without an accounts-changed event, and a key
+ * read before it stayed wrong until the next focus or reconnect. Re-read
+ * on the refusal itself; the observers re-key from there.
+ */
+export function useRereadActiveIdOnMismatch(error: unknown): void {
+  const qc = useQueryClient();
+  useEffect(() => {
+    if (!(error instanceof AuthIdentityMismatchError)) return;
+    void qc.invalidateQueries({ queryKey: ["active-account-id"] });
+  }, [error, qc]);
+}
 
 /**
  * The signed-in identity, straight from `/account_menu`. Gate it on an

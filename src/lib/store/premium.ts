@@ -8,6 +8,7 @@ import {
   authLoggedInQuery,
   describeAuthError,
   premiumStatusQuery,
+  useRereadActiveIdOnMismatch,
 } from "@/lib/store/auth-queries";
 import {
   clearPremiumVerdict,
@@ -89,6 +90,7 @@ export function usePremiumStatusSync(): void {
   const premium = useQuery(
     premiumStatusQuery(loggedIn.data === true, activeId.data),
   );
+  useRereadActiveIdOnMismatch(premium.error);
 
   // Declared FIRST. On the render where the id flips, the old account's
   // answer has to be gone before the mirror and the seeding below look,
