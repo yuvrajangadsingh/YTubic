@@ -9,6 +9,7 @@ import {
   accountInfoQuery,
   activeAccountIdQuery,
   authLoggedInQuery,
+  useRereadActiveIdOnMismatch,
 } from "@/lib/store/auth-queries";
 import { clearPrefetchMemo } from "@/lib/stream";
 import { openChannelPicker } from "@/lib/store/channel-picker";
@@ -263,6 +264,7 @@ export function useAccountMetaBackfill(): void {
   const account = useQuery(
     accountInfoQuery(loggedIn.data === true, activeId.data),
   );
+  useRereadActiveIdOnMismatch(account.error);
 
   const id = activeId.data ?? null;
   const name = account.data?.name ?? "";
