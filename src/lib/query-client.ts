@@ -10,14 +10,19 @@ export const queryClient = new QueryClient({
       retry: 1,
       // Off for anything that has data: a fresh answer is left alone and a
       // stale one waits for its own staleTime, same as before. On for a
-      // query that FAILED, because nothing else ever re-asks. The app
+      // query that FAILED with nothing to show, because nothing else ever
+      // re-asks. Status alone is not enough: a failed refetch also marks
+      // retained data invalidated, so it would re-ask a query that is
+      // still showing yesterday's answer, every page of an infinite one;
+      // those have their own Retry buttons. The app
       // auto-launches at login, before Wi-Fi is up, so every request in
       // the first ~25 seconds fails instantly and would otherwise stay
       // failed for the whole session: on Sep 10 2026 the home feed and
       // the sidebar playlists sat in that state for eight hours while the
       // premium check, which has its own focus refetch, recovered in 24s.
       // "Focus" here is the Tauri window event, see query-focus.ts.
-      refetchOnWindowFocus: (query) => query.state.status === "error",
+      refetchOnWindowFocus: (query) =>
+        query.state.status === "error" && query.state.data === undefined,
     },
   },
 });
