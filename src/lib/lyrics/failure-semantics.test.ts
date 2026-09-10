@@ -346,6 +346,24 @@ describe("describeLyricsError", () => {
     expect(LYRICS_OPS[0]).toBe("Genius search");
   });
 
+  it("does not consult an Array.prototype.find a getter swapped in", () => {
+    // Freezing the list protects its entries, not the methods it inherits.
+    const original = Array.prototype.find;
+    const hostile = Object.create(LyricsHttpError.prototype) as LyricsHttpError;
+    Object.defineProperty(hostile, "status", { get: () => 503 });
+    Object.defineProperty(hostile, "op", {
+      get: () => {
+        Reflect.set(Array.prototype, "find", () => "secretToken");
+        return "secretToken";
+      },
+    });
+    try {
+      expect(describeLyricsError(hostile)).toBe("HTTP 503");
+    } finally {
+      Reflect.set(Array.prototype, "find", original);
+    }
+  });
+
   it("names the status of a failed YouTube Music hop, nothing else", () => {
     const e = new InnerTubeHttpError("next", 503, "secretToken in the body");
     expect(describeLyricsError(e)).toBe("YouTube Music HTTP 503");

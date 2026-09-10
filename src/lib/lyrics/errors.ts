@@ -107,7 +107,13 @@ export function describeLyricsError(e: unknown): string {
     // second read, and the value checked has to be the value printed.
     const { status, op } = e;
     if (!isHttpStatus(status)) return "http error";
-    const known = LYRICS_OPS.find((ours) => ours === op);
+    // An indexed loop, not `find`: the list is frozen, but a getter that
+    // ran during the read above could have swapped Array.prototype.find,
+    // and a frozen array still inherits its methods.
+    let known: LyricsOp | undefined;
+    for (let i = 0; i < LYRICS_OPS.length; i++) {
+      if (LYRICS_OPS[i] === op) known = LYRICS_OPS[i];
+    }
     return known ? `${known} HTTP ${status}` : `HTTP ${status}`;
   }
   if (e instanceof LyricsTimeoutError) return "timed out";
