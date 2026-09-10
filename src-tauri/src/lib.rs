@@ -2692,29 +2692,43 @@ struct AuthContext {
     cookie: String,
     #[serde(rename = "pageId")]
     page_id: Option<String>,
+    /// The account the cookie and page id were read for, `None` when the
+    /// context is anonymous. What lets a caller bind an answer to an
+    /// account rather than to whoever was active when the jar was read.
+    #[serde(rename = "accountId")]
+    account_id: Option<String>,
 }
 
 #[tauri::command]
 async fn get_auth_context(app: tauri::AppHandle, host: String) -> Result<AuthContext, String> {
+    let anonymous = || AuthContext { cookie: String::new(), page_id: None, account_id: None };
+    // One index read for the id, the jar and the page id. Read twice, an
+    // account switch between the reads paired one account's cookies with
+    // another's channel, or with another's id.
+    let idx = match read_index_checked(&app).await {
+        IndexRead::Loaded(idx) => idx,
+        IndexRead::Absent => return Ok(anonymous()),
+        IndexRead::Corrupt(e) | IndexRead::Unavailable(e) => {
+            return Err(format!("auth unavailable: {e}"))
+        }
+    };
+    let Some(id) = idx.active.clone() else {
+        return Ok(anonymous());
+    };
     // Reject rather than hand back an empty context when the jar exists but
     // cannot be read: an empty context means "this user is anonymous", and
     // the caller caches it. One dark-wake keychain miss used to make every
     // InnerTube request for the next five minutes go out signed out.
-    let cookie = match read_active_jar(&app).await {
+    let cookie = match read_jar(&app, &id).await {
         JarRead::Loaded(jar) => session::cookie_header(&jar, &host, session::INNERTUBE_PATH, now_ts()),
         JarRead::Absent => String::new(),
         JarRead::Unavailable(e) => return Err(format!("auth unavailable: {e}")),
     };
-    let page_id = if cookie.is_empty() {
-        None
-    } else {
-        let idx = read_index(&app).await;
-        idx.accounts
-            .iter()
-            .find(|a| idx.active.as_deref() == Some(a.id.as_str()))
-            .and_then(|a| a.page_id.clone())
-    };
-    Ok(AuthContext { cookie, page_id })
+    if cookie.is_empty() {
+        return Ok(anonymous());
+    }
+    let page_id = idx.accounts.iter().find(|a| a.id == id).and_then(|a| a.page_id.clone());
+    Ok(AuthContext { cookie, page_id, account_id: Some(id) })
 }
 
 /// Singleflight for cookie-refresh runs, so the periodic timer and a manual

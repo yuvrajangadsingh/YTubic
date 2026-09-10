@@ -100,9 +100,14 @@ async function sha1Hex(text: string): Promise<string> {
  * Cookie header plus the active brand-channel page id, as one unit.
  * They describe the same identity, so caching them separately could
  * pair fresh cookies with a stale channel (or vice versa) across a
- * sign-in or a channel switch.
+ * sign-in or a channel switch. `accountId` names that identity, null
+ * for an anonymous context, so a caller can insist on it.
  */
-type AuthContext = { cookie: string; pageId: string | null };
+type AuthContext = {
+  cookie: string;
+  pageId: string | null;
+  accountId: string | null;
+};
 
 /**
  * The auth context could not be read at all: the login keychain was
@@ -122,6 +127,22 @@ export class AuthUnavailableError extends Error {
     super(`auth context unavailable: ${String(reason)}`);
     this.name = "AuthUnavailableError";
     this.reason = reason;
+  }
+}
+
+/**
+ * The request was for one account and the credentials on hand are for
+ * another. Raised before anything is sent: the caller asked for an
+ * answer bound to an account, and an answer fetched with the wrong
+ * cookies would be cached and recorded under that account's name. This
+ * is the gap between an account switch or a sign-in and the queries
+ * re-keying to the new id, where a refetch under the old key goes out
+ * with the new jar.
+ */
+export class AuthIdentityMismatchError extends Error {
+  constructor() {
+    super("credentials on hand are for a different account");
+    this.name = "AuthIdentityMismatchError";
   }
 }
 
@@ -257,6 +278,7 @@ export async function captureSetCookies(res: Response): Promise<void> {
  */
 export async function authHeaders(
   mode: AuthMode = "optional",
+  forAccount?: string | null,
 ): Promise<Record<string, string>> {
   let ctx: AuthContext;
   try {
@@ -264,6 +286,11 @@ export async function authHeaders(
   } catch (e) {
     if (mode === "required") throw e;
     return {};
+  }
+  // Checked before the cookie, so a request bound to an account is
+  // refused on an anonymous context too, whatever the mode.
+  if (forAccount !== undefined && ctx.accountId !== forAccount) {
+    throw new AuthIdentityMismatchError();
   }
   const { cookie, pageId } = ctx;
   if (!cookie) return {};
@@ -283,14 +310,22 @@ export async function authHeaders(
 export async function innertubePost(
   endpoint: string,
   body: Record<string, unknown>,
-  opts: { auth?: AuthMode } = {},
+  opts: {
+    auth?: AuthMode;
+    /**
+     * Bind the request to this account (null: to no account). Sent only
+     * with that account's credentials, otherwise it fails with
+     * `AuthIdentityMismatchError` before anything goes out.
+     */
+    forAccount?: string | null;
+  } = {},
 ): Promise<YtNode> {
   // `endpoint` may already carry query params (reload continuations are
   // passed as `browse?ctoken=…` — the server ignores them in the body).
   const url = `https://music.youtube.com/youtubei/v1/${endpoint}${
     endpoint.includes("?") ? "&" : "?"
   }prettyPrint=false`;
-  const auth = await authHeaders(opts.auth);
+  const auth = await authHeaders(opts.auth, opts.forAccount);
   const visitor = loadVisitorData();
   const visitorHeader: Record<string, string> = visitor
     ? { "X-Goog-Visitor-Id": visitor }
