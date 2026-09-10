@@ -421,22 +421,21 @@ function SidebarPlaylists({
               `library.data ?? []`, so a launch before the network was up
               (Sep 10 2026) showed only Liked songs for eight hours and
               nothing re-asked. The window-focus refetch covers the usual
-              way back; this row covers the rest and says what happened. */}
-          {library.isError ? (
+              way back; this row covers the rest and says what happened.
+              Gated on a confirmed login because refetch() ignores
+              `enabled`, and an anonymous library browse answers with the
+              explore page, which would land in the library cache. While
+              the retry runs the query is pending again, so the row goes
+              away and comes back only if the retry fails too. */}
+          {loggedIn.data === true && library.isError ? (
             <SidebarMenuItem>
               <SidebarMenuButton
                 tooltip="Couldn't load playlists"
                 className={MENU_BTN_CLS}
                 onClick={() => void library.refetch()}
               >
-                <RefreshCwIcon
-                  className={library.isFetching ? "animate-spin" : undefined}
-                />
-                <span>
-                  {library.isFetching
-                    ? "Loading playlists…"
-                    : "Couldn't load playlists. Retry"}
-                </span>
+                <RefreshCwIcon />
+                <span>Couldn't load playlists. Retry</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
           ) : null}
