@@ -1653,10 +1653,11 @@ static KEEPER_COMMITTED_GEN: AtomicU64 = AtomicU64::new(0);
 /// retries on the next.
 const KEEPER_PARK_AFTER: Duration = Duration::from_secs(45);
 
-/// Blank the keeper's page `KEEPER_PARK_AFTER` from now unless something
-/// else happens to it first, see `KEEPER_ACTIVITY`. Main thread only: the
-/// activity counter is written there, and the check and the `eval` run
-/// there as one step, so nothing can land between them. The page checks
+/// Ask the keeper to blank its page `KEEPER_PARK_AFTER` from now unless
+/// something else happens to it first, see `KEEPER_ACTIVITY`. Main thread
+/// only: the activity counter is written there, so the check and the
+/// submission of the `eval` are one step. The script itself runs when
+/// WebKit gets to it, and nothing confirms that it did. The page checks
 /// itself before replacing, so a park landing on about:blank does nothing
 /// and the parked page's own events do not re-park forever. `replace` so
 /// the parked page gets no history entry of its own; the entries before
