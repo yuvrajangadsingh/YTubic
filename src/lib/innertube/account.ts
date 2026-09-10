@@ -84,11 +84,17 @@ export async function fetchAccountInfo(): Promise<AccountInfo | null> {
  * when the call fails: `null` opens the Premium gate on every track, so
  * a dropped connection must not be able to produce it.
  */
-export async function fetchPremiumStatus(): Promise<PremiumStatus> {
+/**
+ * `forAccount` binds the answer to an account: the request is only sent
+ * with that account's credentials, see `innertubePost`.
+ */
+export async function fetchPremiumStatus(
+  forAccount?: string | null,
+): Promise<PremiumStatus> {
   const json: YtNode = await innertubePost(
     "account/account_menu",
     {},
-    { auth: "required" },
+    { auth: "required", forAccount },
   );
 
   const popup: YtNode | undefined =

@@ -6,6 +6,7 @@ import {
   type AccountInfo,
   type PremiumStatus,
 } from "@/lib/innertube/account";
+import { AuthIdentityMismatchError } from "@/lib/innertube/shared";
 
 /**
  * One definition per auth query, shared by every screen that mounts it.
@@ -151,14 +152,18 @@ export function premiumStatusQuery(
     // an account switch left the previous account's verdict in the cache
     // under the new id until the full reset landed, and the record on
     // disk was written from that pairing. `undefined` is "not read yet"
-    // and holds the query until it is.
+    // and holds the query until it is. The key alone does not bind the
+    // request, though: the credentials come from one shared cache, and
+    // in the gap after a switch a refetch under the old key went out
+    // with the new jar. So the fetch is told the account too, and
+    // refuses any other.
     queryKey: ["premium-status", accountId ?? null],
     queryFn: async (): Promise<PremiumStatus> => {
       const t0 = Date.now();
       appLog("[premium] check start");
       let status: PremiumStatus;
       try {
-        status = await fetchPremiumStatus();
+        status = await fetchPremiumStatus(accountId ?? null);
       } catch (e) {
         appLog(
           `[premium] check failed in ${secondsSince(t0)}: ${describeAuthError(e)}`,
@@ -177,5 +182,11 @@ export function premiumStatusQuery(
     enabled: enabled && accountId !== undefined,
     staleTime: 30 * 60 * 1000,
     ...AUTH_RETRY,
+    // A request refused for naming a different account than the
+    // credentials on hand will not pass on retry: the id query is about
+    // to re-key this observer, and the backoff only delays that.
+    retry: (failureCount: number, error: unknown) =>
+      !(error instanceof AuthIdentityMismatchError) &&
+      failureCount < AUTH_RETRY.retry,
   };
 }
