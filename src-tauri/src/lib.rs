@@ -2149,6 +2149,10 @@ async fn run_refresh_loop(app: tauri::AppHandle) {
     let mut retry = session::RetryState::default();
     let mut base = session::REFRESH_INTERVAL_SECS;
     let mut interval = base + session::jitter(session::REFRESH_JITTER_SECS, jitter_seed());
+    // The success stamp the last attempt saw. A stamp that has moved since
+    // is a commit this loop did not make (the manual refresh command), and
+    // an attempt after one is on schedule, whatever the retry counters say.
+    let mut stamp_at_last_attempt: Option<i64> = None;
     // Both conditions can hold for hours, so they log the transition and
     // then stay quiet.
     let mut warned_profileless: Option<String> = None;
@@ -2158,7 +2162,7 @@ async fn run_refresh_loop(app: tauri::AppHandle) {
     loop {
         let now = now_ts();
         // A change re-rolls the jitter too, so the deadline can move by up
-        // to a minute either way on top of the change itself.
+        // to two minutes either way on top of the change itself.
         let wanted = refresh_interval_secs(&app).await;
         if wanted != base {
             eprintln!("[refresh] interval {} min (was {})", wanted / 60, base / 60);
@@ -2215,17 +2219,19 @@ async fn run_refresh_loop(app: tauri::AppHandle) {
                     // one (a wake can pull an attempt forward).
                     let why = if retry.forced_due() {
                         "wake"
-                    } else if retry.is_retrying() {
+                    } else if retry.is_retrying() && last == stamp_at_last_attempt {
                         "retry"
                     } else {
                         "due"
                     };
+                    stamp_at_last_attempt = last;
                     // A stamp from the future is a backward clock jump, which
                     // `due_at` already treats as due; say so rather than
-                    // printing a negative age.
+                    // printing a negative age. Saturating: the stamp is
+                    // whatever parsed from the file.
                     let age = match last {
                         Some(t) if t > now => "future".to_string(),
-                        Some(t) => format!("{}m", (now - t) / 60),
+                        Some(t) => format!("{}m", now.saturating_sub(t) / 60),
                         None => "none".to_string(),
                     };
                     eprintln!(
