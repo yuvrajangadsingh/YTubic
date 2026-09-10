@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   describeLyricsError,
+  LyricsHttpError,
   LyricsRateLimitError,
+  LyricsTimeoutError,
   shouldRetryLyricsQuery,
 } from "./errors";
 
@@ -211,13 +213,23 @@ describe("a real answer is still an answer", () => {
  * bodies, and the app log is a file on disk, so the body has to go.
  */
 describe("describeLyricsError", () => {
-  it("keeps the status and nothing else", () => {
+  it("names the request and the status from our own typed error", () => {
+    expect(
+      describeLyricsError(new LyricsHttpError(503, "Musixmatch token.get")),
+    ).toBe("Musixmatch token.get HTTP 503");
+    expect(describeLyricsError(new LyricsHttpError(404, "LRCLIB /get"))).toBe(
+      "LRCLIB /get HTTP 404",
+    );
+  });
+
+  // The old scrubber read a status back out of message text, and with it
+  // whatever else the text held. A plain Error is now opaque on purpose.
+  it("does not read a status out of a plain message", () => {
     expect(
       describeLyricsError(
         new Error("Musixmatch HTTP 503: <html>upstream said no</html>"),
       ),
-    ).toBe("HTTP 503");
-    expect(describeLyricsError(new Error("LRCLIB /get 404"))).toBe("HTTP 404");
+    ).toBe("failed");
   });
 
   it("names a rate limit without quoting the token", () => {
@@ -226,6 +238,13 @@ describe("describeLyricsError", () => {
         new LyricsRateLimitError("Musixmatch token UpgradeOnly_abc123"),
       ),
     ).toBe("rate limited");
+  });
+
+  it("names a timeout from our own type and from AbortSignal.timeout", () => {
+    expect(describeLyricsError(new LyricsTimeoutError())).toBe("timed out");
+    expect(
+      describeLyricsError(new DOMException("took too long", "TimeoutError")),
+    ).toBe("timed out");
   });
 
   it("never quotes the body a JSON parse choked on", () => {
@@ -240,23 +259,12 @@ describe("describeLyricsError", () => {
     expect(describeLyricsError(parsed)).toBe("response was not JSON");
   });
 
-  // A provider that re-wraps its parse failure, or one thrown in another
-  // realm, is not an `instanceof SyntaxError` here.
-  it("catches a parse failure that is not a SyntaxError instance", () => {
-    expect(
-      describeLyricsError(
-        new Error(
-          "Unexpected token 's', \"sessionToken_abc123\" is not valid JSON",
-        ),
-      ),
-    ).toBe("response was not JSON");
-  });
-
   /**
-   * The reason this is a whitelist. Every one of these walked through a
-   * redact-the-bad-parts version: credentials in a URL authority, an IPv6
-   * host (the bracket ends the host, so the query survived), a data: URL,
-   * and a body quoted before the status rather than after it.
+   * Why this is a classifier and not a scrubber. Every one of these walked
+   * through a redact-the-bad-parts version: credentials in a URL authority,
+   * an IPv6 host, a data: payload, a body quoted before the status, a bare
+   * token, an address, and a message that merely looked like a parse error.
+   * None of them is a type we throw, so none of them is described.
    */
   it.each([
     [
@@ -275,26 +283,28 @@ describe("describeLyricsError", () => {
     ],
     ["a bare token", "rejected token sk_live_secretToken0123456789"],
     ["an address", "Genius rejected signup for nobody@example.com"],
-  ])("quotes nothing from %s", (_what, message) => {
-    const line = describeLyricsError(new Error(message));
-    expect(line).not.toMatch(/secret/i);
-    expect(line).not.toContain("@");
-    expect(line).not.toContain("nobody");
+    [
+      "a parse-shaped message",
+      "Unexpected token 's', \"secretToken\" is not valid JSON",
+    ],
+  ])("says only 'failed' for %s", (_what, message) => {
+    expect(describeLyricsError(new Error(message))).toBe("failed");
+  });
+
+  it("copies nothing from an error's own name or class", () => {
+    class ProviderGone extends Error {
+      override name = "secretToken in the name";
+    }
+    expect(describeLyricsError(new ProviderGone("host down at 10.0.0.4"))).toBe(
+      "failed",
+    );
+    const lying = new LyricsHttpError(500, "https://x/?usertoken=secret");
+    expect(describeLyricsError(lying)).toBe("HTTP 500");
   });
 
   it("stays cheap on a long message", () => {
     const started = Date.now();
     describeLyricsError(new Error("x".repeat(64 * 1024)));
     expect(Date.now() - started).toBeLessThan(50);
-  });
-
-  it("falls back to the error class, never the message", () => {
-    class ProviderGone extends Error {
-      override name = "ProviderGone";
-    }
-    expect(describeLyricsError(new ProviderGone("host down at 10.0.0.4"))).toBe(
-      "ProviderGone",
-    );
-    expect(describeLyricsError(new Error("something odd"))).toBe("failed");
   });
 });

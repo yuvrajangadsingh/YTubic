@@ -36,47 +36,69 @@ export class LyricsRateLimitError extends Error {
 }
 
 /**
+ * A response status the caller decided is a failure, carrying the number
+ * itself rather than a sentence containing it.
+ *
+ * `op` names the request in our own words ("Genius search"), set at the
+ * throw site from a literal. Between them they are everything the log
+ * needs, and neither is written by a server, which is the point: reading
+ * a status back out of an error message meant reading whatever else the
+ * message happened to contain.
+ */
+export class LyricsHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly op: string,
+  ) {
+    super(`${op} ${status}`);
+    this.name = "LyricsHttpError";
+  }
+}
+
+/** The provider chain ran past its budget. */
+export class LyricsTimeoutError extends Error {
+  constructor() {
+    super("lyrics fetch timed out");
+    this.name = "LyricsTimeoutError";
+  }
+}
+
+/**
  * What a failed lyrics fetch may put in the app log.
  *
- * A whitelist, not a scrub. Everything an error carries past its own class
- * was written by somebody else: a slice of response body, the URL the
- * transport was handed (which holds the search terms and, on Musixmatch,
- * the signed token), whatever a library decided to quote. Redacting that
- * is a losing game; credentials in a URL authority, IPv6 hosts, data:
- * payloads and bare tokens all walked through an earlier version of this.
+ * Classification only. Nothing here reads a message, a URL or an error
+ * name, because all three are written by somebody else: a slice of
+ * response body, the address the transport was handed (which holds the
+ * search terms and, on Musixmatch, the signed token), a `name` any object
+ * can set. Two earlier versions of this tried to redact the dangerous
+ * parts and both leaked, the second through a trailing three-digit number
+ * it read as a status and through the error's own name.
  *
- * So the output vocabulary is fixed and nothing from the message is ever
- * copied into it. The provider's name is already on the log line the
- * caller writes, so all this has to add is what went wrong.
+ * So the facts come from types we throw ourselves. A provider we do not
+ * recognise is "failed", and that is the honest answer: we do not know
+ * what it said and we are not going to quote it to find out.
  */
 export function describeLyricsError(e: unknown): string {
   if (e instanceof LyricsRateLimitError) return "rate limited";
+  if (e instanceof LyricsHttpError) {
+    if (!Number.isInteger(e.status)) return "http error";
+    // `op` is a literal at every throw site. Shape-checked anyway, so
+    // that stays true if someone later passes something interpolated.
+    const op = /^[\w ./-]{1,40}$/.test(e.op) ? `${e.op} ` : "";
+    return `${op}HTTP ${e.status}`;
+  }
+  if (e instanceof LyricsTimeoutError) return "timed out";
   if (e instanceof SyntaxError) return "response was not JSON";
-  // Bound the input before any pattern touches it. An error can carry a
-  // whole error page, and this runs on the renderer thread.
-  const msg = (e instanceof Error ? e.message : String(e)).slice(0, 200);
+  // AbortSignal.timeout rejects with a DOMException whose name is
+  // spec-defined and read-only. Comparing it copies nothing.
   if (
-    /JSON Parse error|in JSON at position|Unexpected (token|identifier)|not valid JSON/i.test(
-      msg,
-    )
+    typeof DOMException !== "undefined" &&
+    e instanceof DOMException &&
+    (e.name === "TimeoutError" || e.name === "AbortError")
   ) {
-    return "response was not JSON";
+    return "timed out";
   }
-  if (/abort|timed?\s?out/i.test(msg)) return "timed out";
-  // Our own throws end in the status ("LRCLIB /get 404"); anything else
-  // has to say HTTP for it to count, so a three-digit number inside a
-  // body cannot be mistaken for one.
-  const trailing = /\b([45]\d{2})\s*$/.exec(msg);
-  if (trailing) return `HTTP ${trailing[1]}`;
-  const labelled = /\bHTTP\s+([1-5]\d{2})\b/i.exec(msg);
-  if (labelled) return `HTTP ${labelled[1]}`;
-  if (/error sending request|failed to fetch|network|connect/i.test(msg)) {
-    return "network error";
-  }
-  // The class name is written by our code or a runtime, never by a
-  // server. Still bounded, in case something exotic sets its own.
-  const name = e instanceof Error ? e.name : "";
-  return /^[A-Za-z]{1,40}$/.test(name) && name !== "Error" ? name : "failed";
+  return "failed";
 }
 
 /** How many times React Query re-runs a failed lyrics query on its own. */
