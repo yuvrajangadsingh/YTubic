@@ -1613,13 +1613,27 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
 /// provisional navigation never reaches.
 static KEEPER_PAGE_LOADS: AtomicU64 = AtomicU64::new(0);
 
+/// Closes the wrapped window when dropped. macOS only: see
+/// `refresh_account_cookies` for why the keeper is not kept open there.
+#[cfg(target_os = "macos")]
+struct CloseOnDrop(tauri::WebviewWindow);
+
+#[cfg(target_os = "macos")]
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.close();
+    }
+}
+
 /// The live "session-keeper" WebView for `id`: a hidden window on
 /// music.youtube.com that reuses the account's persisted profile. As a
 /// real browser engine it stays authenticated from the stored session and
 /// keeps the server-side session (and its rotating cookies) warm, which
-/// plain HTTP replay cannot do. Built ONCE and reused; any keeper left
-/// over from a previously-active account is closed first, so at most one
-/// runs at a time. Returns (window, just_created).
+/// plain HTTP replay cannot do. Reused if one is already open; any keeper
+/// left over from a previously-active account is closed first, so at most
+/// one runs at a time. Whether a keeper stays open between refreshes is
+/// per platform, see `refresh_account_cookies`. Returns (window,
+/// just_created).
 async fn ensure_session_keeper(
     app: &tauri::AppHandle,
     id: &str,
@@ -1641,13 +1655,14 @@ async fn ensure_session_keeper(
     let url = "https://music.youtube.com/"
         .parse::<tauri::Url>()
         .map_err(|e| e.to_string())?;
-    // Hidden, undecorated, focus-less, off-screen, no taskbar entry. Built
-    // once and reused (not re-created every cycle), so there is no recurring
-    // window creation to flash on screen; the window-state plugin is told to
-    // never restore keeper windows (see `with_filter` in `run`), so a saved
-    // "visible" state can't drag it back on-screen next launch either. The
-    // webview still loads and keeps the session alive regardless of
-    // visibility or position.
+    // Hidden, undecorated, focus-less, off-screen, no taskbar entry. On
+    // Windows it is built once and reused (not re-created every cycle), so
+    // there is no recurring window creation for WebView2 to flash on screen;
+    // on macOS it is closed after each capture and this builder runs again
+    // next time. The window-state plugin is told to never restore keeper
+    // windows (see `with_filter` in `run`), so a saved "visible" state can't
+    // drag it back on-screen next launch either. The webview still loads and
+    // keeps the session alive regardless of visibility or position.
     let win = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
         .title("YTubic session keeper")
         .visible(false)
@@ -1678,8 +1693,17 @@ async fn ensure_session_keeper(
 /// Refresh the replayed cookie snapshot for `id` from its live session-
 /// keeper WebView. Reloads the keeper to force fresh authenticated
 /// requests (which renews the session and rotates its short-lived
-/// cookies), reads the full cookie set, and overwrites `cookies.enc`. The
-/// keeper window is left OPEN for next time.
+/// cookies), reads the full cookie set, and overwrites `cookies.enc`.
+///
+/// What happens to the keeper afterwards is per platform. On macOS it is
+/// closed once this function returns: the WebContent process behind a page
+/// nobody looks at was measured at 260 MB ten minutes after launch and
+/// 1.0 GB after eight and a half idle hours (Sep 10 2026), and
+/// the session lives in the profile directory, not in the window, so the
+/// next refresh builds a fresh keeper and finds it signed in exactly as
+/// the first one after launch does. On Windows the keeper is left open:
+/// WebView2 can show the host window when an external page finishes
+/// loading, and one build per launch is the smallest exposure to that.
 ///
 /// This is what survives Google's ~2h leash on *extracted* cookies: the
 /// bound browser session behind the keeper stays live, so the snapshot we
@@ -1713,6 +1737,11 @@ async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOut
         }
         Err(e) => return RefreshOutcome::Failed(e),
     };
+    // Closed on every way out of this function, snapshot or not. Dropping
+    // the guard queues the close on the event loop, after the poll below
+    // has taken what it needs.
+    #[cfg(target_os = "macos")]
+    let _close_keeper = CloseOnDrop(win.clone());
     // A reused keeper is reloaded to force fresh authenticated traffic; a
     // just-created one is already loading the URL from the builder.
     if !created {
