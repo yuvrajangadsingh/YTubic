@@ -13,6 +13,13 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
  * eight hours. Without this, every `refetchOnWindowFocus` in the app,
  * the auth queries' included, waits for an event that does not come.
  *
+ * Only a focus GAIN is forwarded, and without a value. Passing `false`
+ * on blur would make the manager report the window as unfocused, and
+ * the retryer waits for focus before it continues a retry, so a check
+ * that failed once while the user was in another app would sit paused
+ * until they came back. Left unset, `isFocused()` keeps reading document
+ * visibility, which is what every retry saw before this change.
+ *
  * Idempotent: the manager keeps one listener, and the previous one is
  * torn down when a new setup replaces it.
  */
@@ -24,7 +31,9 @@ export function wireQueryFocusToWindow(): void {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     void getCurrentWindow()
-      .onFocusChanged(({ payload: focused }) => setFocused(focused))
+      .onFocusChanged(({ payload: focused }) => {
+        if (focused) setFocused();
+      })
       .then((un) => {
         if (cancelled) un();
         else unlisten = un;
