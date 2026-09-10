@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { InnerTubeHttpError } from "@/lib/innertube/shared";
 import {
+  LYRICS_OPS,
   describeLyricsError,
   LyricsHttpError,
   LyricsRateLimitError,
@@ -29,6 +30,11 @@ import {
  */
 
 vi.mock("@tauri-apps/plugin-http", () => ({ fetch: vi.fn() }));
+// The InnerTube transport asks the Rust side for the auth context before
+// a request and hands Set-Cookie lines back after; an empty jar is fine.
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(async () => ({ cookie: null, pageId: null })),
+}));
 
 type Route = (url: string) => { status?: number; body?: unknown } | "reject";
 
@@ -320,6 +326,26 @@ describe("describeLyricsError", () => {
     expect(reads).toBe(2);
   });
 
+  it("prints no name that is not on the list, however plain it looks", () => {
+    // The old shape check took any token-shaped string. A name from the
+    // list is the only thing that reaches the log now.
+    const plain = new LyricsHttpError(500, "secretToken" as LyricsOp);
+    expect(describeLyricsError(plain)).toBe("HTTP 500");
+  });
+
+  it("gives a getter that rewrites the list nothing for its trouble", () => {
+    const hostile = Object.create(LyricsHttpError.prototype) as LyricsHttpError;
+    Object.defineProperty(hostile, "status", { get: () => 503 });
+    Object.defineProperty(hostile, "op", {
+      get: () => {
+        Reflect.set(LYRICS_OPS, "0", "secretToken");
+        return "secretToken";
+      },
+    });
+    expect(describeLyricsError(hostile)).toBe("HTTP 503");
+    expect(LYRICS_OPS[0]).toBe("Genius search");
+  });
+
   it("names the status of a failed YouTube Music hop, nothing else", () => {
     const e = new InnerTubeHttpError("next", 503, "secretToken in the body");
     expect(describeLyricsError(e)).toBe("YouTube Music HTTP 503");
@@ -339,5 +365,25 @@ describe("describeLyricsError", () => {
     const started = Date.now();
     describeLyricsError(new Error("x".repeat(64 * 1024)));
     expect(Date.now() - started).toBeLessThan(50);
+  });
+});
+
+/**
+ * The first hop of the YouTube Music lookup does not go through a lyrics
+ * module at all; it is the shared InnerTube transport, so its failure has
+ * to be typed at the source for the describer to name it.
+ */
+describe("the YouTube Music transport", () => {
+  it("throws its typed error from the shared post, and the describer names it", async () => {
+    await setup(() => ({ status: 503, body: "secretToken in the body" }));
+    const shared = await import("@/lib/innertube/shared");
+    const errors = await import("./errors");
+    const err: unknown = await shared.rawNext({ videoId: "x" }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(shared.InnerTubeHttpError);
+    expect(errors.describeLyricsError(err)).toBe("YouTube Music HTTP 503");
+    expect(errors.describeLyricsError(err)).not.toContain("secret");
   });
 });

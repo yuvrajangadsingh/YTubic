@@ -41,9 +41,11 @@ export class LyricsRateLimitError extends Error {
  * The requests a `LyricsHttpError` can name, in our own words. The
  * describer prints the entry from this list, never the value it was
  * handed, so an object wearing the class's prototype cannot get a string
- * of its own into the log.
+ * of its own into the log. Frozen, because `as const` is a type and a
+ * getter on such an object runs before the lookup and could rewrite the
+ * entry it is about to match.
  */
-export const LYRICS_OPS = [
+export const LYRICS_OPS = Object.freeze([
   "Genius search",
   "Genius page",
   "Musixmatch token.get",
@@ -53,7 +55,7 @@ export const LYRICS_OPS = [
   "LRCLIB /get",
   "LRCLIB /search",
   "YouTube Music browse",
-] as const;
+] as const);
 export type LyricsOp = (typeof LYRICS_OPS)[number];
 
 /**
