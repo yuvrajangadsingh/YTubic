@@ -19,6 +19,7 @@ import {
   SOURCE_LABELS,
   SOURCE_ORDER,
   useLyricsSelectionLog,
+  type SelectedSourceState,
   useLyricsSources,
   type LyricsSource,
 } from "@/lib/lyrics/sources";
@@ -237,11 +238,17 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
   const activeSource: LyricsSource | null = pref === "auto" ? best : pref;
   const active = activeSource ? (queries[activeSource].data ?? null) : null;
   // Whether the SELECTED provider has answered, which is not the same as
-  // the race being over: a pinned provider still loading is not a miss.
+  // the race being over: a pinned provider still loading is not a miss,
+  // and one that was never asked (a track with no artist to search by)
+  // is not a miss either.
   const activeQuery = activeSource ? queries[activeSource] : null;
-  const activeSettled =
-    !activeQuery || activeQuery.isSuccess || activeQuery.isError;
-  useLyricsSelectionLog(videoId, activeSource, active, settled, activeSettled);
+  const activeState: SelectedSourceState =
+    !activeQuery || activeQuery.isSuccess || activeQuery.isError
+      ? "settled"
+      : activeQuery.isEnabled
+        ? "loading"
+        : "skipped";
+  useLyricsSelectionLog(videoId, activeSource, active, settled, activeState);
 
   const recordDurationSec =
     active?.kind === "timed" ? active.recordDurationSec : undefined;
