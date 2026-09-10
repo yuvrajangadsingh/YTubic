@@ -8,7 +8,16 @@ export const queryClient = new QueryClient({
       staleTime: 1000 * 60 * 5, // 5 min — InnerTube responses rarely change
       gcTime: 1000 * 60 * 60 * 24, // 24h in cache so hydration from disk has something to return
       retry: 1,
-      refetchOnWindowFocus: false,
+      // Off for anything that has data: a fresh answer is left alone and a
+      // stale one waits for its own staleTime, same as before. On for a
+      // query that FAILED, because nothing else ever re-asks. The app
+      // auto-launches at login, before Wi-Fi is up, so every request in
+      // the first ~25 seconds fails instantly and would otherwise stay
+      // failed for the whole session: on Sep 10 2026 the home feed and
+      // the sidebar playlists sat in that state for eight hours while the
+      // premium check, which has its own focus refetch, recovered in 24s.
+      // "Focus" here is the Tauri window event, see query-focus.ts.
+      refetchOnWindowFocus: (query) => query.state.status === "error",
     },
   },
 });
