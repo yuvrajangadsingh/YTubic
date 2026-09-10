@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { nextSelectionLine } from "./sources";
+import { nextSelectionLine, selectionKey } from "./sources";
 
 const EMPTY = { videoId: "", shown: null };
 const at = (videoId: string, shown: string, settled = true) => ({
@@ -89,5 +89,35 @@ describe("nextSelectionLine", () => {
     expect(
       nextSelectionLine(first.state, at("aaab", "ytmusic timed")).event,
     ).toBe("first");
+  });
+});
+
+/**
+ * The key the hook dedups on. A pinned provider has three states that
+ * must not share a key: still loading (say nothing), finished with nothing
+ * (a miss), and never asked because the track has nothing to search by
+ * (not a miss, and not "no source had" either).
+ */
+describe("selectionKey", () => {
+  const timed = { kind: "timed" } as Parameters<typeof selectionKey>[1];
+
+  it("is empty with no source", () => {
+    expect(selectionKey(null, timed, "settled")).toBe("");
+  });
+
+  it("names the source and the kind when there are words", () => {
+    expect(selectionKey("lrclib", timed, "loading")).toBe("lrclib timed");
+  });
+
+  it("stays silent while the pinned source is loading", () => {
+    expect(selectionKey("genius", null, "loading")).toBe("");
+  });
+
+  it("calls a settled empty answer a miss", () => {
+    expect(selectionKey("genius", null, "settled")).toBe("genius none");
+  });
+
+  it("keeps a source that was never asked apart from a miss", () => {
+    expect(selectionKey("genius", null, "skipped")).toBe("genius skipped");
   });
 });

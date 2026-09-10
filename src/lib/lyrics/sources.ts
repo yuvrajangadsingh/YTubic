@@ -344,23 +344,29 @@ export function nextSelectionLine(
  * and then another's a second later; that is the half of the story the
  * per-attempt lines cannot tell.
  */
+/** What the selected provider's query is doing, as far as the log cares. */
+export type SelectedSourceState = "loading" | "settled" | "skipped";
+
 /**
  * The dedup key for what the panel is rendering, "" for nothing.
  *
- * `sourceSettled` is what keeps a pinned provider that is still loading
+ * `sourceState` is what keeps a pinned provider that is still loading
  * apart from one that finished with nothing. Without it "genius none" was
  * built the moment Genius was selected, which is a truthy key, which
  * announced a miss before Genius had answered and then called its arrival
- * a switch.
+ * a switch. "skipped" is the third case: a pinned provider the track gave
+ * nothing to search by, which is not a miss and not "no source had"
+ * either, since the race may well have a winner the pin is hiding.
  */
 export function selectionKey(
   source: LyricsSource | null,
   lyrics: Lyrics | null,
-  sourceSettled: boolean,
+  sourceState: SelectedSourceState,
 ): string {
   if (!source) return "";
   if (lyrics) return `${source} ${lyrics.kind}`;
-  return sourceSettled ? `${source} none` : "";
+  if (sourceState === "loading") return "";
+  return `${source} ${sourceState === "settled" ? "none" : "skipped"}`;
 }
 
 export function useLyricsSelectionLog(
@@ -368,10 +374,10 @@ export function useLyricsSelectionLog(
   source: LyricsSource | null,
   lyrics: Lyrics | null,
   settled: boolean,
-  sourceSettled: boolean,
+  sourceState: SelectedSourceState,
 ): void {
-  const shown = selectionKey(source, lyrics, sourceSettled);
-  const missing = !!source && !lyrics && sourceSettled;
+  const shown = selectionKey(source, lyrics, sourceState);
+  const hasLyrics = !!lyrics;
   // Unmount-only, so it runs when the shell drops the player on an empty
   // queue and not on every dependency change. That gap is unobservable
   // from inside the hook: nothing is mounted to see it, and without this
@@ -394,14 +400,16 @@ export function useLyricsSelectionLog(
     if (!event) return;
     if (event === "none") {
       appLog(`[lyrics] no source had ${videoId}`);
-    } else if (missing) {
-      appLog(`[lyrics] ${source} has nothing for ${videoId}`);
-    } else {
+    } else if (hasLyrics) {
       appLog(
         event === "first"
           ? `[lyrics] showing ${shown} for ${videoId}`
           : `[lyrics] switched to ${shown} for ${videoId}`,
       );
+    } else if (sourceState === "skipped") {
+      appLog(`[lyrics] ${source} was not asked for ${videoId}`);
+    } else {
+      appLog(`[lyrics] ${source} has nothing for ${videoId}`);
     }
-  }, [videoId, shown, settled, source, missing]);
+  }, [videoId, shown, settled, source, hasLyrics, sourceState]);
 }
