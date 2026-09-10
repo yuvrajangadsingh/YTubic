@@ -2206,6 +2206,25 @@ async fn run_refresh_loop(app: tauri::AppHandle) {
                 }
                 if session::should_attempt(now, due, retry.next_attempt_at()) {
                     attempted = true;
+                    // One line per attempt, before the outcome: a failed one
+                    // has to show how old the snapshot was, and a trial of
+                    // the interval needs the real gap, not the configured
+                    // one (a wake can pull an attempt forward).
+                    let why = if retry.forced_due() {
+                        "wake"
+                    } else if retry.next_attempt_at() > 0 {
+                        "retry"
+                    } else {
+                        "due"
+                    };
+                    let age = match last {
+                        Some(t) => format!("{}m", now.saturating_sub(t) / 60),
+                        None => "none".to_string(),
+                    };
+                    eprintln!(
+                        "[refresh] {active}: attempt ({why}), snapshot age {age}, interval {}m",
+                        interval / 60
+                    );
                     retry.on_attempt();
                     match refresh_account_cookies(&app, &active).await {
                         RefreshOutcome::Committed => {
