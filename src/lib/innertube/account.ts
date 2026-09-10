@@ -31,11 +31,14 @@ export type PremiumStatus = null | "free" | "premium";
  * closes the other half of that hole, where an unreadable jar sends the
  * probe out anonymous and the anonymous menu comes back as proof.
  */
-export async function fetchAccountInfo(): Promise<AccountInfo | null> {
+/** `forAccount` binds the answer to an account, see `innertubePost`. */
+export async function fetchAccountInfo(
+  forAccount?: string | null,
+): Promise<AccountInfo | null> {
   const json: YtNode = await innertubePost(
     "account/account_menu",
     {},
-    { auth: "required" },
+    { auth: "required", forAccount },
   );
 
   const header: YtNode | undefined =

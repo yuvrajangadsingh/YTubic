@@ -4,15 +4,33 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/plugin-http", () => ({ fetch: vi.fn() }));
 vi.mock("@/lib/app-log", () => ({ appLog: vi.fn() }));
 vi.mock("@/lib/innertube/account", () => ({
+  fetchAccountInfo: vi.fn(),
   fetchPremiumStatus: vi.fn(),
 }));
 
-import { fetchPremiumStatus } from "@/lib/innertube/account";
+import { fetchAccountInfo, fetchPremiumStatus } from "@/lib/innertube/account";
 import { AuthIdentityMismatchError } from "@/lib/innertube/shared";
 import {
+  accountInfoQuery,
   describeAuthError,
   premiumStatusQuery,
 } from "@/lib/store/auth-queries";
+
+describe("accountInfoQuery", () => {
+  it("is keyed by the account, waits for the id, and binds the request", async () => {
+    expect(accountInfoQuery(true, "acct").queryKey).toEqual([
+      "account-info",
+      "acct",
+    ]);
+    expect(accountInfoQuery(true, undefined).enabled).toBe(false);
+    vi.mocked(fetchAccountInfo).mockResolvedValueOnce(null);
+    await accountInfoQuery(true, "acct").queryFn();
+    expect(fetchAccountInfo).toHaveBeenLastCalledWith("acct");
+    const { retry } = accountInfoQuery(true, "acct");
+    expect(retry(0, new AuthIdentityMismatchError())).toBe(false);
+    expect(retry(0, new Error("HTTP 503"))).toBe(true);
+  });
+});
 
 describe("premiumStatusQuery", () => {
   it("is keyed by the account and waits for the id to be read", () => {

@@ -255,9 +255,14 @@ export function useAccountMetaBackfill(): void {
   const qc = useQueryClient();
 
   const loggedIn = useQuery(authLoggedInQuery);
-  const account = useQuery(accountInfoQuery(loggedIn.data === true));
-
   const activeId = useQuery(activeAccountIdQuery);
+  // Keyed by the id it is paired with below, so a focus refetch of the
+  // id landing mid-switch cannot pair the new id with the previous
+  // account's meta: the observer moves to the new key, which has no
+  // data until an answer bound to that account lands.
+  const account = useQuery(
+    accountInfoQuery(loggedIn.data === true, activeId.data),
+  );
 
   const id = activeId.data ?? null;
   const name = account.data?.name ?? "";
