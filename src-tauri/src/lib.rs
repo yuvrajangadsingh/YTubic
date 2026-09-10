@@ -1614,30 +1614,43 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
 ///
 /// Only loads of music.youtube.com count, since the parked about:blank
 /// finishes too. The URL wry hands the hook is the webview's current one,
-/// which can already be a pending request, so a blank page finishing in
-/// the same milliseconds as a `navigate` would count; parks and refreshes
-/// are minutes apart, so that is noted here, not closed.
+/// which can already be a pending request, so a blank page finishing
+/// right after a `navigate` would count. A manual refresh can overlap a
+/// park and a late callback has no bound, so this is a residual, noted
+/// here, not closed.
 static KEEPER_PAGE_LOADS: AtomicU64 = AtomicU64::new(0);
 
 /// Anything that happens to the keeper, process-wide: a build, a
 /// `navigate`, a page-load event of any kind, a refresh returning. The
 /// park is a debounce on it: the page is blanked `KEEPER_PARK_AFTER` after
 /// the last activity, whatever it was. A navigation still provisional
-/// after that long is cancelled with it and the next refresh asks again;
-/// that is the contract, rather than a timer per interleaving of WebKit's
-/// callbacks, which do not carry the navigation they belong to.
+/// after that long is cancelled with it and the next refresh asks again,
+/// with two exceptions that leave it to finish or fail on its own: the
+/// build's first navigation, before anything has committed (no eval may
+/// be queued then, see `KEEPER_COMMITTED_GEN`), and one over a page that
+/// is already blank (the eval is a no-op there). That is the contract,
+/// rather than a timer per interleaving of WebKit's callbacks, which do
+/// not carry the navigation they belong to.
 static KEEPER_ACTIVITY: AtomicU64 = AtomicU64::new(0);
 
-/// Whether the keeper built last has committed a page. wry queues `eval`
-/// until the webview's first commit and runs the queue on it, so a park
-/// submitted before that would blank the first page that does load.
-static KEEPER_COMMITTED: AtomicBool = AtomicBool::new(false);
+/// The keeper build in force: bumped before each build and carried by
+/// that build's page-load callbacks, so a callback from a keeper since
+/// replaced can be told apart and retired.
+static KEEPER_BUILD_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// The build that last committed a page. A park runs only when it is the
+/// build in force: wry queues `eval` until a webview's first commit and
+/// runs the queue on it, so a park submitted before that would blank the
+/// first page that does load, and a commit reported by a retired keeper
+/// must not stand in for one.
+static KEEPER_COMMITTED_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// How long the keeper stays on a page after the last activity. Past the
 /// refresh's poll, whose own sleeps total 18 s, with room for the cookie
 /// reads and the commit; the capture is owned data once taken, and a
-/// refresh still polling when the park fires fails this cycle and retries
-/// on the next.
+/// refresh still polling when the park fires may fail this cycle (the
+/// cookie store survives the park, so it may also still capture) and
+/// retries on the next.
 const KEEPER_PARK_AFTER: Duration = Duration::from_secs(45);
 
 /// Blank the keeper's page `KEEPER_PARK_AFTER` from now unless something
@@ -1656,7 +1669,8 @@ fn arm_keeper_park(win: tauri::WebviewWindow) {
         let page = win.clone();
         let _ = win.run_on_main_thread(move || {
             if KEEPER_ACTIVITY.load(Ordering::Relaxed) != seen
-                || !KEEPER_COMMITTED.load(Ordering::Relaxed)
+                || KEEPER_COMMITTED_GEN.load(Ordering::Relaxed)
+                    != KEEPER_BUILD_GEN.load(Ordering::Relaxed)
             {
                 return;
             }
@@ -1711,10 +1725,12 @@ async fn ensure_session_keeper(
     let url = "https://music.youtube.com/"
         .parse::<tauri::Url>()
         .map_err(|e| e.to_string())?;
-    // Activity, see the park. Nothing has committed in the webview about
-    // to be built, and wry queues evals until something does.
+    // Activity, see the park. `build` names the webview about to exist:
+    // its callbacks carry it, and a park runs only once this build has
+    // committed, since wry queues evals until then and a keeper this one
+    // replaces may still report a commit of its own.
     KEEPER_ACTIVITY.fetch_add(1, Ordering::Relaxed);
-    KEEPER_COMMITTED.store(false, Ordering::Relaxed);
+    let build = KEEPER_BUILD_GEN.fetch_add(1, Ordering::Relaxed) + 1;
     // Hidden, undecorated, focus-less, off-screen, no taskbar entry. Built
     // once and reused (not re-created every cycle): there is no recurring
     // window creation to flash on screen, and wry activates the app every
@@ -1737,14 +1753,20 @@ async fn ensure_session_keeper(
         // Registered on the webview, so it fires for every later
         // `navigate()` too — which is what lets a refresh tell "reloaded
         // and Google answered" from "offline, nothing happened".
-        .on_page_load(|win, payload| {
+        .on_page_load(move |win, payload| {
             // Runs on the main thread (WebKit delivers its navigation
             // delegate there, in order), for every event and any host: each
-            // one is activity, and each one re-arms the park.
+            // one is activity, and each one re-arms the park. A callback
+            // from a keeper this one has replaced is retired here: its
+            // window is closing, and its loads must not count for the
+            // current one.
+            if build != KEEPER_BUILD_GEN.load(Ordering::Relaxed) {
+                return;
+            }
             KEEPER_ACTIVITY.fetch_add(1, Ordering::Relaxed);
             let event = payload.event();
             if matches!(event, tauri::webview::PageLoadEvent::Started) {
-                KEEPER_COMMITTED.store(true, Ordering::Relaxed);
+                KEEPER_COMMITTED_GEN.store(build, Ordering::Relaxed);
             }
             // Only a finished Google load is evidence the refresh reached
             // Google, see `KEEPER_PAGE_LOADS`.
@@ -1761,6 +1783,10 @@ async fn ensure_session_keeper(
     // when the external page finishes loading, this puts it straight back to
     // hidden so the user never sees a stray music.youtube.com window.
     let _ = win.hide();
+    // The build's own navigation may never report back (offline), so the
+    // build arms a park like any other activity.
+    let page = win.clone();
+    let _ = win.run_on_main_thread(move || arm_keeper_park(page));
     Ok((win, true))
 }
 
@@ -1823,12 +1849,14 @@ async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOut
     // just-created one is already loading the URL from the builder.
     if !created {
         if let Ok(u) = "https://music.youtube.com/".parse::<tauri::Url>() {
-            // Counted and navigated in one main-thread step, so a park
-            // deciding on the activity count cannot slip between the two.
+            // Counted, navigated and armed in one main-thread step: a park
+            // deciding on the activity count cannot slip in between, and a
+            // navigate that never reports back still ends in a park.
             let page = win.clone();
             let _ = win.run_on_main_thread(move || {
                 KEEPER_ACTIVITY.fetch_add(1, Ordering::Relaxed);
                 let _ = page.navigate(u);
+                arm_keeper_park(page);
             });
         }
     }
@@ -1951,9 +1979,10 @@ async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOut
     }
 
     if let Err(e) = authfs::write_atomic(account_cookies_path(app, id), encrypted, 0o600).await {
-        // Either jar is a live session (the failure can come after the
-        // rename); it is the attempt that failed, and it must never reach
-        // the UI as "signed out".
+        // The jar on disk is whichever the write got to (the failure can
+        // come after the rename), and either way this attempt learned
+        // nothing about the session: it must never reach the UI as
+        // "signed out".
         return RefreshOutcome::Failed(format!("write refreshed cookies: {e}"));
     }
     // The success deadline derives from this stamp and nothing else, so an
