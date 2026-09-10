@@ -5,6 +5,7 @@ import {
   LyricsRateLimitError,
   LyricsTimeoutError,
   shouldRetryLyricsQuery,
+  type LyricsOp,
 } from "./errors";
 
 // `vi.resetModules()` gives the providers a fresh copy of ./errors, so the
@@ -293,13 +294,38 @@ describe("describeLyricsError", () => {
 
   it("copies nothing from an error's own name or class", () => {
     class ProviderGone extends Error {
-      override name = "secretToken in the name";
+      override name = "SecretToken";
     }
     expect(describeLyricsError(new ProviderGone("host down at 10.0.0.4"))).toBe(
       "failed",
     );
-    const lying = new LyricsHttpError(500, "https://x/?usertoken=secret");
+    const lying = new LyricsHttpError(
+      500,
+      "https://x/?usertoken=secret" as LyricsOp,
+    );
     expect(describeLyricsError(lying)).toBe("HTTP 500");
+  });
+
+  it("reads status and op once and prints the list's copy of the name", () => {
+    let reads = 0;
+    const hostile = Object.create(LyricsHttpError.prototype) as LyricsHttpError;
+    Object.defineProperty(hostile, "status", {
+      get: () => (reads++ === 0 ? 503 : "secretToken@example.com"),
+    });
+    Object.defineProperty(hostile, "op", {
+      get: () => (reads++ === 1 ? "Genius page" : "secretToken@example.com"),
+    });
+    expect(describeLyricsError(hostile)).toBe("Genius page HTTP 503");
+    expect(reads).toBe(2);
+  });
+
+  it("refuses a status that is not a real one", () => {
+    expect(describeLyricsError(new LyricsHttpError(1e15, "LRCLIB /get"))).toBe(
+      "http error",
+    );
+    expect(describeLyricsError(new LyricsHttpError(7, "LRCLIB /get"))).toBe(
+      "http error",
+    );
   });
 
   it("stays cheap on a long message", () => {
