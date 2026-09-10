@@ -11,6 +11,12 @@ import {
 import { routeTree } from "@/routeTree.gen";
 import { isFloatingPlayerWindow } from "@/lib/floating-player";
 import FloatingPlayerApp from "@/components/layout/floating-player-app";
+import { wireQueryFocusToWindow } from "@/lib/query-focus";
+
+// Both windows run this bundle and each has its own query client, so
+// each wires its own window. Module scope, not an effect: the manager
+// keeps the listener across provider remounts.
+wireQueryFocusToWindow();
 
 const router = createRouter({
   routeTree,
