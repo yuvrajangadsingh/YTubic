@@ -155,8 +155,7 @@ export function usePremiumStatusSync(): void {
     if (loggedIn.data !== true) return;
     if (premium.data !== undefined) return;
     if (usePremiumStore.getState().status !== null) return;
-    const now = Date.now();
-    const stood = standInVerdict(activeId.data, now);
+    const stood = standInVerdict(activeId.data, Date.now());
     if (!stood) return;
     appLog(
       `[premium] standing in with stored ${stood.status} until the check lands`,
@@ -165,18 +164,27 @@ export function usePremiumStatusSync(): void {
       status: stood.status,
       standInUntil: stood.until,
     });
-    // Follow the deadline in the UI too. `isPremium` enforces it on read
-    // for the case this timer sleeps through.
+  }, [loggedIn.data, activeId.data, premium.data]);
+
+  // The expiry timer follows the deadline in the store, not the seeding
+  // effect above. Owned there, an id flicker (A, unknown, A) re-ran that
+  // effect: its cleanup cancelled the timer, the guard saw a non-null
+  // status and armed no new one, and the seed outlived its day in the UI
+  // while `isPremium`, which enforces the deadline on read for the case a
+  // timer sleeps through, had already said no.
+  const standInUntil = usePremiumStore((s) => s.standInUntil);
+  useEffect(() => {
+    if (standInUntil === null) return;
     const timer = window.setTimeout(
       () => {
-        if (usePremiumStore.getState().standInUntil === null) return;
+        if (usePremiumStore.getState().standInUntil !== standInUntil) return;
         appLog("[premium] stored verdict expired, back to unknown");
         usePremiumStore.setState({ status: null, standInUntil: null });
       },
-      Math.max(0, stood.until - now),
+      Math.max(0, standInUntil - Date.now()),
     );
     return () => window.clearTimeout(timer);
-  }, [loggedIn.data, activeId.data, premium.data]);
+  }, [standInUntil]);
 
   // A failed check leaves the store alone on purpose, so the log is the
   // only place it can show. The query logs each attempt itself; these
