@@ -1751,12 +1751,15 @@ async fn ensure_session_keeper(
 /// bound browser session behind the keeper stays live, so the snapshot we
 /// replay never goes stale.
 ///
-/// Every path that is not [`RefreshOutcome::Committed`] leaves the existing
-/// jar and its success stamp as they were, so we never clobber a usable jar
-/// with an empty one and never let a failed attempt look like a completed
-/// refresh. The one exception is a stamp that fails to write after the jar
-/// did: that reports Failed with the new jar in place and the old deadline,
-/// which errs in the same direction.
+/// Every path that returns before the commit leaves the existing jar and
+/// its success stamp as they were, so a usable jar is never clobbered with
+/// an empty one and a failed attempt never looks like a completed refresh.
+/// The commit itself can report Failed with more on disk than that says:
+/// `write_atomic` renames before it syncs the directory and can fail after
+/// the rename, so a failed jar write may already have swapped the jar in,
+/// and a failed stamp write after it may already have moved the deadline.
+/// Both err the same way, a refresh credited with less than it did, and
+/// the loop backs off and tries again either way.
 async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOutcome {
     // Serialize refreshes so the periodic timer and a manual trigger can't
     // reload the keeper / rewrite the jar on top of each other.
