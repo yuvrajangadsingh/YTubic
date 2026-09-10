@@ -86,7 +86,9 @@ export function isPremium(): boolean {
 export function usePremiumStatusSync(): void {
   const loggedIn = useQuery(authLoggedInQuery);
   const activeId = useQuery(activeAccountIdQuery);
-  const premium = useQuery(premiumStatusQuery(loggedIn.data === true));
+  const premium = useQuery(
+    premiumStatusQuery(loggedIn.data === true, activeId.data),
+  );
 
   // Declared FIRST. On the render where the id flips, the old account's
   // answer has to be gone before the mirror and the seeding below look,

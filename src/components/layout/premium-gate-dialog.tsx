@@ -18,6 +18,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { resetInnertube } from "@/lib/innertube/client";
 import {
+  activeAccountIdQuery,
   authLoggedInQuery,
   premiumStatusQuery,
 } from "@/lib/store/auth-queries";
@@ -46,10 +47,13 @@ export function PremiumGateDialog() {
   // Same key as usePremiumStatusSync, so it's served from the query
   // cache with no extra invoke round-trip in the common case.
   const loggedIn = useQuery({ ...authLoggedInQuery, enabled: open });
+  const activeId = useQuery({ ...activeAccountIdQuery, enabled: open });
   // Same key as the sync hook again, so this usually observes the check
   // it already started. After a settled failure, opening the dialog can
   // start another one, which is the right thing to do with it.
-  const premium = useQuery(premiumStatusQuery(open && loggedIn.data === true));
+  const premium = useQuery(
+    premiumStatusQuery(open && loggedIn.data === true, activeId.data),
+  );
   const qc = useQueryClient();
 
   // Premium confirmed while the dialog is up: nothing to explain.
