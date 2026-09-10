@@ -1614,12 +1614,22 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
 static KEEPER_PAGE_LOADS: AtomicU64 = AtomicU64::new(0);
 
 /// Navigations the refresh has asked of the keeper, process-wide: bumped
-/// before every build and every `navigate`. A parked page checks it so a
-/// timer from an earlier load never blanks a navigation started since.
+/// before every build and, on the main thread in the same step as the
+/// call, before every `navigate`. It covers the gap between asking for a
+/// page and WebKit committing it, which no page-load event marks, so a
+/// park timer from an earlier load never blanks a navigation asked for
+/// since.
 static KEEPER_NAV_GEN: AtomicU64 = AtomicU64::new(0);
 
+/// Page-load events the keeper has reported, any host, started or
+/// finished, process-wide. A park timer checks it so a load that has
+/// committed since, finished or not, is never blanked from under itself.
+static KEEPER_PAGE_EVENTS: AtomicU64 = AtomicU64::new(0);
+
 /// How long a finished music.youtube.com load stays up before it is
-/// parked: the refresh's poll is 18 s at most, plus its commit, plus room.
+/// parked. The refresh's poll sleeps 18 s in all; cookie reads, the
+/// encryption, the jar lock and the commit come on top, and by then the
+/// capture is owned data, so a slow commit does not need the page.
 const KEEPER_PARK_AFTER: Duration = Duration::from_secs(45);
 
 /// The live "session-keeper" WebView for `id`: a hidden window on
@@ -1675,29 +1685,41 @@ async fn ensure_session_keeper(
         // `navigate()` too — which is what lets a refresh tell "reloaded
         // and Google answered" from "offline, nothing happened".
         .on_page_load(|win, payload| {
-            // Only Google counts: the page is parked on about:blank after
-            // each load, and that load must not read as "reached Google".
+            // Runs on the main thread (WebKit delivers its navigation
+            // delegate there, in order), for every event and any host. The
+            // park below decides on these counters from that same thread,
+            // which is what makes its check and its `eval` one step.
+            let events = KEEPER_PAGE_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+            // Only a finished Google load counts: the page is parked on
+            // about:blank after each one, and that must not read as
+            // "reached Google".
             if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
                 || payload.url().host_str() != Some("music.youtube.com")
             {
                 return;
             }
-            let load = KEEPER_PAGE_LOADS.fetch_add(1, Ordering::Relaxed) + 1;
+            KEEPER_PAGE_LOADS.fetch_add(1, Ordering::Relaxed);
             let nav = KEEPER_NAV_GEN.load(Ordering::Relaxed);
             // Park this page once the refresh that asked for it has had its
             // poll and its commit, whatever they concluded. Tied to this
-            // load and this navigation: a newer load, or a navigation
-            // started since, means the page is no longer ours to blank.
-            // `replace`, not a navigation, so the old document is not left
-            // reachable by "back" for the back-forward cache to hold.
+            // load: any page-load event since, or a navigation asked for
+            // since, means the page is no longer ours to blank. Checked and
+            // parked on the main thread, so neither a `navigate` nor a load
+            // can land between the check and the `eval`. `replace` so the
+            // parked page gets no history entry of its own; the entries
+            // before it stay, and whether WebKit keeps the old page cached
+            // for them is what the memory sampler has to show.
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(KEEPER_PARK_AFTER).await;
-                if KEEPER_PAGE_LOADS.load(Ordering::Relaxed) != load
-                    || KEEPER_NAV_GEN.load(Ordering::Relaxed) != nav
-                {
-                    return;
-                }
-                let _ = win.eval("location.replace('about:blank')");
+                let page = win.clone();
+                let _ = win.run_on_main_thread(move || {
+                    if KEEPER_PAGE_EVENTS.load(Ordering::Relaxed) != events
+                        || KEEPER_NAV_GEN.load(Ordering::Relaxed) != nav
+                    {
+                        return;
+                    }
+                    let _ = page.eval("location.replace('about:blank')");
+                });
             });
         })
         .build()
@@ -1763,8 +1785,14 @@ async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOut
     // just-created one is already loading the URL from the builder.
     if !created {
         if let Ok(u) = "https://music.youtube.com/".parse::<tauri::Url>() {
-            KEEPER_NAV_GEN.fetch_add(1, Ordering::Relaxed);
-            let _ = win.navigate(u);
+            // Bumped and navigated in one main-thread step, so no page-load
+            // event can land between the two and hand the new generation to
+            // a load that was asked for before it.
+            let page = win.clone();
+            let _ = win.run_on_main_thread(move || {
+                KEEPER_NAV_GEN.fetch_add(1, Ordering::Relaxed);
+                let _ = page.navigate(u);
+            });
         }
     }
 
