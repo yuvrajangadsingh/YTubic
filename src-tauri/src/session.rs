@@ -319,6 +319,24 @@ pub fn is_environment_unavailable(err: &str) -> bool {
 /// every 20 minutes stays well inside that.
 pub const REFRESH_INTERVAL_SECS: i64 = 20 * 60;
 
+/// Ceiling for the override below. Four hours is past the leash the
+/// default was chosen against, so a trial can find where the snapshot
+/// stops being accepted without being able to park it for a day.
+pub const REFRESH_INTERVAL_MAX_SECS: i64 = 240 * 60;
+
+/// The `refresh-interval-mins` override file, a knob for measuring how
+/// long a snapshot stays accepted: the 20 minute default is a margin
+/// nobody measured (Sep 10 2026). Whole minutes, default through
+/// [`REFRESH_INTERVAL_MAX_SECS`]; anything else means the default, so a
+/// typo can neither hammer Google nor let the snapshot rot. Seconds out.
+pub fn parse_interval_override(text: &str) -> Option<i64> {
+    let mins: i64 = text.trim().parse().ok()?;
+    let secs = mins.checked_mul(60)?;
+    (REFRESH_INTERVAL_SECS..=REFRESH_INTERVAL_MAX_SECS)
+        .contains(&secs)
+        .then_some(secs)
+}
+
 /// Spread applied to the interval so several accounts (and several installs)
 /// never reload their keeper on the same second.
 pub const REFRESH_JITTER_SECS: i64 = 60;
@@ -1051,6 +1069,24 @@ mod tests {
         wake::init();
         // The signal is process-wide, so two calls hand back the same one.
         assert!(std::sync::Arc::ptr_eq(&wake::signal(), &wake::signal()));
+    }
+
+    #[test]
+    fn interval_override_takes_whole_minutes_inside_the_range() {
+        assert_eq!(parse_interval_override("60"), Some(3600));
+        assert_eq!(parse_interval_override(" 40\n"), Some(2400));
+        assert_eq!(parse_interval_override("20"), Some(REFRESH_INTERVAL_SECS));
+        assert_eq!(
+            parse_interval_override("240"),
+            Some(REFRESH_INTERVAL_MAX_SECS)
+        );
+    }
+
+    #[test]
+    fn interval_override_means_the_default_on_anything_else() {
+        for text in ["", "abc", "10", "241", "-60", "60.5", "3600s"] {
+            assert_eq!(parse_interval_override(text), None, "{text:?}");
+        }
     }
 
     #[test]
