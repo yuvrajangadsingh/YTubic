@@ -1611,71 +1611,75 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
 /// cookie store keeps answering with whatever it already held. On macOS
 /// this counter follows `webView:didFinishNavigation:`, which a failed
 /// provisional navigation never reaches.
+///
+/// Only loads of music.youtube.com count, since the parked about:blank
+/// finishes too. The URL wry hands the hook is the webview's current one,
+/// which can already be a pending request, so a blank page finishing in
+/// the same milliseconds as a `navigate` would count; parks and refreshes
+/// are minutes apart, so that is noted here, not closed.
 static KEEPER_PAGE_LOADS: AtomicU64 = AtomicU64::new(0);
 
-/// Navigations the refresh has asked of the keeper, process-wide: bumped
-/// before every build and, on the main thread in the same step as the
-/// call, before every `navigate`. It covers the gap between asking for a
-/// page and WebKit committing it, which no page-load event marks, so a
-/// park timer from an earlier load never blanks a navigation asked for
-/// since.
-static KEEPER_NAV_GEN: AtomicU64 = AtomicU64::new(0);
+/// Anything that happens to the keeper, process-wide: a build, a
+/// `navigate`, a page-load event of any kind, a refresh returning. The
+/// park is a debounce on it: the page is blanked `KEEPER_PARK_AFTER` after
+/// the last activity, whatever it was. A navigation still provisional
+/// after that long is cancelled with it and the next refresh asks again;
+/// that is the contract, rather than a timer per interleaving of WebKit's
+/// callbacks, which do not carry the navigation they belong to.
+static KEEPER_ACTIVITY: AtomicU64 = AtomicU64::new(0);
 
-/// Page-load events the keeper has reported, any host, started or
-/// finished, process-wide. A park timer checks it so a load that has
-/// committed since, finished or not, is never blanked from under itself.
-static KEEPER_PAGE_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// Whether the keeper built last has committed a page. wry queues `eval`
+/// until the webview's first commit and runs the queue on it, so a park
+/// submitted before that would blank the first page that does load.
+static KEEPER_COMMITTED: AtomicBool = AtomicBool::new(false);
 
-/// The generation the keeper last committed a navigation for: set from
-/// `KEEPER_NAV_GEN` on every Started event, on the main thread. While it
-/// trails `KEEPER_NAV_GEN` a navigation has been asked for and not yet
-/// committed, and a Finished arriving then belongs to the page before it.
-static KEEPER_NAV_COMMITTED: AtomicU64 = AtomicU64::new(0);
-
-/// How long a music.youtube.com page stays up before it is parked. The
-/// refresh's poll sleeps 18 s in all; cookie reads, the encryption, the
-/// jar lock and the commit come on top, and by then the capture is owned
-/// data, so a slow commit does not need the page.
+/// How long the keeper stays on a page after the last activity. Past the
+/// refresh's poll, whose own sleeps total 18 s, with room for the cookie
+/// reads and the commit; the capture is owned data once taken, and a
+/// refresh still polling when the park fires fails this cycle and retries
+/// on the next.
 const KEEPER_PARK_AFTER: Duration = Duration::from_secs(45);
 
-/// Blank the keeper's page `KEEPER_PARK_AFTER` from now unless a page-load
-/// event or a navigation request happens in between. The delay is past
-/// the refresh's poll with room to spare; it does not wait for the commit,
-/// see the constant. Main thread only: the counters it captures are
-/// written there, and the check and the `eval` run there as one step, so
-/// neither a `navigate` nor a load can land between them. `replace` so
+/// Blank the keeper's page `KEEPER_PARK_AFTER` from now unless something
+/// else happens to it first, see `KEEPER_ACTIVITY`. Main thread only: the
+/// activity counter is written there, and the check and the `eval` run
+/// there as one step, so nothing can land between them. The page checks
+/// itself before replacing, so a park landing on about:blank does nothing
+/// and the parked page's own events do not re-park forever. `replace` so
 /// the parked page gets no history entry of its own; the entries before
 /// it stay, and whether WebKit keeps the old page cached for them is what
 /// the memory sampler has to show.
 fn arm_keeper_park(win: tauri::WebviewWindow) {
-    let events = KEEPER_PAGE_EVENTS.load(Ordering::Relaxed);
-    let nav = KEEPER_NAV_GEN.load(Ordering::Relaxed);
+    let seen = KEEPER_ACTIVITY.load(Ordering::Relaxed);
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(KEEPER_PARK_AFTER).await;
         let page = win.clone();
         let _ = win.run_on_main_thread(move || {
-            if KEEPER_PAGE_EVENTS.load(Ordering::Relaxed) != events
-                || KEEPER_NAV_GEN.load(Ordering::Relaxed) != nav
+            if KEEPER_ACTIVITY.load(Ordering::Relaxed) != seen
+                || !KEEPER_COMMITTED.load(Ordering::Relaxed)
             {
                 return;
             }
-            let _ = page.eval("location.replace('about:blank')");
+            let _ = page.eval(
+                "if (location.href !== 'about:blank') location.replace('about:blank')",
+            );
         });
     });
 }
 
-/// Arms the park when the refresh returns, whichever way it does. The
-/// per-load timer only exists once a load has finished, and a navigation
-/// that never commits (offline, a provisional failure) fires no page-load
-/// event at all, so without this the previous page stayed up until the
-/// next refresh. Same counters, same rules: a load finishing after this
-/// gets its own timer, a navigation asked for after this cancels it.
+/// Counts the refresh returning as activity and arms the park, whichever
+/// way it returned. A navigation that never commits (offline) fires no
+/// page-load event at all, and without this the previous page stayed up
+/// until the next refresh.
 struct ParkKeeperOnReturn(tauri::WebviewWindow);
 
 impl Drop for ParkKeeperOnReturn {
     fn drop(&mut self) {
         let page = self.0.clone();
-        let _ = self.0.run_on_main_thread(move || arm_keeper_park(page));
+        let _ = self.0.run_on_main_thread(move || {
+            KEEPER_ACTIVITY.fetch_add(1, Ordering::Relaxed);
+            arm_keeper_park(page);
+        });
     }
 }
 
@@ -1708,7 +1712,10 @@ async fn ensure_session_keeper(
     let url = "https://music.youtube.com/"
         .parse::<tauri::Url>()
         .map_err(|e| e.to_string())?;
-    KEEPER_NAV_GEN.fetch_add(1, Ordering::Relaxed);
+    // Activity, see the park. Nothing has committed in the webview about
+    // to be built, and wry queues evals until something does.
+    KEEPER_ACTIVITY.fetch_add(1, Ordering::Relaxed);
+    KEEPER_COMMITTED.store(false, Ordering::Relaxed);
     // Hidden, undecorated, focus-less, off-screen, no taskbar entry. Built
     // once and reused (not re-created every cycle): there is no recurring
     // window creation to flash on screen, and wry activates the app every
@@ -1733,34 +1740,19 @@ async fn ensure_session_keeper(
         // and Google answered" from "offline, nothing happened".
         .on_page_load(|win, payload| {
             // Runs on the main thread (WebKit delivers its navigation
-            // delegate there, in order), for every event and any host. The
-            // park decides on these counters from that same thread, which
-            // is what makes its check and its `eval` one step.
-            KEEPER_PAGE_EVENTS.fetch_add(1, Ordering::Relaxed);
+            // delegate there, in order), for every event and any host: each
+            // one is activity, and each one re-arms the park.
+            KEEPER_ACTIVITY.fetch_add(1, Ordering::Relaxed);
             let event = payload.event();
             if matches!(event, tauri::webview::PageLoadEvent::Started) {
-                KEEPER_NAV_COMMITTED
-                    .store(KEEPER_NAV_GEN.load(Ordering::Relaxed), Ordering::Relaxed);
-                return;
+                KEEPER_COMMITTED.store(true, Ordering::Relaxed);
             }
-            // Only a finished Google load counts: the page is parked on
-            // about:blank after each one, and that must not read as
-            // "reached Google".
-            if !matches!(event, tauri::webview::PageLoadEvent::Finished)
-                || payload.url().host_str() != Some("music.youtube.com")
+            // Only a finished Google load is evidence the refresh reached
+            // Google, see `KEEPER_PAGE_LOADS`.
+            if matches!(event, tauri::webview::PageLoadEvent::Finished)
+                && payload.url().host_str() == Some("music.youtube.com")
             {
-                return;
-            }
-            KEEPER_PAGE_LOADS.fetch_add(1, Ordering::Relaxed);
-            // A Finished that lands after a newer navigation was asked for
-            // and before that one committed belongs to the page it is
-            // replacing. A timer armed here would carry the new generation
-            // and could blank the new page while it is still provisional;
-            // the refresh's own park covers the old page instead.
-            if KEEPER_NAV_COMMITTED.load(Ordering::Relaxed)
-                != KEEPER_NAV_GEN.load(Ordering::Relaxed)
-            {
-                return;
+                KEEPER_PAGE_LOADS.fetch_add(1, Ordering::Relaxed);
             }
             arm_keeper_park(win);
         })
@@ -1778,11 +1770,10 @@ async fn ensure_session_keeper(
 /// requests (which renews the session and rotates its short-lived
 /// cookies), reads the full cookie set, and overwrites `cookies.enc`.
 ///
-/// The keeper does not stay on music.youtube.com between refreshes: each
-/// finished load parks itself on about:blank 45 s later, from the page-load
-/// hook in `ensure_session_keeper`, and this function arms the same park
-/// when it returns, so a navigation that never commits does not leave the
-/// previous page up. Left up, the WebContent process behind a page nobody looks at was
+/// The keeper does not stay on music.youtube.com between refreshes: 45 s
+/// after the last thing that happened to it (a page-load event, a
+/// `navigate`, this function returning) the page is parked on about:blank,
+/// see `KEEPER_ACTIVITY`. Left up, the WebContent process behind a page nobody looks at was
 /// measured at 260 MB ten minutes after launch and 1.0 GB after eight and a
 /// half idle hours (Sep 10 2026). The window itself stays: wry activates
 /// the app whenever it builds a webview, so closing and rebuilding one
@@ -1827,19 +1818,17 @@ async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOut
         }
         Err(e) => return RefreshOutcome::Failed(e),
     };
-    // Whichever way this returns, the page is parked 45 s on unless a load
-    // or a navigation has happened by then, see `ParkKeeperOnReturn`.
+    // Returning is activity too, whichever way, see `ParkKeeperOnReturn`.
     let _park_on_return = ParkKeeperOnReturn(win.clone());
     // A reused keeper is reloaded to force fresh authenticated traffic; a
     // just-created one is already loading the URL from the builder.
     if !created {
         if let Ok(u) = "https://music.youtube.com/".parse::<tauri::Url>() {
-            // Bumped and navigated in one main-thread step, so no page-load
-            // event can land between the two and hand the new generation to
-            // a load that was asked for before it.
+            // Counted and navigated in one main-thread step, so a park
+            // deciding on the activity count cannot slip between the two.
             let page = win.clone();
             let _ = win.run_on_main_thread(move || {
-                KEEPER_NAV_GEN.fetch_add(1, Ordering::Relaxed);
+                KEEPER_ACTIVITY.fetch_add(1, Ordering::Relaxed);
                 let _ = page.navigate(u);
             });
         }
@@ -1963,14 +1952,15 @@ async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOut
     }
 
     if let Err(e) = authfs::write_atomic(account_cookies_path(app, id), encrypted, 0o600).await {
-        // A storage failure keeps the previous jar, so the session is
-        // intact; it is the attempt that failed, and it must never reach
+        // Either jar is a live session (the failure can come after the
+        // rename); it is the attempt that failed, and it must never reach
         // the UI as "signed out".
         return RefreshOutcome::Failed(format!("write refreshed cookies: {e}"));
     }
     // The success deadline derives from this stamp and nothing else, so an
-    // unwritable stamp means the refresh did not fully commit: leave the
-    // deadline where it was and let the loop back off and try again.
+    // unwritable stamp means the refresh did not fully commit: report it,
+    // so the loop backs off and tries again, whether or not the rename had
+    // already landed.
     if let Err(e) = write_last_refresh(app, id, now_ts()).await {
         return RefreshOutcome::Failed(format!("write refresh stamp: {e}"));
     }
@@ -1987,7 +1977,8 @@ enum RefreshOutcome {
     /// Nothing was written and nothing was learned. Does not advance the
     /// success deadline and does not count as a session failure.
     Deferred(String),
-    /// The attempt ran and failed. The previous jar is untouched.
+    /// The attempt ran and failed. Nothing was learned; what is on disk is
+    /// whatever the attempt got to, see `refresh_account_cookies`.
     Failed(String),
 }
 
