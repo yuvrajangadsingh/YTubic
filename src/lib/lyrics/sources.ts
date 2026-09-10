@@ -402,9 +402,11 @@ export function useLyricsSelectionLog(
     if (!event) return;
     if (event === "none") {
       // An empty race in which something errored out is not every source
-      // having looked and found nothing; say which ones never answered.
+      // having looked and found nothing; say so, and which ones failed.
       appLog(
-        `[lyrics] no source had ${videoId}${failed ? ` (failed: ${failed})` : ""}`,
+        failed
+          ? `[lyrics] no lyrics available for ${videoId} (failed: ${failed})`
+          : `[lyrics] no source had ${videoId}`,
       );
     } else if (hasLyrics) {
       appLog(
