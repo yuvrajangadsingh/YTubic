@@ -1739,7 +1739,8 @@ async fn ensure_session_keeper(
             KEEPER_PAGE_EVENTS.fetch_add(1, Ordering::Relaxed);
             let event = payload.event();
             if matches!(event, tauri::webview::PageLoadEvent::Started) {
-                KEEPER_NAV_COMMITTED.store(KEEPER_NAV_GEN.load(Ordering::Relaxed), Ordering::Relaxed);
+                KEEPER_NAV_COMMITTED
+                    .store(KEEPER_NAV_GEN.load(Ordering::Relaxed), Ordering::Relaxed);
                 return;
             }
             // Only a finished Google load counts: the page is parked on
@@ -1756,7 +1757,8 @@ async fn ensure_session_keeper(
             // replacing. A timer armed here would carry the new generation
             // and could blank the new page while it is still provisional;
             // the refresh's own park covers the old page instead.
-            if KEEPER_NAV_COMMITTED.load(Ordering::Relaxed) != KEEPER_NAV_GEN.load(Ordering::Relaxed)
+            if KEEPER_NAV_COMMITTED.load(Ordering::Relaxed)
+                != KEEPER_NAV_GEN.load(Ordering::Relaxed)
             {
                 return;
             }
