@@ -32,6 +32,7 @@ import { useYtdlpSetup } from "@/lib/ytdlp";
 import { useUpdateStartupCheck } from "@/lib/updater";
 import { useWhatsNewOnUpdate } from "@/lib/store/whats-new";
 import { pickHighResThumbnail } from "@/components/shared/thumbnail";
+import { resetLyricsSelectionLog } from "@/lib/lyrics/sources";
 import { usePlaybackStore, currentTrack } from "@/lib/store/playback";
 import { useLayoutStore } from "@/lib/store/layout";
 import { usePremiumStatusSync } from "@/lib/store/premium";
@@ -116,6 +117,12 @@ export function AppShell({ children }: { children: ReactNode }) {
   const hasTrack = usePlaybackStore(
     (s) => s.index >= 0 && s.index < s.queue.length,
   );
+  // The lyrics log announces its pick afresh once the player has been
+  // dropped and a track is played again. The views cannot see that gap;
+  // this component stays mounted through it.
+  useEffect(() => {
+    if (!hasTrack) resetLyricsSelectionLog();
+  }, [hasTrack]);
   // Set when we close the floating window programmatically (queue emptied)
   // so the player-window-closed handler doesn't mistake it for the user
   // clicking X and revert the persisted floating layout preference.

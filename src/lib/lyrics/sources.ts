@@ -299,12 +299,17 @@ type SelectionLogState = { videoId: string; shown: string | null };
  * effects. Per-instance state wrote the same pick once per caller.
  */
 let selectionLog: SelectionLogState = { videoId: "", shown: null };
-/** Views currently logging; the state above outlives all but the last. */
-let logViews = 0;
-/** The reset waiting on the last view's departure, see the hook. */
-let resetAfterLastView: ReturnType<typeof setTimeout> | undefined;
 
-/** Reset between tests. */
+/**
+ * Forget what has been announced. The shell calls this when the queue
+ * empties and the player, and every lyrics view with it, is dropped: the
+ * views cannot see that gap (nothing is mounted to see it), and without
+ * the reset the pick from before it survived and swallowed the line when
+ * the same track was played again from cache. Not from the views' own
+ * unmount: the player bar stays mounted behind the fullscreen player, a
+ * remount in the same commit (StrictMode) is not a gap, and two views
+ * sharing one state must not reset each other. Tests use it too.
+ */
 export function resetLyricsSelectionLog(): void {
   selectionLog = { videoId: "", shown: null };
 }
@@ -386,33 +391,6 @@ export function useLyricsSelectionLog(
 ): void {
   const shown = selectionKey(source, lyrics, sourceState);
   const hasLyrics = !!lyrics;
-  // Reset when the LAST view leaves, which is what happens when the shell
-  // drops the player on an empty queue, and not on every dependency
-  // change. That gap is unobservable from inside the hook: nothing is
-  // mounted to see it, and without this the pick from before the gap
-  // survives and swallows the announcement when the same track is played
-  // again from cache. Last and not first: the player bar stays mounted
-  // behind the fullscreen player, and resetting when fullscreen closed
-  // made the bar announce its unchanged pick a second time.
-  useEffect(() => {
-    logViews += 1;
-    if (resetAfterLastView !== undefined) {
-      clearTimeout(resetAfterLastView);
-      resetAfterLastView = undefined;
-    }
-    return () => {
-      logViews -= 1;
-      if (logViews !== 0) return;
-      // A tick later, not now: StrictMode runs this cleanup and then the
-      // setup again on the same mount, and a reset in between announced
-      // a cached pick twice. A view mounting before the tick cancels
-      // it, and nothing outside StrictMode mounts that fast.
-      resetAfterLastView = setTimeout(() => {
-        resetAfterLastView = undefined;
-        selectionLog = { videoId: "", shown: null };
-      }, 0);
-    };
-  }, []);
   useEffect(() => {
     if (!videoId) return;
     const { state, event } = nextSelectionLine(selectionLog, {
