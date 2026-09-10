@@ -1,3 +1,5 @@
+import { InnerTubeHttpError } from "@/lib/innertube/shared";
+
 /**
  * The one distinction every lyrics provider has to keep intact: "this track
  * has no lyrics" and "we could not find out" are different answers.
@@ -107,6 +109,12 @@ export function describeLyricsError(e: unknown): string {
     return known ? `${known} HTTP ${status}` : `HTTP ${status}`;
   }
   if (e instanceof LyricsTimeoutError) return "timed out";
+  // The first hop of the YouTube Music lookup goes through the shared
+  // InnerTube transport, which throws its own typed error.
+  if (e instanceof InnerTubeHttpError) {
+    const { status } = e;
+    return isHttpStatus(status) ? `YouTube Music HTTP ${status}` : "http error";
+  }
   if (e instanceof SyntaxError) return "response was not JSON";
   // AbortSignal.timeout rejects with a DOMException whose name is
   // spec-defined and read-only. Comparing it copies nothing.

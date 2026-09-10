@@ -306,14 +306,28 @@ export async function innertubePost(
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(
-      `InnerTube ${endpoint} → HTTP ${res.status}: ${text.slice(0, 300)}`,
-    );
+    throw new InnerTubeHttpError(endpoint, res.status, text.slice(0, 300));
   }
 
   const json = (await res.json()) as YtNode;
   captureVisitorData(json);
   return json;
+}
+
+/**
+ * A non-OK InnerTube response, with the status as a number so a log line
+ * can name it without reading the message. The message is what it always
+ * was: the endpoint, the status and a slice of the body, for the places
+ * that print it (`describeAuthError` trims it to the status).
+ */
+export class InnerTubeHttpError extends Error {
+  constructor(
+    readonly endpoint: string,
+    readonly status: number,
+    body: string,
+  ) {
+    super(`InnerTube ${endpoint} → HTTP ${status}: ${body}`);
+  }
 }
 
 /**

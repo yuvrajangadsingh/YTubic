@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { InnerTubeHttpError } from "@/lib/innertube/shared";
 import {
   describeLyricsError,
   LyricsHttpError,
@@ -317,6 +318,12 @@ describe("describeLyricsError", () => {
     });
     expect(describeLyricsError(hostile)).toBe("Genius page HTTP 503");
     expect(reads).toBe(2);
+  });
+
+  it("names the status of a failed YouTube Music hop, nothing else", () => {
+    const e = new InnerTubeHttpError("next", 503, "secretToken in the body");
+    expect(describeLyricsError(e)).toBe("YouTube Music HTTP 503");
+    expect(e.message).toContain("HTTP 503");
   });
 
   it("refuses a status that is not a real one", () => {
