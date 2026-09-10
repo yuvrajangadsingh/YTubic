@@ -13,11 +13,29 @@ import {
 } from "@/lib/store/auth-queries";
 
 describe("premiumStatusQuery", () => {
+  it("is keyed by the account and waits for the id to be read", () => {
+    expect(premiumStatusQuery(true, "acct").queryKey).toEqual([
+      "premium-status",
+      "acct",
+    ]);
+    expect(premiumStatusQuery(true, null).queryKey).toEqual([
+      "premium-status",
+      null,
+    ]);
+    expect(premiumStatusQuery(true, undefined).enabled).toBe(false);
+    expect(premiumStatusQuery(true, null).enabled).toBe(true);
+    expect(premiumStatusQuery(false, "acct").enabled).toBe(false);
+  });
+
   it("passes a real verdict through", async () => {
     vi.mocked(fetchPremiumStatus).mockResolvedValueOnce("premium");
-    await expect(premiumStatusQuery(true).queryFn()).resolves.toBe("premium");
+    await expect(premiumStatusQuery(true, "acct").queryFn()).resolves.toBe(
+      "premium",
+    );
     vi.mocked(fetchPremiumStatus).mockResolvedValueOnce("free");
-    await expect(premiumStatusQuery(true).queryFn()).resolves.toBe("free");
+    await expect(premiumStatusQuery(true, "acct").queryFn()).resolves.toBe(
+      "free",
+    );
   });
 
   // The query only runs once the jar is known to be signed in, so an
@@ -26,7 +44,7 @@ describe("premiumStatusQuery", () => {
   // check that had already finished.
   it("treats a signed-out answer as a failed check, not a verdict", async () => {
     vi.mocked(fetchPremiumStatus).mockResolvedValueOnce(null);
-    await expect(premiumStatusQuery(true).queryFn()).rejects.toThrow(
+    await expect(premiumStatusQuery(true, "acct").queryFn()).rejects.toThrow(
       /signed out/,
     );
   });

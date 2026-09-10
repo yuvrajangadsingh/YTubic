@@ -141,9 +141,17 @@ export function accountInfoQuery(enabled: boolean) {
  * One line per attempt, with elapsed time: a start with no finish is a
  * hang, and a same-value re-check still leaves a trace.
  */
-export function premiumStatusQuery(enabled: boolean) {
+export function premiumStatusQuery(
+  enabled: boolean,
+  accountId: string | null | undefined,
+) {
   return {
-    queryKey: ["premium-status"],
+    // Keyed by the account the answer is for. Without the id in the key,
+    // an account switch left the previous account's verdict in the cache
+    // under the new id until the full reset landed, and the record on
+    // disk was written from that pairing. `undefined` is "not read yet"
+    // and holds the query until it is.
+    queryKey: ["premium-status", accountId ?? null],
     queryFn: async (): Promise<PremiumStatus> => {
       const t0 = Date.now();
       appLog("[premium] check start");
@@ -165,7 +173,7 @@ export function premiumStatusQuery(enabled: boolean) {
       appLog(`[premium] check done in ${secondsSince(t0)}: ${status}`);
       return status;
     },
-    enabled,
+    enabled: enabled && accountId !== undefined,
     staleTime: 30 * 60 * 1000,
     ...AUTH_RETRY,
   };
