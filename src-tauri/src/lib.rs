@@ -527,6 +527,24 @@ async fn write_last_refresh(app: &tauri::AppHandle, id: &str, at: i64) -> Result
     authfs::write_atomic(last_refresh_path(app, id), at.to_string().into_bytes(), 0o600).await
 }
 
+/// `refresh-interval-mins` in the app data dir, see
+/// `session::parse_interval_override`. Read every pass of the refresh loop,
+/// so writing or deleting the file lands within a tick and needs no
+/// rebuild; missing or unreadable means the default.
+async fn refresh_interval_secs(app: &tauri::AppHandle) -> i64 {
+    let path = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("refresh-interval-mins");
+    match tokio::fs::read_to_string(path).await {
+        Ok(text) => {
+            session::parse_interval_override(&text).unwrap_or(session::REFRESH_INTERVAL_SECS)
+        }
+        Err(_) => session::REFRESH_INTERVAL_SECS,
+    }
+}
+
 /// Browser UA the login and refresh WebViews both present to Google. Kept
 /// identical so the session Google issues to the login window is the
 /// same one the refresh window later renews. These are outbound fingerprints,
@@ -2128,8 +2146,8 @@ async fn refresh_active_session(app: tauri::AppHandle) -> Result<bool, String> {
 async fn run_refresh_loop(app: tauri::AppHandle) {
     let wake = session::wake::signal();
     let mut retry = session::RetryState::default();
-    let mut interval =
-        session::REFRESH_INTERVAL_SECS + session::jitter(session::REFRESH_JITTER_SECS, jitter_seed());
+    let mut base = session::REFRESH_INTERVAL_SECS;
+    let mut interval = base + session::jitter(session::REFRESH_JITTER_SECS, jitter_seed());
     // Both conditions can hold for hours, so they log the transition and
     // then stay quiet.
     let mut warned_profileless: Option<String> = None;
@@ -2138,6 +2156,12 @@ async fn run_refresh_loop(app: tauri::AppHandle) {
 
     loop {
         let now = now_ts();
+        let wanted = refresh_interval_secs(&app).await;
+        if wanted != base {
+            eprintln!("[refresh] interval {} min (was {})", wanted / 60, base / 60);
+            base = wanted;
+            interval = base + session::jitter(session::REFRESH_JITTER_SECS, jitter_seed());
+        }
         // Read the index directly rather than through `read_index`: an
         // unreadable one would otherwise log on every tick, and this is the
         // one condition nothing in the app can heal by itself.
@@ -2186,8 +2210,8 @@ async fn run_refresh_loop(app: tauri::AppHandle) {
                     match refresh_account_cookies(&app, &active).await {
                         RefreshOutcome::Committed => {
                             retry.on_committed();
-                            interval = session::REFRESH_INTERVAL_SECS
-                                + session::jitter(session::REFRESH_JITTER_SECS, jitter_seed());
+                            interval =
+                                base + session::jitter(session::REFRESH_JITTER_SECS, jitter_seed());
                             if warned_deferred {
                                 warned_deferred = false;
                                 eprintln!("[refresh] desktop session is available again");
