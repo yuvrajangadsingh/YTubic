@@ -531,20 +531,22 @@ export function FullscreenPlayer({ onClose }: { onClose: () => void }) {
               // and where the bottom gradient reaches these labels a white
               // frame left the title at 1.36:1 and the artist line at
               // 1.22:1. 65% black (the artwork stage's own scrim) puts the
-              // title and the transport icons at 6.98:1 and the muted
-              // artist and time labels at 4.89:1 over pure white; the
-              // gradient beneath only adds to that.
+              // title and the transport icons (foreground, 98.5% white) at
+              // 6.68:1 and the muted artist and time labels at 4.89:1 over
+              // pure white; the gradient beneath only adds to that.
               <div
                 className={cn(
                   "relative flex w-[min(44rem,84vw)] min-w-0 flex-col gap-0.5 rounded-2xl bg-black/65 px-6 pb-3 pt-4 text-center transition-opacity duration-500",
                   chromeHidden && "pointer-events-none opacity-0",
                 )}
               >
-                <VideoQualityBadge className="absolute right-3 top-3" />
-                <span className="max-w-full truncate text-xl font-semibold">
+                <VideoQualityBadge className="absolute right-2 top-2" />
+                {/* Side padding keeps a long title out from under the
+                    badge, both sides so the centred text stays centred. */}
+                <span className="max-w-full truncate px-12 text-xl font-semibold">
                   {track.title}
                 </span>
-                <span className="max-w-full truncate text-sm text-muted-foreground">
+                <span className="max-w-full truncate px-12 text-sm text-muted-foreground">
                   {artistLine}
                 </span>
                 <div className="mt-3 flex w-full flex-col gap-2">{controls}</div>
