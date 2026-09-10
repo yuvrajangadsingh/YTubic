@@ -7,6 +7,7 @@ import { fetchYtMusicLyrics } from "@/lib/lyrics/ytmusic";
 import { rejectSiteChrome } from "@/lib/lyrics/plausibility";
 import {
   describeLyricsError,
+  LyricsTimeoutError,
   shouldRetryLyricsQuery,
 } from "@/lib/lyrics/errors";
 import { appLog } from "@/lib/app-log";
@@ -54,7 +55,7 @@ function lyricsTimeoutSignal(ms: number): AbortSignal {
     return AbortSignal.timeout(ms);
   }
   const controller = new AbortController();
-  setTimeout(() => controller.abort(new Error("lyrics fetch timed out")), ms);
+  setTimeout(() => controller.abort(new LyricsTimeoutError()), ms);
   return controller.signal;
 }
 
@@ -89,9 +90,14 @@ function logAttempt(
       return lyrics;
     },
     (e: unknown) => {
-      appLog(
-        `[lyrics] ${source} failed in ${secs()}: ${describeLyricsError(e)}`,
-      );
+      // Describing must never replace the rejection it describes.
+      let why = "failed";
+      try {
+        why = describeLyricsError(e);
+      } catch {
+        /* keep the default */
+      }
+      appLog(`[lyrics] ${source} failed in ${secs()}: ${why}`);
       throw e;
     },
   );
@@ -338,24 +344,47 @@ export function nextSelectionLine(
  * and then another's a second later; that is the half of the story the
  * per-attempt lines cannot tell.
  */
+/**
+ * The dedup key for what the panel is rendering, "" for nothing.
+ *
+ * `sourceSettled` is what keeps a pinned provider that is still loading
+ * apart from one that finished with nothing. Without it "genius none" was
+ * built the moment Genius was selected, which is a truthy key, which
+ * announced a miss before Genius had answered and then called its arrival
+ * a switch.
+ */
+export function selectionKey(
+  source: LyricsSource | null,
+  lyrics: Lyrics | null,
+  sourceSettled: boolean,
+): string {
+  if (!source) return "";
+  if (lyrics) return `${source} ${lyrics.kind}`;
+  return sourceSettled ? `${source} none` : "";
+}
+
 export function useLyricsSelectionLog(
   videoId: string | undefined,
   source: LyricsSource | null,
   lyrics: Lyrics | null,
   settled: boolean,
+  sourceSettled: boolean,
 ): void {
-  // "none" rather than "" when a source is selected but holds nothing:
-  // pinning Genius on a track Genius does not have is a different event
-  // from no provider having it, and the two must not share a key.
-  const shown = source ? `${source} ${lyrics ? lyrics.kind : "none"}` : "";
-  const missing = !!source && !lyrics;
-  useEffect(() => {
-    if (!videoId) {
-      // Nothing playing. Reset, or a cached pick on the way back to the
-      // track that was playing before reads as unchanged and is dropped.
+  const shown = selectionKey(source, lyrics, sourceSettled);
+  const missing = !!source && !lyrics && sourceSettled;
+  // Unmount-only, so it runs when the shell drops the player on an empty
+  // queue and not on every dependency change. That gap is unobservable
+  // from inside the hook: nothing is mounted to see it, and without this
+  // the pick from before the gap survives and swallows the announcement
+  // when the same track is played again from cache.
+  useEffect(
+    () => () => {
       selectionLog = { videoId: "", shown: null };
-      return;
-    }
+    },
+    [],
+  );
+  useEffect(() => {
+    if (!videoId) return;
     const { state, event } = nextSelectionLine(selectionLog, {
       videoId,
       shown,
