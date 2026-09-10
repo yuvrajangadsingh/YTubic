@@ -83,7 +83,8 @@ const STAGE_PALETTE = {
   // The lyrics nudge pill is `bg-surface-active/70`, and light mode's
   // surface is white at 85%: over the dark stage its grey text fell to
   // 1.23:1. This is the dark theme's value: 8.8:1 for the same text at
-  // full opacity, 5.4:1 through the pill's resting 70% group opacity.
+  // full opacity, 4.96:1 through the pill's resting 70% group opacity
+  // (4.66:1 with the noise layer taken as solid white).
   "--surface-active": "oklch(0 0 0 / 60%)",
 } as CSSProperties;
 
@@ -499,6 +500,11 @@ export function FullscreenPlayer({ onClose }: { onClose: () => void }) {
                   size="icon"
                   aria-label="Exit full screen"
                   onClick={onClose}
+                  // Backed, because in video mode the frame sits above both
+                  // scrims and a white frame put the white chevron at
+                  // 1.04:1. 60% black keeps it at 5.5:1 over pure white and
+                  // costs nothing over the artwork stage, which is dark.
+                  className="bg-black/60 hover:bg-black/75 hover:text-foreground"
                 >
                   <ChevronDownIcon />
                 </Button>

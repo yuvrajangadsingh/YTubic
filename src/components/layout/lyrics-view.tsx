@@ -640,8 +640,9 @@ function TimedLyrics({
           cut). Clicking the readout resets to 0. Rests at 70%, not 60%:
           the group opacity fades the readout along with the surface,
           and at 60% the text sat at 4.04:1 on the fullscreen stage over
-          white artwork; 70% gives 5.4:1 there and only makes the pill
-          more visible in the inline panel. */}
+          white artwork; 70% gives 4.96:1 there (4.66:1 with the noise
+          layer taken as solid white) and only makes the pill more
+          visible in the inline panel. */}
       <div className="absolute bottom-2 right-1 z-10 flex items-center gap-0.5 rounded-full border border-hairline bg-surface-active/70 px-1 py-0.5 opacity-70 backdrop-blur-md transition-opacity hover:opacity-100">
         <Tooltip>
           <TooltipTrigger asChild>
