@@ -1660,9 +1660,8 @@ fn arm_keeper_park(win: tauri::WebviewWindow) {
             {
                 return;
             }
-            let _ = page.eval(
-                "if (location.href !== 'about:blank') location.replace('about:blank')",
-            );
+            let _ =
+                page.eval("if (location.href !== 'about:blank') location.replace('about:blank')");
         });
     });
 }
