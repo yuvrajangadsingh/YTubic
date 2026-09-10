@@ -1613,20 +1613,14 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
 /// provisional navigation never reaches.
 static KEEPER_PAGE_LOADS: AtomicU64 = AtomicU64::new(0);
 
-/// Replaces the keeper's page with about:blank when dropped, if armed. See
-/// `refresh_account_cookies` for why the page goes and the window stays.
-struct ParkKeeperOnDrop(Option<tauri::WebviewWindow>);
+/// Navigations the refresh has asked of the keeper, process-wide: bumped
+/// before every build and every `navigate`. A parked page checks it so a
+/// timer from an earlier load never blanks a navigation started since.
+static KEEPER_NAV_GEN: AtomicU64 = AtomicU64::new(0);
 
-impl Drop for ParkKeeperOnDrop {
-    fn drop(&mut self) {
-        if let Some(win) = self.0.take() {
-            // `replace`, not a navigation: a navigation leaves the old page
-            // reachable by "back", and a page that is reachable can sit in
-            // the back-forward cache with its memory intact.
-            let _ = win.eval("location.replace('about:blank')");
-        }
-    }
-}
+/// How long a finished music.youtube.com load stays up before it is
+/// parked: the refresh's poll is 18 s at most, plus its commit, plus room.
+const KEEPER_PARK_AFTER: Duration = Duration::from_secs(45);
 
 /// The live "session-keeper" WebView for `id`: a hidden window on
 /// music.youtube.com that reuses the account's persisted profile. As a
@@ -1657,6 +1651,7 @@ async fn ensure_session_keeper(
     let url = "https://music.youtube.com/"
         .parse::<tauri::Url>()
         .map_err(|e| e.to_string())?;
+    KEEPER_NAV_GEN.fetch_add(1, Ordering::Relaxed);
     // Hidden, undecorated, focus-less, off-screen, no taskbar entry. Built
     // once and reused (not re-created every cycle): there is no recurring
     // window creation to flash on screen, and wry activates the app every
@@ -1679,14 +1674,31 @@ async fn ensure_session_keeper(
         // Registered on the webview, so it fires for every later
         // `navigate()` too — which is what lets a refresh tell "reloaded
         // and Google answered" from "offline, nothing happened".
-        .on_page_load(|_win, payload| {
-            // Only Google counts: the page is parked on about:blank between
-            // refreshes, and that load must not read as "reached Google".
-            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
-                && payload.url().host_str() == Some("music.youtube.com")
+        .on_page_load(|win, payload| {
+            // Only Google counts: the page is parked on about:blank after
+            // each load, and that load must not read as "reached Google".
+            if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
+                || payload.url().host_str() != Some("music.youtube.com")
             {
-                KEEPER_PAGE_LOADS.fetch_add(1, Ordering::Relaxed);
+                return;
             }
+            let load = KEEPER_PAGE_LOADS.fetch_add(1, Ordering::Relaxed) + 1;
+            let nav = KEEPER_NAV_GEN.load(Ordering::Relaxed);
+            // Park this page once the refresh that asked for it has had its
+            // poll and its commit, whatever they concluded. Tied to this
+            // load and this navigation: a newer load, or a navigation
+            // started since, means the page is no longer ours to blank.
+            // `replace`, not a navigation, so the old document is not left
+            // reachable by "back" for the back-forward cache to hold.
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(KEEPER_PARK_AFTER).await;
+                if KEEPER_PAGE_LOADS.load(Ordering::Relaxed) != load
+                    || KEEPER_NAV_GEN.load(Ordering::Relaxed) != nav
+                {
+                    return;
+                }
+                let _ = win.eval("location.replace('about:blank')");
+            });
         })
         .build()
         .map_err(|e| format!("build session-keeper: {e}"))?;
@@ -1702,26 +1714,27 @@ async fn ensure_session_keeper(
 /// requests (which renews the session and rotates its short-lived
 /// cookies), reads the full cookie set, and overwrites `cookies.enc`.
 ///
-/// Once a refresh has seen the keeper reach Google, the page is replaced
-/// with about:blank on the way out. Left on music.youtube.com between
-/// refreshes, the WebContent process behind a page nobody looks at was
-/// measured at 260 MB ten minutes after launch and 1.0 GB after eight and
-/// a half idle hours (Sep 10 2026). The window itself stays: wry activates
+/// The keeper does not stay on music.youtube.com between refreshes: each
+/// finished load parks itself on about:blank 45 s later, from the page-load
+/// hook in `ensure_session_keeper`, whatever this function concluded about
+/// it. Left up, the WebContent process behind a page nobody looks at was
+/// measured at 260 MB ten minutes after launch and 1.0 GB after eight and a
+/// half idle hours (Sep 10 2026). The window itself stays: wry activates
 /// the app whenever it builds a webview, so closing and rebuilding one
 /// every twenty minutes is not free. The session is in WebKit's cookie
-/// store, which the page does not own, and the next refresh navigates
-/// back and finds it signed in the same way the first load after a launch
-/// does. A refresh that saw no page load leaves the page alone, since it
-/// may still be loading.
+/// store, which the page does not own, and the next refresh navigates back
+/// and finds it signed in the same way the first load after a launch does.
 ///
 /// This is what survives Google's ~2h leash on *extracted* cookies: the
 /// bound browser session behind the keeper stays live, so the snapshot we
 /// replay never goes stale.
 ///
 /// Every path that is not [`RefreshOutcome::Committed`] leaves the existing
-/// jar and its success stamp exactly as they were, so we never clobber a
-/// usable jar with an empty one and never let a failed attempt look like a
-/// completed refresh.
+/// jar and its success stamp as they were, so we never clobber a usable jar
+/// with an empty one and never let a failed attempt look like a completed
+/// refresh. The one exception is a stamp that fails to write after the jar
+/// did: that reports Failed with the new jar in place and the old deadline,
+/// which errs in the same direction.
 async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOutcome {
     // Serialize refreshes so the periodic timer and a manual trigger can't
     // reload the keeper / rewrite the jar on top of each other.
@@ -1746,13 +1759,11 @@ async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOut
         }
         Err(e) => return RefreshOutcome::Failed(e),
     };
-    // Armed further down, once this refresh has seen a page load; dropped
-    // on every way out of this function after that.
-    let mut park = ParkKeeperOnDrop(None);
     // A reused keeper is reloaded to force fresh authenticated traffic; a
     // just-created one is already loading the URL from the builder.
     if !created {
         if let Ok(u) = "https://music.youtube.com/".parse::<tauri::Url>() {
+            KEEPER_NAV_GEN.fetch_add(1, Ordering::Relaxed);
             let _ = win.navigate(u);
         }
     }
@@ -1861,12 +1872,6 @@ async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOut
     // requiring both would fail a legitimate cycle in which Google happened
     // to rotate nothing.
     let reloaded = KEEPER_PAGE_LOADS.load(Ordering::Relaxed) > loads_before;
-    // Only a keeper that finished loading is parked. One that did not may
-    // still be mid-renewal, and blanking it would cut off exactly what the
-    // next attempt is waiting for.
-    if reloaded {
-        park.0 = Some(win.clone());
-    }
     let renewed = previous
         .as_deref()
         .is_none_or(|p| session::jars_differ(p, &snapshot));
