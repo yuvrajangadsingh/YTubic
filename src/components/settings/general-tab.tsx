@@ -6,6 +6,7 @@ import {
   BellIcon,
   Loader2Icon,
   LogInIcon,
+  PanelTopIcon,
   RocketIcon,
   UserRoundIcon,
   XIcon,
@@ -114,6 +115,8 @@ function BehaviorGroup() {
   const setPlaybackNotifications = useSettingsStore(
     (s) => s.setPlaybackNotifications,
   );
+  const notchSongPeek = useSettingsStore((s) => s.notchSongPeek);
+  const setNotchSongPeek = useSettingsStore((s) => s.setNotchSongPeek);
 
   const qc = useQueryClient();
   const autostart = useQuery({
@@ -161,6 +164,20 @@ function BehaviorGroup() {
           />
         }
       />
+      {IS_MAC && (
+        <SettingRow
+          icon={PanelTopIcon}
+          title="Show song changes at the notch"
+          description="When a new song starts, the notch grows for a moment to show its name."
+          control={
+            <Switch
+              checked={notchSongPeek}
+              onCheckedChange={setNotchSongPeek}
+              aria-label="Show song changes at the notch"
+            />
+          }
+        />
+      )}
       <SettingRow
         icon={XIcon}
         title={IS_MAC ? "Close to menu bar" : "Close to tray"}
