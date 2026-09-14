@@ -33,6 +33,7 @@ mod cast;
 mod discord;
 mod lastfm;
 mod media;
+mod notch;
 mod session;
 mod stream_proxy;
 mod ytdlp;
@@ -5385,6 +5386,7 @@ pub fn run() {
             pick_cache_folder,
             focus_main_window,
             open_player_window,
+            notch::notch_set_enabled,
             close_player_window,
             set_now_playing,
             set_playback_activity,
