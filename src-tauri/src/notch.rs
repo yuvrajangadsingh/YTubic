@@ -66,15 +66,17 @@ pub const LINE_HEIGHT: f64 = 16.0;
 /// Point size of the text.
 pub const FONT_SIZE: f64 = 12.0;
 /// How long the open shape stays before it springs back.
-pub const HOLD_SECS: f64 = 2.0;
+pub const HOLD_SECS: f64 = 2.5;
 /// Animation tick.
 pub const TICK_SECS: f64 = 1.0 / 60.0;
 /// Opening spring, mass 1: a little bounce.
 pub const OPEN_STIFFNESS: f64 = 224.0;
 pub const OPEN_DAMPING: f64 = 24.0;
-/// Closing spring, mass 1: critically damped, no bounce back into the housing.
-pub const CLOSE_STIFFNESS: f64 = 195.0;
-pub const CLOSE_DAMPING: f64 = 28.0;
+/// Closing spring, mass 1: critically damped, no bounce back into the
+/// housing, and slow enough to read as the shape retreating rather than
+/// snapping shut.
+pub const CLOSE_STIFFNESS: f64 = 64.0;
+pub const CLOSE_DAMPING: f64 = 16.0;
 
 /// The housing of a screen, or None when it has none (external display,
 /// clamshell, pre-notch MacBook).
@@ -1024,7 +1026,7 @@ mod tests {
             damping: CLOSE_DAMPING,
         });
         assert_eq!(x, 0.0);
-        assert!(ticks < 60, "ticks {ticks}");
+        assert!((40..90).contains(&ticks), "ticks {ticks}");
         let mut s = Spring {
             x: 1.0,
             v: 0.0,
