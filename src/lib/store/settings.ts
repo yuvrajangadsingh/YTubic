@@ -25,6 +25,10 @@ type State = {
   /** Height cap for the video-mode companion stream. 1080 doubles as
    *  "Auto": the server picks the best track at or under the cap. */
   videoQuality: VideoQuality;
+  /** macOS only: when a new song starts, the notch grows for a moment
+   *  to show its name, then springs back. Off by default. The panel lives
+   *  in `src-tauri/src/notch.rs`, fed by the media bridge. */
+  notchSongPeek: boolean;
   /** Broadcast the current track to Discord as a Rich Presence status
    *  ("Listening to YTubic"). Off by default — opt-in for privacy.
    *  The IPC worker lives in `src-tauri/src/discord.rs`. */
@@ -53,6 +57,7 @@ type State = {
   setBackground: (v: BackgroundMode) => void;
   setPlaybackNotifications: (v: boolean) => void;
   setVideoQuality: (v: VideoQuality) => void;
+  setNotchSongPeek: (v: boolean) => void;
   setDiscordRichPresence: (v: boolean) => void;
   setLastfmEnabled: (v: boolean) => void;
   setLastfmLoveSync: (v: boolean) => void;
@@ -78,6 +83,7 @@ export const useSettingsStore = create<State>()(
       background: "ambient",
       playbackNotifications: false,
       videoQuality: 1080,
+      notchSongPeek: false,
       discordRichPresence: false,
       lastfmEnabled: false,
       lastfmSessionKey: null,
@@ -91,6 +97,7 @@ export const useSettingsStore = create<State>()(
       setPlaybackNotifications: (playbackNotifications) =>
         set({ playbackNotifications }),
       setVideoQuality: (videoQuality) => set({ videoQuality }),
+      setNotchSongPeek: (notchSongPeek) => set({ notchSongPeek }),
       setDiscordRichPresence: (discordRichPresence) =>
         set({ discordRichPresence }),
       setLastfmEnabled: (lastfmEnabled) => set({ lastfmEnabled }),

@@ -27,6 +27,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAudioEngine } from "@/lib/audio-engine";
 import { useCacheAutoClean } from "@/lib/cache-cleanup";
 import { usePlaybackNotifications } from "@/lib/playback-notifications";
+import { useNotchPeek } from "@/lib/notch";
 import { useLastfmScrobbler } from "@/lib/lastfm-scrobbler";
 import { useYtdlpSetup } from "@/lib/ytdlp";
 import { useUpdateStartupCheck } from "@/lib/updater";
@@ -104,6 +105,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   useDiscordPresenceSync();
   useCacheAutoClean();
   usePlaybackNotifications();
+  useNotchPeek();
   useLastfmScrobbler();
   const mode = useLayoutStore((s) => s.mode);
   const setMode = useLayoutStore((s) => s.setMode);
