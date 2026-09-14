@@ -2112,6 +2112,7 @@ export function useAudioEngine() {
         void invoke("media_clear").catch(() => {});
         return;
       }
+      const el = audioRef.current;
       void invoke("media_update", {
         title: t.title,
         artist: buildArtistLabel(t),
@@ -2120,12 +2121,19 @@ export function useAudioEngine() {
         duration: Number.isFinite(s.duration) ? s.duration : 0,
         elapsed: s.position,
         paused: !s.playing,
+        // Audio really running, not just meant to be: the notch peek waits
+        // for this so a track skipped past never flashes its name.
+        started: !!el && !el.paused && el.readyState >= 3 && !el.ended,
       }).catch(() => {});
     };
     push();
-    if (!playing) return;
-    const id = window.setInterval(push, 2000);
-    return () => window.clearInterval(id);
+    const el = audioRef.current;
+    el?.addEventListener("playing", push);
+    const id = playing ? window.setInterval(push, 2000) : undefined;
+    return () => {
+      el?.removeEventListener("playing", push);
+      if (id !== undefined) window.clearInterval(id);
+    };
   }, [track, playing, duration]);
 
   // Discord Rich Presence mirrors the same metadata, but pushed only on
