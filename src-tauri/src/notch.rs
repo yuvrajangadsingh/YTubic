@@ -4,7 +4,8 @@
 //! at rest it is the housing's own outline, which sits behind the hardware
 //! and draws nothing, and fully open it is a rounded tab reaching `DROP`
 //! points below the menu bar with a note glyph and "Title · Artist" on one
-//! line. It holds for `HOLD_SECS`, springs back, and the panel is ordered
+//! line. It holds for `HOLD_SECS`, longer when the text has to scroll
+//! past, springs back, and the panel is ordered
 //! out again. Nothing is on screen while idle, and while open the only
 //! black beside the housing at menu bar height is the two `EAR` slivers
 //! at the very top edge.
@@ -69,6 +70,11 @@ pub const FONT_SIZE: f64 = 12.0;
 pub const HOLD_SECS: f64 = 2.5;
 /// Animation tick.
 pub const TICK_SECS: f64 = 1.0 / 60.0;
+/// Text wider than its box scrolls left at this pace during the hold.
+pub const SCROLL_PT_PER_SEC: f64 = 40.0;
+/// Still time before a scroll starts and after it ends, so the first and
+/// the last words can be read.
+pub const SCROLL_REST_SECS: f64 = 0.8;
 /// Opening spring, mass 1: a little bounce.
 pub const OPEN_STIFFNESS: f64 = 224.0;
 pub const OPEN_DAMPING: f64 = 24.0;
@@ -196,6 +202,27 @@ pub fn content_alpha(t: f64) -> f64 {
     ((t - 0.5) * 2.0).clamp(0.0, 1.0)
 }
 
+/// How long the open shape holds: `HOLD_SECS` when the text fits, else long
+/// enough for `overflow` points of it to scroll past at reading pace with a
+/// rest at each end.
+pub fn hold_secs(overflow: f64) -> f64 {
+    if overflow <= 0.0 {
+        HOLD_SECS
+    } else {
+        (2.0 * SCROLL_REST_SECS + overflow / SCROLL_PT_PER_SEC).max(HOLD_SECS)
+    }
+}
+
+/// Horizontal shift of the text `elapsed` seconds into the hold: none
+/// through the opening rest, then left at reading pace until the tail of the
+/// text is in view.
+pub fn scroll_offset(elapsed: f64, overflow: f64) -> f64 {
+    if overflow <= 0.0 {
+        return 0.0;
+    }
+    -((elapsed - SCROLL_REST_SECS) * SCROLL_PT_PER_SEC).clamp(0.0, overflow)
+}
+
 /// Whether audio is really running, from the media bridge's optional
 /// `started` flag. A frontend that predates the flag sends none, and for
 /// it a moving position is the only signal there is; when the flag is
@@ -300,6 +327,7 @@ pub fn clear() {}
 mod imp {
     use std::cell::{Cell, RefCell};
     use std::ptr::{null, NonNull};
+    use std::time::Instant;
 
     use block2::RcBlock;
     use objc2::rc::Retained;
@@ -325,6 +353,9 @@ mod imp {
         panel: Retained<NSPanel>,
         shape: Retained<CAShapeLayer>,
         icon: Option<Retained<NSImageView>>,
+        /// Clips the text to its box; the label inside is as wide as its
+        /// text and slides left when that is wider than the box.
+        clip: Retained<NSView>,
         label: Retained<NSTextField>,
         /// Token from addObserverForName:. Held because passing it back to
         /// removeObserver: is the only way to unregister, and nothing does:
@@ -359,6 +390,16 @@ mod imp {
         gen: u64,
         ticker: Option<Retained<NSTimer>>,
         hold: Option<Retained<NSTimer>>,
+        /// Points of text past the right edge of its box, 0 when it fits.
+        overflow: f64,
+        /// When the current hold began. The scroll is placed by wall time,
+        /// not by counting ticks: NSTimer drops firings it missed instead
+        /// of catching up, and the hold timer runs on wall time too.
+        hold_started: Option<Instant>,
+        /// When the end of the text was put in view this hold; the hold
+        /// start itself when the text fits. None until the scroll gets
+        /// there. The close waits a full rest after this moment.
+        tail_at: Option<Instant>,
     }
 
     thread_local! {
@@ -379,6 +420,9 @@ mod imp {
                 gen: 0,
                 ticker: None,
                 hold: None,
+                overflow: 0.0,
+                hold_started: None,
+                tail_at: None,
             })
         };
     }
@@ -421,13 +465,15 @@ mod imp {
                 Some(pill) => pill,
                 None => slot.insert(build(mtm)),
             };
-            apply_layout(pill, layout);
             pill.label.setStringValue(&NSString::from_str(text));
+            apply_layout(pill, layout);
         });
+        let overflow = text_overflow();
         let gen = ANIM.with(|a| {
             let mut a = a.borrow_mut();
             a.gen += 1;
             a.layout = Some(layout);
+            a.overflow = overflow;
             if let Some(hold) = a.hold.take() {
                 hold.invalidate();
             }
@@ -435,7 +481,18 @@ mod imp {
         });
         let phase = ANIM.with(|a| a.borrow().phase);
         match phase {
-            Phase::Holding => schedule_hold(gen),
+            Phase::Holding => {
+                ANIM.with(|a| {
+                    let mut a = a.borrow_mut();
+                    let now = Instant::now();
+                    a.hold_started = Some(now);
+                    a.tail_at = (overflow <= 0.0).then_some(now);
+                });
+                schedule_hold(gen, super::hold_secs(overflow));
+                if overflow > 0.0 {
+                    start_ticker();
+                }
+            }
             Phase::Opening => {}
             Phase::Idle | Phase::Closing => {
                 ANIM.with(|a| {
@@ -482,12 +539,30 @@ mod imp {
         });
     }
 
-    /// One 60 Hz step of the spring.
+    /// One 60 Hz step: the text scroll while holding, the spring otherwise.
     fn tick() {
-        let (x, settled, phase, gen) = ANIM.with(|a| {
+        if ANIM.with(|a| a.borrow().phase) == Phase::Holding {
+            let (shift, done) = ANIM.with(|a| {
+                let a = a.borrow();
+                let shift = super::scroll_offset(hold_elapsed(&a), a.overflow);
+                (shift, shift <= -a.overflow)
+            });
+            set_scroll(shift);
+            if done {
+                ANIM.with(|a| {
+                    let mut a = a.borrow_mut();
+                    if a.tail_at.is_none() {
+                        a.tail_at = Some(Instant::now());
+                    }
+                });
+                stop_ticker();
+            }
+            return;
+        }
+        let (x, settled, phase, gen, overflow) = ANIM.with(|a| {
             let mut a = a.borrow_mut();
             let settled = a.spring.step(super::TICK_SECS);
-            (a.spring.x, settled, a.phase, a.gen)
+            (a.spring.x, settled, a.phase, a.gen, a.overflow)
         });
         draw(x);
         if !settled {
@@ -495,9 +570,17 @@ mod imp {
         }
         match phase {
             Phase::Opening => {
-                ANIM.with(|a| a.borrow_mut().phase = Phase::Holding);
-                stop_ticker();
-                schedule_hold(gen);
+                ANIM.with(|a| {
+                    let mut a = a.borrow_mut();
+                    a.phase = Phase::Holding;
+                    let now = Instant::now();
+                    a.hold_started = Some(now);
+                    a.tail_at = (overflow <= 0.0).then_some(now);
+                });
+                if overflow <= 0.0 {
+                    stop_ticker();
+                }
+                schedule_hold(gen, super::hold_secs(overflow));
             }
             Phase::Closing => {
                 ANIM.with(|a| a.borrow_mut().phase = Phase::Idle);
@@ -512,22 +595,48 @@ mod imp {
         }
     }
 
-    /// The hold ran out: spring back, unless something newer happened.
+    enum AfterHold {
+        Nothing,
+        /// The ticker fell behind (a stalled main thread) and the tail of
+        /// the text never got placed: put it in view and rest once more.
+        ShowTail(f64),
+        /// The tail got there late; rest this much longer before closing.
+        RestMore(f64),
+        Close,
+    }
+
+    /// The hold ran out: spring back, unless something newer happened or
+    /// the tail of the text has not been in view for a full rest yet.
     fn hold_fired(gen: u64) {
-        let go = ANIM.with(|a| {
+        let next = ANIM.with(|a| {
             let mut a = a.borrow_mut();
             a.hold = None;
             if a.gen != gen || a.phase != Phase::Holding {
-                return false;
+                return AfterHold::Nothing;
+            }
+            let Some(tail_at) = a.tail_at else {
+                a.tail_at = Some(Instant::now());
+                return AfterHold::ShowTail(a.overflow);
+            };
+            let rested = tail_at.elapsed().as_secs_f64();
+            if rested < super::SCROLL_REST_SECS {
+                return AfterHold::RestMore(super::SCROLL_REST_SECS - rested);
             }
             a.phase = Phase::Closing;
             a.spring.target = 0.0;
             a.spring.stiffness = super::CLOSE_STIFFNESS;
             a.spring.damping = super::CLOSE_DAMPING;
-            true
+            AfterHold::Close
         });
-        if go {
-            start_ticker();
+        match next {
+            AfterHold::Nothing => {}
+            AfterHold::ShowTail(overflow) => {
+                stop_ticker();
+                set_scroll(-overflow);
+                schedule_hold(gen, super::SCROLL_REST_SECS);
+            }
+            AfterHold::RestMore(secs) => schedule_hold(gen, secs),
+            AfterHold::Close => start_ticker(),
         }
     }
 
@@ -555,13 +664,12 @@ mod imp {
         });
     }
 
-    fn schedule_hold(gen: u64) {
+    fn schedule_hold(gen: u64, secs: f64) {
         let block = RcBlock::new(move |_timer: NonNull<NSTimer>| hold_fired(gen));
         // SAFETY: as for the ticker; common modes so a held-open menu does
         // not freeze the peek on screen.
         let timer = unsafe {
-            let timer =
-                NSTimer::timerWithTimeInterval_repeats_block(super::HOLD_SECS, false, &block);
+            let timer = NSTimer::timerWithTimeInterval_repeats_block(secs, false, &block);
             NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
             timer
         };
@@ -571,6 +679,32 @@ mod imp {
                 old.invalidate();
             }
         });
+    }
+
+    /// Seconds since the current hold began, 0 outside a hold.
+    fn hold_elapsed(a: &Anim) -> f64 {
+        a.hold_started
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
+    /// Slide the text left by `shift` points (0 or negative).
+    fn set_scroll(shift: f64) {
+        PILL.with(|p| {
+            if let Some(pill) = p.borrow().as_ref() {
+                pill.label.setFrameOrigin(NSPoint::new(shift, 0.0));
+            }
+        });
+    }
+
+    /// Points of text past the right edge of its box after `apply_layout`.
+    fn text_overflow() -> f64 {
+        PILL.with(|p| {
+            p.borrow()
+                .as_ref()
+                .map(|pill| (pill.label.frame().size.width - pill.clip.frame().size.width).max(0.0))
+                .unwrap_or(0.0)
+        })
     }
 
     /// Write the outline and content opacity for progress `x`.
@@ -642,8 +776,14 @@ mod imp {
             view.setFrame(bounds);
         }
         pill.shape.setFrame(bounds);
-        pill.label
-            .setFrame(to_ns_rect(super::label_frame(l.body_w)));
+        let text_box = to_ns_rect(super::label_frame(l.body_w));
+        pill.clip.setFrame(text_box);
+        pill.label.sizeToFit();
+        let text_w = pill.label.frame().size.width.max(text_box.size.width);
+        pill.label.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(text_w, super::LINE_HEIGHT),
+        ));
         if let Some(icon) = &pill.icon {
             icon.setFrame(to_ns_rect(super::icon_frame()));
         }
@@ -670,6 +810,34 @@ mod imp {
             }
         });
         draw(x);
+        // The box may be a different width now and apply_layout put the
+        // text back at its start: measure again and, mid-hold, restore the
+        // scroll position and give the hold whatever time the new width
+        // still needs.
+        let overflow = text_overflow();
+        let (phase, gen, elapsed) = ANIM.with(|a| {
+            let mut a = a.borrow_mut();
+            a.overflow = overflow;
+            (a.phase, a.gen, hold_elapsed(&a))
+        });
+        if phase != Phase::Holding {
+            return;
+        }
+        let shift = super::scroll_offset(elapsed, overflow);
+        set_scroll(shift);
+        ANIM.with(|a| {
+            let mut a = a.borrow_mut();
+            if shift > -overflow {
+                a.tail_at = None;
+            } else if a.tail_at.is_none() {
+                a.tail_at = Some(Instant::now());
+            }
+        });
+        let left = (super::hold_secs(overflow) - elapsed).max(super::SCROLL_REST_SECS);
+        schedule_hold(gen, left);
+        if overflow > 0.0 {
+            start_ticker();
+        }
     }
 
     /// Layout for the first NSScreen with a camera housing.
@@ -769,10 +937,16 @@ mod imp {
             super::FONT_SIZE,
             weight,
         )));
-        label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        label.setLineBreakMode(NSLineBreakMode::ByClipping);
         label.setDrawsBackground(false);
         label.setBezeled(false);
-        view.addSubview(&label);
+        let clip = NSView::initWithFrame(mtm.alloc::<NSView>(), NSRect::ZERO);
+        clip.setWantsLayer(true);
+        if let Some(layer) = clip.layer() {
+            layer.setMasksToBounds(true);
+        }
+        clip.addSubview(&label);
+        view.addSubview(&clip);
 
         let block = RcBlock::new(move |_note: NonNull<NSNotification>| {
             screens_changed();
@@ -794,6 +968,7 @@ mod imp {
             panel,
             shape,
             icon,
+            clip,
             label,
             _screens_observer: observer,
         }
@@ -1082,6 +1257,35 @@ mod tests {
         assert!(audio_started(Some(true), 0.0));
         assert!(!audio_started(None, 0.0));
         assert!(audio_started(None, 0.5));
+    }
+
+    #[test]
+    fn hold_is_fixed_for_text_that_fits_and_grows_with_the_overflow() {
+        assert_eq!(hold_secs(0.0), HOLD_SECS);
+        assert_eq!(hold_secs(-3.0), HOLD_SECS);
+        // A few points over still gets the plain hold, not a shorter one.
+        assert_eq!(hold_secs(8.0), HOLD_SECS);
+        let long = hold_secs(80.0);
+        assert!((long - 3.6).abs() < 1e-9, "hold {long}");
+    }
+
+    #[test]
+    fn scroll_rests_then_moves_at_reading_pace_and_stops_at_the_tail() {
+        assert_eq!(scroll_offset(0.0, 80.0), 0.0);
+        assert_eq!(scroll_offset(SCROLL_REST_SECS, 80.0), 0.0);
+        let mid = scroll_offset(SCROLL_REST_SECS + 1.0, 80.0);
+        assert!((mid + SCROLL_PT_PER_SEC).abs() < 1e-9, "mid {mid}");
+        assert_eq!(scroll_offset(60.0, 80.0), -80.0);
+        assert_eq!(scroll_offset(60.0, 0.0), 0.0);
+        // The tail is in view for a full rest before the hold ends.
+        for overflow in [1.0, 40.0, 80.0, 300.0] {
+            let at_rest = hold_secs(overflow) - SCROLL_REST_SECS;
+            let shift = scroll_offset(at_rest, overflow);
+            assert!(
+                (shift + overflow).abs() < 1e-6,
+                "overflow {overflow} shift {shift}"
+            );
+        }
     }
 
     #[test]
