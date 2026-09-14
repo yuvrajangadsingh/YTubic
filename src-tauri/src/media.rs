@@ -147,8 +147,13 @@ pub fn media_update(
     duration: f64,
     elapsed: f64,
     paused: bool,
+    started: Option<bool>,
 ) {
     let _ = app.run_on_main_thread(move || {
+        // The notch peek sits on this path even though the OS controls
+        // below are Linux-only; it no-ops off macOS.
+        let started = crate::notch::audio_started(started, elapsed);
+        crate::notch::on_media(&title, &artist, paused, started);
         apply(title, artist, album, thumbnail, duration, !paused, elapsed);
     });
 }
@@ -156,5 +161,8 @@ pub fn media_update(
 /// Tell the OS nothing is playing (queue emptied / signed out).
 #[tauri::command]
 pub fn media_clear(app: AppHandle) {
-    let _ = app.run_on_main_thread(clear);
+    let _ = app.run_on_main_thread(|| {
+        crate::notch::clear();
+        clear();
+    });
 }
