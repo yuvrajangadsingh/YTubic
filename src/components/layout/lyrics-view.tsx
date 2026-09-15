@@ -400,6 +400,26 @@ function easeInOutCubic(t: number): number {
   return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 }
 
+/**
+ * Where line `idx` sits in the scroll content and where its anchor is:
+ * the very first line is pinned to the top, any later line is placed with
+ * its centre at `ratio` of the column so more upcoming lines stay
+ * visible. getBoundingClientRect avoids depending on offsetParent.
+ */
+function measureLine(
+  container: HTMLElement,
+  el: HTMLElement,
+  idx: number,
+  ratio: number,
+) {
+  const cRect = container.getBoundingClientRect();
+  const eRect = el.getBoundingClientRect();
+  const top = eRect.top - cRect.top + container.scrollTop;
+  const target =
+    idx === 0 ? 0 : container.clientHeight * ratio - el.clientHeight / 2;
+  return { top, target };
+}
+
 function TimedLyrics({
   lines,
   offset,
@@ -419,6 +439,10 @@ function TimedLyrics({
   const rafRef = useRef<number | null>(null);
   const position = usePlaybackStore((s) => s.position);
   const seek = usePlaybackStore((s) => s.seek);
+  // False while the active line sits above its anchor because the column
+  // is already scrolled to the top (a line early in the song): it then
+  // overlaps the blur strip, which has to get out of the way.
+  const [anchored, setAnchored] = useState(true);
 
   // A short break marker (invisible spacer) can become the "active"
   // line between stanzas, which made the highlight vanish for a few
@@ -452,13 +476,24 @@ function TimedLyrics({
   useEffect(() => {
     const container = scrollRef.current;
     if (!container) return;
-    const idx = findActiveIdx(
+    // A scroll animation still running for the previous lyric set would
+    // land on top of this snap; the animated effect below no longer
+    // cancels it, since the snap leaves prevActiveRef at the new index.
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    let idx = findActiveIdx(
       lines,
       usePlaybackStore.getState().position - offsetRef.current,
     );
+    // Same walk-back as the render: a spacer never carries the highlight,
+    // so it must not be the line that gets snapped to and measured.
+    while (idx > 0 && isSpacerLine(lines[idx])) idx--;
     prevActiveRef.current = idx;
     if (idx < 0) {
       container.scrollTop = 0;
+      setAnchored(true);
       return;
     }
     const el = container.querySelector<HTMLElement>(
@@ -466,16 +501,12 @@ function TimedLyrics({
     );
     if (!el) {
       container.scrollTop = 0;
+      setAnchored(true);
       return;
     }
-    const cRect = container.getBoundingClientRect();
-    const eRect = el.getBoundingClientRect();
-    const elTopWithinContent = eRect.top - cRect.top + container.scrollTop;
-    const target =
-      idx === 0
-        ? 0
-        : container.clientHeight * viewportRatio - el.clientHeight / 2;
-    container.scrollTop = Math.max(0, elTopWithinContent - target);
+    const { top, target } = measureLine(container, el, idx, viewportRatio);
+    container.scrollTop = Math.max(0, top - target);
+    setAnchored(top >= target);
   }, [lines]);
 
   useEffect(() => {
@@ -488,20 +519,14 @@ function TimedLyrics({
       `[data-line-idx="${activeIdx}"]`,
     );
     if (!el) return;
-    // Position the active line above center so more upcoming lines stay
-    // visible. getBoundingClientRect avoids depending on offsetParent.
-    const cRect = container.getBoundingClientRect();
-    const eRect = el.getBoundingClientRect();
-    const elTopWithinContent =
-      eRect.top - cRect.top + container.scrollTop;
-    // The very first line is treated as a special case: we pin it to
-    // the top of the viewport instead of the usual ~45% position. For
-    // any later line, the active-line-above-center rule applies.
-    const target =
-      activeIdx === 0
-        ? 0
-        : container.clientHeight * viewportRatio - el.clientHeight / 2;
-    const targetTop = Math.max(0, elTopWithinContent - target);
+    const { top, target } = measureLine(
+      container,
+      el,
+      activeIdx,
+      viewportRatio,
+    );
+    const targetTop = Math.max(0, top - target);
+    setAnchored(top >= target);
 
     if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     const startTop = container.scrollTop;
@@ -526,6 +551,29 @@ function TimedLyrics({
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     };
   }, []);
+
+  // A resize (panel dragged, fullscreen toggled) moves the anchor and the
+  // strip while the line stays put; measure it again.
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!container || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      if (activeIdx < 0) return;
+      const el = container.querySelector<HTMLElement>(
+        `[data-line-idx="${activeIdx}"]`,
+      );
+      if (!el) return;
+      const { top, target } = measureLine(
+        container,
+        el,
+        activeIdx,
+        viewportRatio,
+      );
+      setAnchored(top >= target);
+    });
+    ro.observe(container);
+    return () => ro.disconnect();
+  }, [activeIdx, viewportRatio]);
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">
@@ -656,12 +704,14 @@ function TimedLyrics({
           user manually scrolls up to find an earlier line, that line
           becomes clear as it leaves the blurred strip.
           When the very first line is active it sits at viewport top
-          (no above-center offset), so we fade the overlay out to keep
-          the first line crisp. */}
+          (no above-center offset), and a line early in the song cannot
+          be scrolled down to its anchor at all (the column is already at
+          the top), so in both cases the overlay fades out to keep the
+          line crisp. */}
       <div
         aria-hidden
         className="lyrics-blur-overlay pointer-events-none absolute inset-x-0 top-0 h-[26%] transition-opacity duration-500 ease-in-out"
-        style={{ opacity: activeIdx <= 0 ? 0 : 1 }}
+        style={{ opacity: activeIdx <= 0 || !anchored ? 0 : 1 }}
       />
       {/* Sync nudge, floats over the faded bottom edge of the column.
           Nudges the highlight in 0.25s steps for tracks whose audio is
