@@ -121,6 +121,27 @@ function stormActive(): boolean {
   return stormActiveUntil > performance.now();
 }
 
+// WebKit suspends a hidden page's web process about 20 s after its audio
+// stops, and from then on the media keys go unanswered until the window
+// comes back (Sep 2026: pause with the keyboard, hide the window, play
+// does nothing). A page that changes its title while hidden is allowed
+// to keep running, the way a Safari tab showing a countdown is, so flip
+// an invisible suffix when the page is hidden with a paused track. WebKit
+// ignores a title change within 5 s of a click or a page load, hence the
+// second try; once granted, the exemption lasts until the next page load.
+let awakeRetry: number | undefined;
+function keepHiddenPageAwake(el: HTMLAudioElement, retry = true): void {
+  const hidden = document.visibilityState !== "visible";
+  if (!hidden || !el.src || !el.paused) return;
+  const t = document.title;
+  document.title = t.endsWith("\u200b") ? t.slice(0, -1) : `${t}\u200b`;
+  appLog("title nudge, page hidden");
+  window.clearTimeout(awakeRetry);
+  if (retry) {
+    awakeRetry = window.setTimeout(() => keepHiddenPageAwake(el, false), 6000);
+  }
+}
+
 function noteFlip(kind: "play" | "pause"): void {
   const now = performance.now();
   if (stormActiveUntil > now) {
@@ -558,8 +579,10 @@ export function useAudioEngine() {
     // never started while it was hidden. A repeated play() on an element
     // whose earlier play() is still pending is a no-op, so this is safe
     // even when WebKit was merely slow rather than blocked.
+    const onKeepAwake = () => keepHiddenPageAwake(el);
     const onVisibility = () => {
       appLog(`visibility ${document.visibilityState} ${mediaState(el)}`);
+      onKeepAwake();
       if (document.visibilityState !== "visible") return;
       if (store().playing && el.paused && el.src && !videoHoldRef.current) {
         appLog("resuming after visibility change");
@@ -581,6 +604,10 @@ export function useAudioEngine() {
     el.addEventListener("playing", onPlaying);
     el.addEventListener("waiting", onWaiting);
     for (const t of LOGGED) el.addEventListener(t, onLogged);
+    el.addEventListener("pause", onKeepAwake);
+    // A track resolved after the pause loads into an element that stays
+    // paused, so no pause event: catch it when the metadata lands.
+    el.addEventListener("loadedmetadata", onKeepAwake);
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       el.removeEventListener("play", onFlipPlay);
@@ -595,6 +622,9 @@ export function useAudioEngine() {
       el.removeEventListener("playing", onPlaying);
       el.removeEventListener("waiting", onWaiting);
       for (const t of LOGGED) el.removeEventListener(t, onLogged);
+      el.removeEventListener("pause", onKeepAwake);
+      el.removeEventListener("loadedmetadata", onKeepAwake);
+      window.clearTimeout(awakeRetry);
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, []);
