@@ -167,13 +167,13 @@ function BehaviorGroup() {
       {IS_MAC && (
         <SettingRow
           icon={PanelTopIcon}
-          title="Show song changes at the notch"
-          description="When a new song starts, the notch grows for a moment to show its name."
+          title="Show playback at the notch"
+          description="When a song starts, pauses or resumes, the notch grows for a moment to show it."
           control={
             <Switch
               checked={notchSongPeek}
               onCheckedChange={setNotchSongPeek}
-              aria-label="Show song changes at the notch"
+              aria-label="Show playback at the notch"
             />
           }
         />
