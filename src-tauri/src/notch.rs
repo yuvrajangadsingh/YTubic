@@ -1,12 +1,12 @@
-//! A song-change peek at the MacBook camera housing.
+//! A playback peek at the MacBook camera housing.
 //!
-//! When a new track starts playing, a black shape grows out of the housing:
-//! at rest it is the housing's own outline, which sits behind the hardware
-//! and draws nothing, and fully open it is a rounded tab reaching `DROP`
-//! points below the menu bar with a note glyph and "Title · Artist" on one
-//! line. It holds for `HOLD_SECS`, longer when the text has to scroll
-//! past, springs back, and the panel is ordered
-//! out again. Nothing is on screen while idle, and while open the only
+//! When a new track starts playing, and when the track pauses or resumes,
+//! a black shape grows out of the housing: at rest it is the housing's own
+//! outline, which sits behind the hardware and draws nothing, and fully
+//! open it is a rounded tab reaching `DROP` points below the menu bar with
+//! a glyph (note, pause or play) and "Title · Artist" on one line. It holds
+//! for the kind's base time, longer when the text has to scroll past,
+//! springs back, and the panel is ordered out again. Nothing is on screen while idle, and while open the only
 //! black beside the housing at menu bar height is the two `EAR` slivers
 //! at the very top edge.
 //!
@@ -66,8 +66,10 @@ pub const GAP: f64 = 8.0;
 pub const LINE_HEIGHT: f64 = 16.0;
 /// Point size of the text.
 pub const FONT_SIZE: f64 = 12.0;
-/// How long the open shape stays before it springs back.
+/// How long a song peek stays open before it springs back.
 pub const HOLD_SECS: f64 = 2.5;
+/// How long a pause or resume peek stays: a confirmation, not a title card.
+pub const SHORT_HOLD_SECS: f64 = 1.5;
 /// Animation tick.
 pub const TICK_SECS: f64 = 1.0 / 60.0;
 /// Text wider than its box scrolls left at this pace during the hold.
@@ -202,14 +204,14 @@ pub fn content_alpha(t: f64) -> f64 {
     ((t - 0.5) * 2.0).clamp(0.0, 1.0)
 }
 
-/// How long the open shape holds: `HOLD_SECS` when the text fits, else long
+/// How long the open shape holds: `base` when the text fits, else long
 /// enough for `overflow` points of it to scroll past at reading pace with a
 /// rest at each end.
-pub fn hold_secs(overflow: f64) -> f64 {
+pub fn hold_secs(overflow: f64, base: f64) -> f64 {
     if overflow <= 0.0 {
-        HOLD_SECS
+        base
     } else {
-        (2.0 * SCROLL_REST_SECS + overflow / SCROLL_PT_PER_SEC).max(HOLD_SECS)
+        (2.0 * SCROLL_REST_SECS + overflow / SCROLL_PT_PER_SEC).max(base)
     }
 }
 
@@ -266,39 +268,100 @@ impl Spring {
     }
 }
 
-/// Decides which media updates get a peek: the first update for a new
-/// (title, artist) that has actually started playing, once. Pause, resume,
-/// seeks and the periodic position pushes all repeat a key already shown and
-/// so do nothing.
+/// What a peek is about, which picks its glyph and its base hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Song,
+    Pause,
+    Resume,
+}
+
+impl Kind {
+    /// The SF Symbol drawn before the text.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Kind::Song => "music.note",
+            Kind::Pause => "pause.fill",
+            Kind::Resume => "play.fill",
+        }
+    }
+
+    /// Hold when the text fits.
+    pub fn hold_secs(self) -> f64 {
+        match self {
+            Kind::Song => HOLD_SECS,
+            Kind::Pause | Kind::Resume => SHORT_HOLD_SECS,
+        }
+    }
+}
+
+/// One thing to show at the notch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peek {
+    pub kind: Kind,
+    pub text: String,
+}
+
+/// Decides which media updates get a peek. A new (title, artist) peeks once
+/// it has actually started playing; after that the same track peeks again
+/// each time it pauses and each time it resumes. Seeks and the periodic
+/// position pushes change neither the key nor the pause state and so do
+/// nothing. A track that arrives paused is not shown until it plays, and
+/// then it counts as a new song, not a resume.
 #[derive(Debug, Default)]
 pub struct Tracker {
     shown: Option<(String, String)>,
+    /// Pause state of `shown` as last seen.
+    paused: bool,
 }
 
 impl Tracker {
-    /// The text to peek for this update, if any.
+    /// The peek for this update, if any.
     pub fn observe(
         &mut self,
         title: &str,
         artist: &str,
         paused: bool,
         started: bool,
-    ) -> Option<String> {
+    ) -> Option<Peek> {
         let key = (title.trim().to_string(), artist.trim().to_string());
-        if key.0.is_empty() || paused || !started {
-            return None;
-        }
-        if self.shown.as_ref() == Some(&key) {
+        if key.0.is_empty() {
             return None;
         }
         let text = pill_text(&key.0, Some(&key.1));
-        self.shown = Some(key);
-        Some(text)
+        if self.shown.as_ref() != Some(&key) {
+            if paused || !started {
+                return None;
+            }
+            self.shown = Some(key);
+            self.paused = false;
+            return Some(Peek {
+                kind: Kind::Song,
+                text,
+            });
+        }
+        if paused && !self.paused {
+            self.paused = true;
+            return Some(Peek {
+                kind: Kind::Pause,
+                text,
+            });
+        }
+        // Play was pressed, but audio only counts once it is running.
+        if !paused && self.paused && started {
+            self.paused = false;
+            return Some(Peek {
+                kind: Kind::Resume,
+                text,
+            });
+        }
+        None
     }
 
     /// Nothing is playing any more; the next track counts as new again.
     pub fn clear(&mut self) {
         self.shown = None;
+        self.paused = false;
     }
 }
 
@@ -345,7 +408,7 @@ mod imp {
     };
     use objc2_quartz_core::{CAShapeLayer, CATransaction};
 
-    use super::{Seg, Spring, Tracker};
+    use super::{Peek, Seg, Spring, Tracker};
 
     /// Everything the peek owns on screen. Built on first use, then reused.
     /// AppKit objects here are only ever touched on the main thread.
@@ -392,6 +455,8 @@ mod imp {
         hold: Option<Retained<NSTimer>>,
         /// Points of text past the right edge of its box, 0 when it fits.
         overflow: f64,
+        /// Hold for the current peek when its text fits.
+        base_hold: f64,
         /// When the current hold began. The scroll is placed by wall time,
         /// not by counting ticks: NSTimer drops firings it missed instead
         /// of catching up, and the hold timer runs on wall time too.
@@ -421,6 +486,7 @@ mod imp {
                 ticker: None,
                 hold: None,
                 overflow: 0.0,
+                base_hold: super::HOLD_SECS,
                 hold_started: None,
                 tail_at: None,
             })
@@ -437,10 +503,10 @@ mod imp {
     /// A media update from the frontend. `started` means audio is actually
     /// running, not just intended to.
     pub fn on_media(title: &str, artist: &str, paused: bool, started: bool) {
-        let text = TRACKER.with(|t| t.borrow_mut().observe(title, artist, paused, started));
-        if let Some(text) = text {
+        let peek = TRACKER.with(|t| t.borrow_mut().observe(title, artist, paused, started));
+        if let Some(peek) = peek {
             if ENABLED.with(|e| e.get()) {
-                present(&text);
+                present(&peek);
             }
         }
     }
@@ -451,8 +517,8 @@ mod imp {
         dismiss();
     }
 
-    /// Show `text`, opening the shape if it is not already out.
-    fn present(text: &str) {
+    /// Show `peek`, opening the shape if it is not already out.
+    fn present(peek: &Peek) {
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
@@ -465,15 +531,24 @@ mod imp {
                 Some(pill) => pill,
                 None => slot.insert(build(mtm)),
             };
-            pill.label.setStringValue(&NSString::from_str(text));
+            pill.label.setStringValue(&NSString::from_str(&peek.text));
+            if let Some(icon) = &pill.icon {
+                let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    &NSString::from_str(peek.kind.symbol()),
+                    None,
+                );
+                icon.setImage(image.as_deref());
+            }
             apply_layout(pill, layout);
         });
         let overflow = text_overflow();
+        let base = peek.kind.hold_secs();
         let gen = ANIM.with(|a| {
             let mut a = a.borrow_mut();
             a.gen += 1;
             a.layout = Some(layout);
             a.overflow = overflow;
+            a.base_hold = base;
             if let Some(hold) = a.hold.take() {
                 hold.invalidate();
             }
@@ -488,7 +563,7 @@ mod imp {
                     a.hold_started = Some(now);
                     a.tail_at = (overflow <= 0.0).then_some(now);
                 });
-                schedule_hold(gen, super::hold_secs(overflow));
+                schedule_hold(gen, super::hold_secs(overflow, base));
                 if overflow > 0.0 {
                     start_ticker();
                 }
@@ -559,10 +634,10 @@ mod imp {
             }
             return;
         }
-        let (x, settled, phase, gen, overflow) = ANIM.with(|a| {
+        let (x, settled, phase, gen, overflow, base) = ANIM.with(|a| {
             let mut a = a.borrow_mut();
             let settled = a.spring.step(super::TICK_SECS);
-            (a.spring.x, settled, a.phase, a.gen, a.overflow)
+            (a.spring.x, settled, a.phase, a.gen, a.overflow, a.base_hold)
         });
         draw(x);
         if !settled {
@@ -580,7 +655,7 @@ mod imp {
                 if overflow <= 0.0 {
                     stop_ticker();
                 }
-                schedule_hold(gen, super::hold_secs(overflow));
+                schedule_hold(gen, super::hold_secs(overflow, base));
             }
             Phase::Closing => {
                 ANIM.with(|a| a.borrow_mut().phase = Phase::Idle);
@@ -815,10 +890,10 @@ mod imp {
         // scroll position and give the hold whatever time the new width
         // still needs.
         let overflow = text_overflow();
-        let (phase, gen, elapsed) = ANIM.with(|a| {
+        let (phase, gen, elapsed, base) = ANIM.with(|a| {
             let mut a = a.borrow_mut();
             a.overflow = overflow;
-            (a.phase, a.gen, hold_elapsed(&a))
+            (a.phase, a.gen, hold_elapsed(&a), a.base_hold)
         });
         if phase != Phase::Holding {
             return;
@@ -833,7 +908,7 @@ mod imp {
                 a.tail_at = Some(Instant::now());
             }
         });
-        let left = (super::hold_secs(overflow) - elapsed).max(super::SCROLL_REST_SECS);
+        let left = (super::hold_secs(overflow, base) - elapsed).max(super::SCROLL_REST_SECS);
         schedule_hold(gen, left);
         if overflow > 0.0 {
             start_ticker();
@@ -1215,40 +1290,92 @@ mod tests {
         }
     }
 
+    fn peek(kind: Kind, text: &str) -> Option<Peek> {
+        Some(Peek {
+            kind,
+            text: text.to_string(),
+        })
+    }
+
     #[test]
     fn tracker_peeks_a_new_song_once_it_starts() {
         let mut t = Tracker::default();
         assert_eq!(t.observe("Kabira", "Arijit Singh", false, false), None);
         assert_eq!(
             t.observe("Kabira", "Arijit Singh", false, true),
-            Some("Kabira \u{00b7} Arijit Singh".to_string())
+            peek(Kind::Song, "Kabira \u{00b7} Arijit Singh")
+        );
+        // Position pushes and seeks while playing.
+        assert_eq!(t.observe("Kabira", "Arijit Singh", false, true), None);
+        assert_eq!(t.observe("Kabira", "Arijit Singh", false, true), None);
+    }
+
+    #[test]
+    fn tracker_peeks_pause_and_resume_of_the_shown_song() {
+        let mut t = Tracker::default();
+        assert!(t.observe("Kabira", "Arijit Singh", false, true).is_some());
+        assert_eq!(
+            t.observe("Kabira", "Arijit Singh", true, false),
+            peek(Kind::Pause, "Kabira \u{00b7} Arijit Singh")
+        );
+        // Still paused: position pushes and seeks say nothing new.
+        assert_eq!(t.observe("Kabira", "Arijit Singh", true, false), None);
+        // Play pressed, audio not running yet.
+        assert_eq!(t.observe("Kabira", "Arijit Singh", false, false), None);
+        assert_eq!(
+            t.observe("Kabira", "Arijit Singh", false, true),
+            peek(Kind::Resume, "Kabira \u{00b7} Arijit Singh")
         );
         assert_eq!(t.observe("Kabira", "Arijit Singh", false, true), None);
-        assert_eq!(t.observe("Kabira", "Arijit Singh", true, true), None);
-        assert_eq!(t.observe("Kabira", "Arijit Singh", false, true), None);
+        assert_eq!(
+            t.observe("Kabira", "Arijit Singh", true, false),
+            peek(Kind::Pause, "Kabira \u{00b7} Arijit Singh")
+        );
     }
 
     #[test]
     fn tracker_waits_while_paused_and_ignores_empty_titles() {
         let mut t = Tracker::default();
-        assert_eq!(t.observe("Piche Tere", "Kunwarr", true, true), None);
+        // A track that arrives paused is a new song when it plays, not a
+        // resume.
+        assert_eq!(t.observe("Piche Tere", "Kunwarr", true, false), None);
         assert_eq!(
             t.observe("Piche Tere", "Kunwarr", false, true),
-            Some("Piche Tere \u{00b7} Kunwarr".to_string())
+            peek(Kind::Song, "Piche Tere \u{00b7} Kunwarr")
         );
         assert_eq!(t.observe("  ", "Kunwarr", false, true), None);
         assert_eq!(
             t.observe("Tasveer", "", false, true),
-            Some("Tasveer".to_string())
+            peek(Kind::Song, "Tasveer")
         );
+        // Pausing a different track than the one shown says nothing.
+        assert_eq!(t.observe("Piche Tere", "Kunwarr", true, false), None);
     }
 
     #[test]
     fn tracker_clear_makes_the_same_song_new_again() {
         let mut t = Tracker::default();
         assert!(t.observe("Kabira", "Arijit Singh", false, true).is_some());
+        assert!(t.observe("Kabira", "Arijit Singh", true, false).is_some());
         t.clear();
-        assert!(t.observe("Kabira", "Arijit Singh", false, true).is_some());
+        assert_eq!(
+            t.observe("Kabira", "Arijit Singh", false, true)
+                .map(|p| p.kind),
+            Some(Kind::Song)
+        );
+    }
+
+    #[test]
+    fn pause_and_resume_peeks_are_short() {
+        assert_eq!(Kind::Song.hold_secs(), HOLD_SECS);
+        assert_eq!(Kind::Pause.hold_secs(), SHORT_HOLD_SECS);
+        assert_eq!(Kind::Resume.hold_secs(), SHORT_HOLD_SECS);
+        assert_eq!(hold_secs(0.0, SHORT_HOLD_SECS), SHORT_HOLD_SECS);
+        // A scroll takes the time it takes, whatever the base.
+        let long = hold_secs(80.0, SHORT_HOLD_SECS);
+        assert!((long - 3.6).abs() < 1e-9, "hold {long}");
+        assert_eq!(Kind::Pause.symbol(), "pause.fill");
+        assert_eq!(Kind::Resume.symbol(), "play.fill");
     }
 
     #[test]
@@ -1261,11 +1388,11 @@ mod tests {
 
     #[test]
     fn hold_is_fixed_for_text_that_fits_and_grows_with_the_overflow() {
-        assert_eq!(hold_secs(0.0), HOLD_SECS);
-        assert_eq!(hold_secs(-3.0), HOLD_SECS);
+        assert_eq!(hold_secs(0.0, HOLD_SECS), HOLD_SECS);
+        assert_eq!(hold_secs(-3.0, HOLD_SECS), HOLD_SECS);
         // A few points over still gets the plain hold, not a shorter one.
-        assert_eq!(hold_secs(8.0), HOLD_SECS);
-        let long = hold_secs(80.0);
+        assert_eq!(hold_secs(8.0, HOLD_SECS), HOLD_SECS);
+        let long = hold_secs(80.0, HOLD_SECS);
         assert!((long - 3.6).abs() < 1e-9, "hold {long}");
     }
 
@@ -1279,7 +1406,7 @@ mod tests {
         assert_eq!(scroll_offset(60.0, 0.0), 0.0);
         // The tail is in view for a full rest before the hold ends.
         for overflow in [1.0, 40.0, 80.0, 300.0] {
-            let at_rest = hold_secs(overflow) - SCROLL_REST_SECS;
+            let at_rest = hold_secs(overflow, HOLD_SECS) - SCROLL_REST_SECS;
             let shift = scroll_offset(at_rest, overflow);
             assert!(
                 (shift + overflow).abs() < 1e-6,

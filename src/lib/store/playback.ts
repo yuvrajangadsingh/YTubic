@@ -91,6 +91,9 @@ export type PlaybackState = {
   muted: boolean;
   /** Current playhead, seconds. */
   position: number;
+  /** How many times the queue has run out (last track done, repeat off):
+   *  lets the audio engine tell that stop from a pause. */
+  queueEnded: number;
   /** Real duration (from audio element, once loaded). */
   duration: number;
   /** When the user drags the slider, we seek here on release. */
@@ -244,6 +247,7 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
   muted: false,
   position: 0,
   duration: 0,
+  queueEnded: 0,
   pendingSeek: undefined,
 
   playNow: (track, extras) => {
@@ -456,7 +460,7 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
     let nextIndex = index + 1;
     if (nextIndex >= queue.length) {
       if (repeat !== "all") {
-        set({ playing: false, position: 0 });
+        set({ playing: false, position: 0, queueEnded: get().queueEnded + 1 });
         return;
       }
       // Looping with shuffle on → reshuffle so the next pass isn't identical.
