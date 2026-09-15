@@ -25,9 +25,9 @@ type State = {
   /** Height cap for the video-mode companion stream. 1080 doubles as
    *  "Auto": the server picks the best track at or under the cap. */
   videoQuality: VideoQuality;
-  /** macOS only: when a new song starts, the notch grows for a moment
-   *  to show its name, then springs back. Off by default. The panel lives
-   *  in `src-tauri/src/notch.rs`, fed by the media bridge. */
+  /** macOS only: when a song starts, pauses or resumes, the notch grows
+   *  for a moment to show it, then springs back. Off by default. The panel
+   *  lives in `src-tauri/src/notch.rs`, fed by the media bridge. */
   notchSongPeek: boolean;
   /** Broadcast the current track to Discord as a Rich Presence status
    *  ("Listening to YTubic"). Off by default — opt-in for privacy.
