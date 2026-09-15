@@ -227,6 +227,11 @@ export function useAudioEngine() {
     premiumOk: boolean;
   } | null>(null);
   const carrySeekRef = useRef<{ token: number; seconds: number } | null>(null);
+  // Which queue slot the element's src belongs to; unset from the moment a
+  // resolve drops the old src until the new one is installed.
+  const loadedSlotRef = useRef<{ videoId?: string; index: number } | null>(
+    null,
+  );
   // Counts how many tracks have failed in a row without a successful
   // play in between. Reset to 0 on `playing`. Used to short-circuit
   // auto-skip after a few consecutive failures so we don't burn through
@@ -808,6 +813,7 @@ export function useAudioEngine() {
     // playing through the streamUrlFor() round-trip (~50–500 ms), so the
     // user hears the tail of track A bleed into the start of track B.
     el.pause();
+    loadedSlotRef.current = null;
     if (!streamVideoId) {
       el.removeAttribute("src");
       el.load();
@@ -917,6 +923,7 @@ export function useAudioEngine() {
           console.debug("[audio] setting src for", videoId, "→", src);
         }
         el.src = src;
+        loadedSlotRef.current = { videoId, index };
         const st = usePlaybackStore.getState();
         st.setStreamUrl(src);
         const carry = carrySeekRef.current;
@@ -2032,6 +2039,8 @@ export function useAudioEngine() {
   // re-triggers the resolve / playback effects above.
   const duration = usePlaybackStore((s) => s.duration);
   const position = usePlaybackStore((s) => s.position);
+  const queueEnded = usePlaybackStore((s) => s.queueEnded);
+  const seenQueueEndRef = useRef(0);
 
   // Long-outro auto-advance. Extended uploads and music-video audio can
   // run minutes past the actual song; when the synced lyrics say the
@@ -2121,10 +2130,22 @@ export function useAudioEngine() {
         duration: Number.isFinite(s.duration) ? s.duration : 0,
         elapsed: s.position,
         paused: !s.playing,
-        // Audio really running, not just meant to be: the notch peek waits
-        // for this so a track skipped past never flashes its name.
-        started: !!el && !el.paused && el.readyState >= 3 && !el.ended,
+        // Audio really running, not just meant to be, and for this queue
+        // slot: an end guard can advance the store while the element is
+        // still on the previous song. The notch peek waits for this so a
+        // track skipped past never flashes its name.
+        started:
+          !!el &&
+          loadedSlotRef.current?.videoId === t.videoId &&
+          loadedSlotRef.current?.index === s.index &&
+          !el.paused &&
+          el.readyState >= 3 &&
+          !el.ended,
+        // The queue ran out with the last track still loaded; without this
+        // the notch would call that stop a pause.
+        finished: s.queueEnded !== seenQueueEndRef.current,
       }).catch(() => {});
+      seenQueueEndRef.current = s.queueEnded;
     };
     push();
     const el = audioRef.current;
@@ -2134,7 +2155,7 @@ export function useAudioEngine() {
       el?.removeEventListener("playing", push);
       if (id !== undefined) window.clearInterval(id);
     };
-  }, [track, playing, duration]);
+  }, [track, playing, duration, queueEnded]);
 
   // Discord Rich Presence mirrors the same metadata, but pushed only on
   // track / play-state / duration change — never the 2s position refresh

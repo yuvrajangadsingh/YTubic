@@ -88,6 +88,16 @@ describe("playback next()", () => {
     expect(s.position).toBe(0);
   });
 
+  it("counts a queue end so the engine can tell it from a pause", () => {
+    setup({ queue: [track("a"), track("b")], index: 0, repeat: "off" });
+    const before = usePlaybackStore.getState().queueEnded;
+    usePlaybackStore.getState().next();
+    expect(usePlaybackStore.getState().queueEnded).toBe(before);
+    usePlaybackStore.getState().next();
+    expect(usePlaybackStore.getState().queueEnded).toBe(before + 1);
+    expect(usePlaybackStore.getState().playing).toBe(false);
+  });
+
   it("advances to the next track mid-queue", () => {
     setup({
       queue: [track("a"), track("b"), track("c")],

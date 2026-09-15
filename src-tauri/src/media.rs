@@ -148,12 +148,19 @@ pub fn media_update(
     elapsed: f64,
     paused: bool,
     started: Option<bool>,
+    finished: Option<bool>,
 ) {
     let _ = app.run_on_main_thread(move || {
         // The notch peek sits on this path even though the OS controls
         // below are Linux-only; it no-ops off macOS.
         let started = crate::notch::audio_started(started, elapsed);
-        crate::notch::on_media(&title, &artist, paused, started);
+        // The queue ran out: that is not a pause, so no pause peek, and the
+        // track counts as new if it is played again.
+        if finished.unwrap_or(false) {
+            crate::notch::clear();
+        } else {
+            crate::notch::on_media(&title, &artist, paused, started);
+        }
         apply(title, artist, album, thumbnail, duration, !paused, elapsed);
     });
 }
