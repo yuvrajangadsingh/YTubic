@@ -2975,6 +2975,7 @@ async fn merge_response_cookies(
     app: tauri::AppHandle,
     host: String,
     set_cookies: Vec<String>,
+    for_account: Option<String>,
 ) -> Result<bool, String> {
     if set_cookies.is_empty() {
         return Ok(false);
@@ -2982,6 +2983,12 @@ async fn merge_response_cookies(
     let Some(id) = read_index(&app).await.active else {
         return Ok(false);
     };
+    // A request bound to an account names it here. After a switch mid-flight
+    // the active jar is someone else's, and the rotation is dropped rather
+    // than written into it.
+    if for_account.is_some_and(|a| a != id) {
+        return Ok(false);
+    }
     // Held across the whole read-modify-write, and shared with the refresh
     // commit and the login write, so a rotation can no longer be lost to a
     // snapshot landing between the read and the rename.

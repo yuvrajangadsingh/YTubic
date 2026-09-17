@@ -74,7 +74,7 @@ function buildContext(): {
 export const DESKTOP_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-const BASE_HEADERS: Record<string, string> = {
+export const BASE_HEADERS: Record<string, string> = {
   "Content-Type": "application/json",
   "User-Agent": DESKTOP_UA,
   "X-YouTube-Client-Name": "67",
@@ -237,13 +237,22 @@ export function splitSetCookieHeader(raw: string): string[] {
  *
  * Best-effort by design: a failed merge must never fail the data call
  * that triggered it.
+ *
+ * `forAccount` names the account a bound request went out as. Rust merges
+ * into whichever jar is active when the response lands, so after a switch
+ * mid-flight a bound response is dropped instead of putting one account's
+ * rotated cookies into the other's jar. A request bound to no account
+ * (null) went out without cookies and no jar is owed what came back.
  */
-export async function captureSetCookies(res: Response): Promise<void> {
+export async function captureSetCookies(
+  res: Response,
+  forAccount?: string | null,
+): Promise<void> {
   const lines =
     typeof res.headers.getSetCookie === "function"
       ? res.headers.getSetCookie()
       : splitSetCookieHeader(res.headers.get("set-cookie") ?? "");
-  if (lines.length === 0) return;
+  if (lines.length === 0 || forAccount === null) return;
   let host: string;
   try {
     host = new URL(res.url).hostname;
@@ -254,6 +263,7 @@ export async function captureSetCookies(res: Response): Promise<void> {
     const changed = await invoke<boolean>("merge_response_cookies", {
       host,
       setCookies: lines,
+      forAccount: forAccount ?? null,
     });
     // A rotated value means the cached Cookie header is stale — drop
     // it so the next request sends what Google just issued.
@@ -388,7 +398,7 @@ export async function innertubePost(
     enter("cookies");
 
     // Before the error bail: Google rotates cookies on 4xx responses too.
-    await captureSetCookies(res);
+    await captureSetCookies(res, opts.forAccount);
     enter("body");
 
     if (!res.ok) {
