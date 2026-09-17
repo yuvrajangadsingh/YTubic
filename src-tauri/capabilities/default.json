@@ -11,6 +11,7 @@
       "allow": [
         { "url": "https://music.youtube.com/*" },
         { "url": "https://www.youtube.com/*" },
+        { "url": "https://s.youtube.com/*" },
         { "url": "https://www.google.com/*" },
         { "url": "https://i.ytimg.com/*" },
         { "url": "https://yt3.ggpht.com/*" },
