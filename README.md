@@ -105,8 +105,7 @@ On top of everything upstream already does:
 - **Video mode** — watch the video version of a track at 1080p, 1440p or 4K,
   through a quality picker that only offers the tiers a given video actually has
 - **Lyrics that pick the right record** — matched on identity rather than the
-  closest guess, padded intros auto-aligned, and manual timing nudges that stick
-  to the track instead of resetting
+  closest guess, with padded intros auto-aligned
 - **Accent colour from the cover** — the seek bar, play button and active toggles
   take their colour from the album art instead of staying brand red
 - **Search history** — recent queries saved and offered on the empty search page

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CheckIcon, MicVocalIcon, MinusIcon, PlusIcon } from "lucide-react";
+import { CheckIcon, MicVocalIcon } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -56,87 +56,6 @@ function savePref(p: Pref) {
   }
 }
 
-/**
- * Per-track lyric sync nudge, persisted as a videoId to seconds map.
- * Needed because the streamed audio is sometimes a different edit than
- * the one the lyric timings were cut to (a music video vs the album
- * track), so the lines run ahead of or behind the vocal by a constant
- * per-song amount that no global setting can fix. Positive = lyrics
- * fire later.
- */
-const OFFSETS_KEY = "ytm:lyrics-offsets";
-const OFFSET_STEP_S = 0.25;
-const OFFSET_LIMIT_S = 15;
-/** Soft cap on stored offsets; oldest-touched entries get trimmed
- *  first (JS objects iterate in insertion order, same trick the
- *  track-source store uses for its byVideoId map). */
-const MAX_OFFSET_ENTRIES = 500;
-
-/** A nudge is only meaningful against the lyric record it was tuned
- *  on. `sig` pins it there: when a better record replaces the old one
- *  (matcher fixes, cache-key bumps), a stale nudge would silently
- *  shift the CORRECT timings; that exact thing happened with a -5.5s
- *  nudge dialed in against wrong lyrics. Legacy plain-number entries
- *  are ignored for the same reason. */
-type OffsetEntry = { s: number; sig: string };
-
-function loadOffsetMap(): Record<string, OffsetEntry | number> {
-  try {
-    const raw = localStorage.getItem(OFFSETS_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw) as unknown;
-    if (parsed && typeof parsed === "object") {
-      return parsed as Record<string, OffsetEntry | number>;
-    }
-  } catch {
-    /* corrupted entry, start fresh */
-  }
-  return {};
-}
-
-function loadOffset(videoId: string, recordSig: string | null): number {
-  const v = loadOffsetMap()[videoId];
-  if (
-    v &&
-    typeof v === "object" &&
-    Number.isFinite(v.s) &&
-    recordSig !== null &&
-    v.sig === recordSig
-  ) {
-    return v.s;
-  }
-  return 0;
-}
-
-function saveOffset(
-  videoId: string,
-  seconds: number,
-  recordSig: string | null,
-): void {
-  try {
-    const map = loadOffsetMap();
-    // Delete-then-set moves the key to the end of insertion order, so
-    // the cap below always evicts the least recently adjusted tracks.
-    delete map[videoId];
-    if (seconds !== 0 && recordSig !== null) {
-      map[videoId] = { s: seconds, sig: recordSig };
-    }
-    const keys = Object.keys(map);
-    for (const k of keys.slice(0, Math.max(0, keys.length - MAX_OFFSET_ENTRIES))) {
-      delete map[k];
-    }
-    localStorage.setItem(OFFSETS_KEY, JSON.stringify(map));
-  } catch {
-    /* noop */
-  }
-}
-
-function formatOffset(seconds: number): string {
-  if (seconds === 0) return "0s";
-  const trimmed = seconds.toFixed(2).replace(/\.?0+$/, "");
-  return `${seconds > 0 ? "+" : ""}${trimmed}s`;
-}
-
 export type LyricsViewState = {
   active: Lyrics | null;
   isLoading: boolean;
@@ -145,10 +64,8 @@ export type LyricsViewState = {
   setPref: (p: Pref) => void;
   best: LyricsSource | null;
   availability: Record<LyricsSource, Availability>;
-  /** Per-track sync nudge in seconds; positive = lyrics fire later. */
+  /** Estimated lead-in in seconds; positive = lyrics fire later. */
   offset: number;
-  nudgeOffset: (deltaSeconds: number) => void;
-  resetOffset: () => void;
 };
 
 /**
@@ -169,37 +86,6 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
   };
 
   const videoId = track?.videoId;
-  const autoOffsetRef = useRef(0);
-  // The active record's signature lands after the queries resolve;
-  // mirrored in a ref so the user-triggered nudge handlers always see
-  // the current one.
-  const recordSigRef = useRef<string | null>(null);
-  const [offset, setOffsetState] = useState(0);
-  const nudgeOffset = (deltaSeconds: number) => {
-    if (!videoId) return;
-    // Round to the step grid so repeated float adds can't drift into
-    // 0.7500000000000001-style labels. Seed from the auto-alignment
-    // when the user hasn't nudged yet, so the first click fine-tunes
-    // it instead of snapping back to zero.
-    const base = offset !== 0 ? offset : autoOffsetRef.current;
-    const raw = base + deltaSeconds;
-    const next = Math.max(
-      -OFFSET_LIMIT_S,
-      Math.min(
-        OFFSET_LIMIT_S,
-        Math.round(raw / OFFSET_STEP_S) * OFFSET_STEP_S,
-      ),
-    );
-    setOffsetState(next);
-    saveOffset(videoId, next, recordSigRef.current);
-  };
-  const resetOffset = () => {
-    if (!videoId) return;
-    setOffsetState(0);
-    saveOffset(videoId, 0, recordSigRef.current);
-    setAutoOffset(0);
-  };
-
   const { queries, best, isLoading, settled } = useLyricsSources(
     track,
     !!track,
@@ -208,14 +94,10 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
   // Auto-alignment for uploads with a padded intro: when the playing
   // file is a few seconds longer than the recording the timings were
   // cut for AND the audio itself starts that many seconds in, shift
-  // the lyrics by that lead-in. Applies only while the user hasn't set
-  // their own nudge; a manual nudge always wins.
+  // the lyrics by that lead-in.
   const streamUrl = usePlaybackStore((s) => s.streamUrl);
   const realDuration = usePlaybackStore((s) => s.duration);
   const [autoOffset, setAutoOffset] = useState(0);
-  // Mirrored in a ref so nudgeOffset (declared above) can seed from the
-  // current auto value without stale-closure games.
-  autoOffsetRef.current = autoOffset;
   useEffect(() => {
     setAutoOffset(0);
   }, [videoId]);
@@ -264,19 +146,9 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
 
   const recordDurationSec =
     active?.kind === "timed" ? active.recordDurationSec : undefined;
-  const recordSig =
-    active?.kind === "timed"
-      ? `${active.source ?? ""}:${recordDurationSec ?? 0}`
-      : null;
-  recordSigRef.current = recordSig;
-  // Load the saved nudge only once the record it was tuned against is
-  // known, so a nudge pinned to a different record stays ignored.
-  useEffect(() => {
-    setOffsetState(videoId ? loadOffset(videoId, recordSig) : 0);
-  }, [videoId, recordSig]);
 
   useEffect(() => {
-    if (!videoId || offset !== 0) return;
+    if (!videoId) return;
     if (!streamUrl || !realDuration || !recordDurationSec) return;
     let cancelled = false;
     void estimateLeadInOffset(streamUrl, realDuration, recordDurationSec).then(
@@ -287,11 +159,7 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
     return () => {
       cancelled = true;
     };
-  }, [videoId, streamUrl, realDuration, recordDurationSec, offset]);
-
-  // The user's saved nudge wins outright; the estimated lead-in only
-  // fills the gap while they haven't touched the dial.
-  const effectiveOffset = offset !== 0 ? offset : autoOffset;
+  }, [videoId, streamUrl, realDuration, recordDurationSec]);
 
   return {
     active,
@@ -301,9 +169,7 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
     setPref,
     best,
     availability,
-    offset: effectiveOffset,
-    nudgeOffset,
-    resetOffset,
+    offset: autoOffset,
   };
 }
 
@@ -342,8 +208,6 @@ export function LyricsBody({
       <TimedLyrics
         lines={state.active.lines}
         offset={state.offset}
-        onNudge={state.nudgeOffset}
-        onReset={state.resetOffset}
         viewportRatio={viewportRatio}
         melt={melt}
       />
@@ -423,15 +287,11 @@ function measureLine(
 function TimedLyrics({
   lines,
   offset,
-  onNudge,
-  onReset,
   viewportRatio = ACTIVE_LINE_VIEWPORT_RATIO,
   melt = "soft",
 }: {
   lines: TimedLine[];
   offset: number;
-  onNudge: (deltaSeconds: number) => void;
-  onReset: () => void;
   viewportRatio?: number;
   melt?: "full" | "soft";
 }) {
@@ -455,7 +315,7 @@ function TimedLyrics({
   // Positive offset = lyrics fire later, i.e. the playhead is treated
   // as being earlier in the song. Kept in a ref too so the mount-snap
   // effect below (deps: [lines]) reads the current value without
-  // re-snapping on every nudge.
+  // re-snapping when the lead-in estimate lands.
   const rawActiveIdx = findActiveIdx(lines, position - offset);
   let activeIdx = rawActiveIdx;
   while (activeIdx > 0 && isSpacerLine(lines[activeIdx])) activeIdx--;
@@ -713,56 +573,6 @@ function TimedLyrics({
         className="lyrics-blur-overlay pointer-events-none absolute inset-x-0 top-0 h-[26%] transition-opacity duration-500 ease-in-out"
         style={{ opacity: activeIdx <= 0 || !anchored ? 0 : 1 }}
       />
-      {/* Sync nudge, floats over the faded bottom edge of the column.
-          Nudges the highlight in 0.25s steps for tracks whose audio is
-          a different edit than the lyric timings (music video vs album
-          cut). Clicking the readout resets to 0. Rests at 70%, not 60%:
-          the group opacity fades the readout along with the surface,
-          and at 60% the text sat at 4.04:1 on the fullscreen stage over
-          white artwork; 70% gives 4.96:1 there (4.66:1 with the noise
-          layer taken as solid white) and only makes the pill more
-          visible in the inline panel. */}
-      <div className="absolute bottom-2 right-1 z-10 flex items-center gap-0.5 rounded-full border border-hairline bg-surface-active/70 px-1 py-0.5 opacity-70 backdrop-blur-md transition-opacity hover:opacity-100">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              aria-label="Lyrics earlier"
-              onClick={() => onNudge(-OFFSET_STEP_S)}
-              className="flex size-5 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-white/10 hover:text-foreground"
-            >
-              <MinusIcon className="size-3.5" />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent>Lyrics earlier</TooltipContent>
-        </Tooltip>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              aria-label="Reset lyrics offset"
-              onClick={onReset}
-              className="min-w-11 text-center text-xs font-medium tabular-nums text-muted-foreground transition-colors hover:text-foreground"
-            >
-              {formatOffset(offset)}
-            </button>
-          </TooltipTrigger>
-          <TooltipContent>Sync offset (click to reset)</TooltipContent>
-        </Tooltip>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              aria-label="Lyrics later"
-              onClick={() => onNudge(OFFSET_STEP_S)}
-              className="flex size-5 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-white/10 hover:text-foreground"
-            >
-              <PlusIcon className="size-3.5" />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent>Lyrics later</TooltipContent>
-        </Tooltip>
-      </div>
     </div>
   );
 }
