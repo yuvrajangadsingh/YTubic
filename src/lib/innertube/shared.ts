@@ -74,7 +74,7 @@ function buildContext(): {
 export const DESKTOP_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-const BASE_HEADERS: Record<string, string> = {
+export const BASE_HEADERS: Record<string, string> = {
   "Content-Type": "application/json",
   "User-Agent": DESKTOP_UA,
   "X-YouTube-Client-Name": "67",
