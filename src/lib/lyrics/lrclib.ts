@@ -29,7 +29,7 @@ import { LyricsHttpError } from "@/lib/lyrics/errors";
  * API docs ask clients to identify themselves with.
  */
 
-const USER_AGENT = "YTubic (https://github.com/yuvrajangadsingh/YTubic)";
+const USER_AGENT = "Radif (https://github.com/yuvrajangadsingh/radif)";
 
 type LrclibParams = {
   title: string;

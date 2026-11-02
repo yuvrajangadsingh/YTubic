@@ -135,12 +135,12 @@ export function AppSidebar() {
          *  16px). In collapsed mode the row centers it like the
          *  centered menu icons below. */}
         <img
-          src="/ytubic-icon.svg"
-          alt="YTubic"
+          src="/radif-icon.svg"
+          alt="Radif"
           className="size-7 shrink-0"
         />
         <span className="text-xl font-semibold leading-none tracking-tight transition-opacity duration-200 group-data-[collapsible=icon]:hidden">
-          YTubic
+          Radif
         </span>
         {IS_BETA_PLATFORM && (
           <span
@@ -726,8 +726,8 @@ function UserProfile() {
               <DialogTitle>Sign out?</DialogTitle>
               <DialogDescription>
                 {email
-                  ? `This signs ${email} out of YTubic.`
-                  : "This signs the current account out of YTubic."}{" "}
+                  ? `This signs ${email} out of Radif.`
+                  : "This signs the current account out of Radif."}{" "}
                 Your library and playlists stay on YouTube Music; signing
                 back in restores them.
               </DialogDescription>

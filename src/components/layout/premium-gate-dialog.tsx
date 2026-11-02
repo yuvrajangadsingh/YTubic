@@ -117,7 +117,7 @@ export function PremiumGateDialog() {
             {checking
               ? "Checking your YouTube Music subscription…"
               : signedOut
-                ? "YTubic plays music through your YouTube Music account. Sign in with an account that has an active Music Premium subscription."
+                ? "Radif plays music through your YouTube Music account. Sign in with an account that has an active Music Premium subscription."
                 : waiting
                   ? "The check is on hold: the connection dropped, or the window was in the background. It resumes on its own as soon as it can."
                   : failed
@@ -140,11 +140,11 @@ export function PremiumGateDialog() {
               <InfoIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
               <p className="text-xs leading-relaxed text-muted-foreground">
                 Free YouTube Music is supported by ads. YouTube's Terms of
-                Service require those ads to play, and YTubic has no way to
+                Service require those ads to play, and Radif has no way to
                 show them, so YouTube limits ad-free playback to Premium
                 accounts.{" "}
                 <span className="font-medium text-foreground">
-                  YTubic itself stays completely free and open source, and
+                  Radif itself stays completely free and open source, and
                   always will be.
                 </span>{" "}
                 You can keep listening for free, with ads, at
