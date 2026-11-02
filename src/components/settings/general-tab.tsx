@@ -142,7 +142,7 @@ function BehaviorGroup() {
       <SettingRow
         icon={RocketIcon}
         title="Launch at startup"
-        description="Start YTubic automatically when you log in."
+        description="Start Radif automatically when you log in."
         control={
           <Switch
             checked={!!autostart.data}
@@ -183,8 +183,8 @@ function BehaviorGroup() {
         title={IS_MAC ? "Close to menu bar" : "Close to tray"}
         description={
           IS_MAC
-            ? "Hide YTubic to the menu bar when you close the window instead of quitting."
-            : "Hide YTubic to the tray when you press ✕ instead of quitting."
+            ? "Hide Radif to the menu bar when you close the window instead of quitting."
+            : "Hide Radif to the tray when you press ✕ instead of quitting."
         }
         control={
           <Switch

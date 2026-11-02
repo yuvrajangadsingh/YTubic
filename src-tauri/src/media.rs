@@ -35,7 +35,7 @@ pub fn init(app: &AppHandle) {
 
     let config = PlatformConfig {
         dbus_name: "ytubic",
-        display_name: "YTubic",
+        display_name: "Radif",
         hwnd,
     };
 

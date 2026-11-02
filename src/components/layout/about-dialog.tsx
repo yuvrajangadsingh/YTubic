@@ -17,7 +17,7 @@ import { IS_BETA_PLATFORM, IS_MAC } from "@/lib/platform";
 import { openWhatsNew } from "@/lib/store/whats-new";
 import { GithubIcon } from "@/components/shared/brand-icons";
 
-const REPO_URL = "https://github.com/yuvrajangadsingh/YTubic";
+const REPO_URL = "https://github.com/yuvrajangadsingh/radif";
 
 const CREDITS: { name: string; role: string; url: string }[] = [
   {
@@ -63,7 +63,7 @@ export function AboutDialog({
           <div className="flex items-center gap-3">
             <img src="/ytubic-icon.svg" alt="" className="size-12" />
             <div className="flex flex-col items-start">
-              <DialogTitle className="text-lg">YTubic</DialogTitle>
+              <DialogTitle className="text-lg">Radif</DialogTitle>
               {/* Version and the What's New link share one row so the
                   header stays two lines tall next to the 48px icon. */}
               <div className="flex items-center gap-2">

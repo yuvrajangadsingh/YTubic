@@ -74,7 +74,7 @@ export function ChannelPickerDialog() {
           <DialogDescription>
             Your Google account can hold several YouTube channels. Library,
             likes and recommendations belong to the channel, not the
-            account, so pick the one YTubic should use.
+            account, so pick the one Radif should use.
           </DialogDescription>
         </DialogHeader>
 

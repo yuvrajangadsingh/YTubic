@@ -119,7 +119,7 @@ export function WhatsNewDialog() {
             What's New
           </DialogTitle>
           <DialogDescription className="sr-only">
-            Release history for YTubic
+            Release history for Radif
           </DialogDescription>
         </div>
 

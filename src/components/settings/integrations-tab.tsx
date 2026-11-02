@@ -263,7 +263,7 @@ function LastfmSection() {
 }
 
 /**
- * Integrations tab: third-party services YTubic can broadcast to.
+ * Integrations tab: third-party services Radif can broadcast to.
  * Discord Rich Presence and Last.fm scrobbling both react to the same
  * now-playing state, mirrored out over their own backends.
  */

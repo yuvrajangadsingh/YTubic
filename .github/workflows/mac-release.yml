@@ -93,7 +93,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # Ad-hoc signature. Without it the bundle is only linker-signed and
-          # a recipient's Mac reads that as tampering ("YTubic is damaged"),
+          # a recipient's Mac reads that as tampering ("Radif is damaged"),
           # which has no Open Anyway path. No Developer ID cert on this
           # account, so notarization is out; see release.yml for the note on
           # why APPLE_* vars must not be set from `secrets.*` directly.
@@ -110,16 +110,15 @@ jobs:
           # on for this build only.
           args: --target universal-apple-darwin --config {"bundle":{"createUpdaterArtifacts":true}}
           tagName: ${{ steps.version.outputs.tag }}
-          releaseName: "YTubic ${{ steps.version.outputs.version }} — macOS"
+          releaseName: "Radif ${{ steps.version.outputs.version }} — macOS"
           releaseBody: |
-            macOS build of YTubic, from a fork of
-            [NUber-dev/YTubic](https://github.com/NUber-dev/YTubic).
+            Radif for macOS.
 
             Universal binary, Intel and Apple Silicon. The app is ad-hoc
             signed and not notarized, so on first launch macOS will block it:
             open **System Settings → Privacy & Security** and click **Open
             Anyway**. If it says the app is damaged, run
-            `xattr -cr /Applications/YTubic.app`.
+            `xattr -cr /Applications/Radif.app`.
           # Left as a draft on purpose: this workflow has never run, so the
           # first release it produces deserves a look before it goes public.
           # Flip to false once you've seen it publish a good one.

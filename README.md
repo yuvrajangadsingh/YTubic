@@ -1,6 +1,6 @@
 <div align="center">
   <img src="assets/branding/ytubic-logo-full.svg" width="260"
-       alt="YTubic" />
+       alt="Radif" />
 
   <p><em>YouTube Music, as an actual Mac app — with the player turned up.</em></p>
 
@@ -23,14 +23,14 @@
   <br /><br />
 
   <img src="assets/screenshots/artist-page.jpg" width="820"
-       alt="An artist page in YTubic, with the player docked at the bottom and synced lyrics open on the right" />
+       alt="An artist page in Radif, with the player docked at the bottom and synced lyrics open on the right" />
 </div>
 
 <br />
 
 YouTube Music in a browser tab is fine right up until you want it to behave like
 an app — media keys that actually work, a Now Playing card in Control Center, a
-window that doesn't vanish into thirty other tabs. YTubic is a desktop client
+window that doesn't vanish into thirty other tabs. Radif is a desktop client
 that talks to YouTube's API directly and draws its own interface instead of
 wrapping the website, so pages open instantly and playback starts without the
 spinner.
@@ -48,14 +48,14 @@ About two minutes, and most of that is macOS being suspicious of you.
 
 **1.** [Download the `.dmg`](../../releases/latest) and open it.
 
-**2.** Drag **YTubic** onto the Applications folder.
+**2.** Drag **Radif** onto the Applications folder.
 
-**3.** Open it. macOS will refuse, saying *"Apple could not verify YTubic is free
+**3.** Open it. macOS will refuse, saying *"Apple could not verify Radif is free
 of malware"* — that happens to every app not signed with Apple's $99-a-year
 certificate, which this one isn't. Open **Terminal** and paste:
 
 ```bash
-xattr -cr /Applications/YTubic.app
+xattr -cr /Applications/Radif.app
 ```
 
 That clears the "downloaded from the internet" flag and nothing else. Open the
@@ -75,8 +75,8 @@ app fetches a small streaming helper in the background.
 <details>
 <summary>I'd rather not touch Terminal</summary>
 
-Try to open YTubic, let macOS block it, then go to **System Settings → Privacy &
-Security** and scroll to the bottom. There'll be a line about YTubic being
+Try to open Radif, let macOS block it, then go to **System Settings → Privacy &
+Security** and scroll to the bottom. There'll be a line about Radif being
 blocked with an **Open Anyway** button next to it. Same result, more clicking.
 
 </details>
@@ -131,10 +131,10 @@ pnpm tauri build --bundles app,dmg   # build a .dmg
 The build lands in `src-tauri/target/release/bundle/`. One gotcha worth knowing:
 Tauri's output `.app` is only linker-signed, which macOS reads as tampering on
 another machine — sign it before you hand it to anyone, otherwise they get
-"YTubic is damaged" with no way past it:
+"Radif is damaged" with no way past it:
 
 ```bash
-codesign --force --deep --sign - YTubic.app
+codesign --force --deep --sign - Radif.app
 ```
 
 <details>
@@ -183,6 +183,9 @@ This started as a fork of it in July 2026 and has been its own line since August
 [LRCLIB](https://lrclib.net) and Musixmatch for synced lyrics, and
 [Tauri](https://tauri.app), [shadcn/ui](https://ui.shadcn.com) and
 [TanStack](https://tanstack.com) for the stack underneath.
+
+The name: a radif is the refrain in a ghazal, the words every couplet comes
+back to.
 
 ## License
 

@@ -1775,7 +1775,7 @@ async fn ensure_session_keeper(
     // webview still loads and keeps the session alive regardless of
     // visibility or position.
     let win = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
-        .title("YTubic session keeper")
+        .title("Radif session keeper")
         .visible(false)
         .decorations(false)
         .focused(false)
@@ -2501,7 +2501,7 @@ async fn open_player_window(
         "player",
         WebviewUrl::App("index.html?floating-player=1".into()),
     )
-    .title("YTubic — player")
+    .title("Radif — player")
     .decorations(false)
     .inner_size(360.0, 720.0)
     .min_inner_size(320.0, 560.0)
@@ -5217,7 +5217,7 @@ fn tray_icon(app: &tauri::AppHandle) -> tauri::image::Image<'static> {
 }
 
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
-    let show_item = MenuItem::with_id(app, "show", "Show YTubic", true, None::<&str>)?;
+    let show_item = MenuItem::with_id(app, "show", "Show Radif", true, None::<&str>)?;
     let play_item = MenuItem::with_id(app, "play_pause", "Play / Pause", true, Some("Space"))?;
     let prev_item = MenuItem::with_id(app, "prev", "Previous", true, None::<&str>)?;
     let next_item = MenuItem::with_id(app, "next", "Next", true, None::<&str>)?;
@@ -5236,9 +5236,9 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         // No-op off macOS; there it's what makes the glyph track the menu bar.
         .icon_as_template(cfg!(target_os = "macos"))
         .tooltip(if cfg!(debug_assertions) {
-            "YTubic (dev)"
+            "Radif (dev)"
         } else {
-            "YTubic"
+            "Radif"
         })
         .menu(&menu)
         // macOS menu-bar extras conventionally open on left-click. Linux
@@ -5324,10 +5324,14 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ))
+        // The LaunchAgent file is named after app_name, which defaults to
+        // productName. Installs from before the rename have YTubic.plist;
+        // a new name would leave it behind, still launching at login.
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name("YTubic")
+                .build(),
+        )
         .manage(state)
         .manage(CloseBehavior::default())
         .manage(authfs::MutationLocks::default())
@@ -5444,6 +5448,19 @@ pub fn run() {
             // From here on stderr lands in the app log with timestamps,
             // however the app was launched.
             applog::init(app.handle());
+            // The login entry stores this copy's path. A fresh Radif.app
+            // next to an old YTubic.app would otherwise keep launching the
+            // old one at login, so rewrite it while enabled. Not in dev: it
+            // would point the real login entry at the debug binary.
+            if !cfg!(debug_assertions) {
+                use tauri_plugin_autostart::ManagerExt;
+                let autolaunch = app.autolaunch();
+                if autolaunch.is_enabled().unwrap_or(false) {
+                    if let Err(e) = autolaunch.enable() {
+                        eprintln!("[autostart] refresh failed: {e}");
+                    }
+                }
+            }
             // The cookie key's home on macOS; must precede the first
             // encrypt/decrypt, which the session load below performs.
             if let Ok(dir) = app.path().app_data_dir() {
