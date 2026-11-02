@@ -1,7 +1,7 @@
 [package]
 name = "ytubic"
-version = "0.4.9"
-description = "YTubic — fast, responsive YouTube Music desktop client"
+version = "0.5.0"
+description = "Radif — fast, responsive YouTube Music desktop client"
 authors = ["Yuvraj Angad Singh"]
 license = "GPL-3.0-only"
 edition = "2021"
@@ -32,7 +32,7 @@ serde_json = "1"
 # hours. We echo rotations into the jar ourselves (merge_response_cookies),
 # so the shadow store must not exist: it also attached partial cookie sets
 # to requests that carried no explicit Cookie header, and it kept session
-# security cookies in plaintext next to our DPAPI-encrypted jar.
+# security cookies in plaintext next to our encrypted jar.
 tauri-plugin-http = { version = "2", default-features = false, features = [
     "unsafe-headers",
     "rustls-tls",
@@ -64,9 +64,7 @@ tauri-plugin-notification = "2"
 # the CORS-less art CDNs and throws in WKWebView). jpeg is what the art
 # hosts serve; other formats ride in through feature unification.
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
-# Native media controls: SMTC on Windows and MPRIS on Linux. We create the
-# Windows SMTC from the host process so the tile resolves to YTubic's identity
-# instead of the msedgewebview2.exe child. See media.rs. macOS is NOT handled
+# Native media controls: MPRIS on Linux. See media.rs. macOS is NOT handled
 # here — it has its own MPRemoteCommandCenter bridge (now_playing.rs), and
 # letting souvlaki register too would fight over the system Now Playing entry.
 souvlaki = "0.7"
@@ -95,21 +93,11 @@ libc = "0.2"
 # it panics rather than choosing. See the install_default call in run().
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Security_Cryptography",
-    # SetCurrentProcessExplicitAppUserModelID — pins our AppUserModelID onto the
-    # process so the SMTC media tile resolves (via the installer's matching Start
-    # Menu shortcut) to "YTubic" instead of "Unknown app". See src/appid.rs.
-    "Win32_UI_Shell",
-] }
-
 # macOS system Now Playing (Control Center / media keys / AirPods). A
-# Tauri WKWebView doesn't bridge the JS MediaSession API to the system
-# the way WebView2 does for Windows, so we drive MediaPlayer.framework
-# directly. objc2 + objc2-foundation are already in the tree via tauri;
-# declared here so we can use them, plus the MediaPlayer bindings.
+# Tauri WKWebView doesn't bridge the JS MediaSession API to the system,
+# so we drive MediaPlayer.framework directly. objc2 + objc2-foundation are
+# already in the tree via tauri; declared here so we can use them, plus the
+# MediaPlayer bindings.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
@@ -118,6 +106,42 @@ objc2-foundation = { version = "0.3", features = [
     "NSValue",
     "NSProcessInfo",
     "NSObjCRuntime",
+] }
+# The notch peek (src/notch.rs): a borderless NSPanel positioned from
+# NSScreen's safe-area insets, masked by an animated CAShapeLayer. Every crate
+# below is cut to the classes notch.rs names, because the default feature
+# set of these bindings is "every class in the framework" and that drags in
+# CloudKit, CoreData, CoreImage, CoreText, CoreVideo and Metal bindings
+# nothing here touches.
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "NSApplication",
+    "NSColor",
+    "NSControl",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSGraphics",
+    "NSImage",
+    "NSImageView",
+    "NSPanel",
+    "NSParagraphStyle",
+    "NSResponder",
+    "NSScreen",
+    "NSTextField",
+    "NSView",
+    "NSWindow",
+    "objc2-core-foundation",
+    "objc2-quartz-core",
+] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = [
+    "CALayer",
+    "CAShapeLayer",
+    "CATransaction",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "CGColor",
+    "CGPath",
 ] }
 objc2-media-player = { version = "0.3", features = [
     "MPNowPlayingInfoCenter",

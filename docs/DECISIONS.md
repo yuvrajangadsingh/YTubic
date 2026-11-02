@@ -9,6 +9,29 @@ time; they are quoted, not rounded up.
 
 ---
 
+## 2026-09-06 · Windows support removed from the code
+
+**Decided:** delete the Windows code, not just the CI job. Gone: the DPAPI
+cookie store, the `CREATE_NO_WINDOW` spawn flags, the WebView2 browser args,
+the AppUserModelID module, the nsis bundle target, the Microsoft Store icons,
+the `windows-sys` dependency and the Windows entry in the release matrix.
+
+**Why:** nothing has built for Windows since the CI job went on 2026-09-04, so
+none of it was compiled anywhere. The gates were the real cost. Most of them
+wrapped the mac and the Linux paths as much as the Windows one, so reading a
+spawn call or the cookie store meant working out which of three platforms each
+arm was for, and deleting the wrong half of one would have broken Linux
+quietly.
+
+**Kept:** Linux. It is the canary that catches non-mac Rust mistakes, and
+`release.yml` is still the only workflow that bundles the deb, rpm and
+AppImage. Two `cfg`s in `lib.rs` still name windows on purpose: the catch-all
+plaintext arms of `encrypt` and `decrypt` for unsupported platforms. Leaving
+the term in makes a Windows build fail at compile time instead of quietly
+writing session cookies in the clear.
+
+---
+
 ## 2026-09-04 · CI runs macOS and Ubuntu only
 
 **Decided:** drop `windows-latest` from the CI matrix and from main's required
@@ -68,7 +91,7 @@ second for minutes (500+ cycles the second time). Every "element playing under
 a paused store" line came before any `play()` of ours, so the flips were
 WebKit's, released as a burst of media commands it had been holding, and the
 app was echoing each one. The first breaker only gated OS commands, which
-changed nothing and swallowed real presses (Codex review finding #11).
+changed nothing and swallowed real presses (review finding #11).
 
 **Status:** in. Not reproducible on demand; the log lines `play/pause storm`,
 `storm persisted` and `storm settled` are the evidence to look for.
@@ -86,7 +109,7 @@ it. Play resolves never wait.
 
 **Why:** resolves that overlapped another resolve exceeded 15 seconds twice as
 often as lone ones (9% vs 4.4%), and nothing capped concurrent yt-dlp
-processes. Codex's review of the first version found two holes: a timed-out
+processes. A review of the first version found two holes: a timed-out
 wait proceeded *without* a permit (so every queued prefetch stampeded at once),
 and a play joining a queued prefetch inherited background priority and could
 wait 45 seconds before resolving.
@@ -117,7 +140,7 @@ is the anonymous tier (130k) on a play that was already slow. His choice over
 path hangs too (measured: 2 of 5 plain connections to youtube.com failing, the
 others taking up to 7.5s). No app-side change produces sound through that.
 
-**Rejected:** caching the anonymous winner. Codex pointed out that it would make
+**Rejected:** caching the anonymous winner. The review pointed out it would make
 every later replay of that track 130k. Hence the marker and eviction, with the
 marker committed before the rename so a crash cannot leave an unmarked low-tier
 file as the permanent copy.
@@ -292,7 +315,7 @@ measurement doc is kept in `docs/` as evidence.
 
 ---
 
-## 2026-09-01 · Auth hardened, Codex-reviewed
+## 2026-09-01 · Auth hardened and reviewed
 
 **Decided:** exact cookie-name predicate for "signed in" (`__Secure-3PAPISID`
 or `SAPISID`, the cookies the frontend signs with), atomic jar writes (unique
@@ -304,7 +327,7 @@ treated as "defer", not "failed".
 **Why:** the refresh timer was measured stalling across sleep (gaps of 142 and
 177 minutes on a 20-minute monotonic timer), and the previous sign-in check was
 looser than what the app actually needs to sign requests. Ten blockers from the
-Codex review were repaired before merge.
+the review were repaired before merge.
 
 **Still unverified:** the sleep/wake path. The Mac has not slept once since
 this landed.
@@ -316,7 +339,7 @@ this landed.
 **Decided:** keep the name for now. 36 candidates were generated and judged;
 the clear ones were radif, sneck and chapbook; the judge's order was radif,
 gamak, sneck, chapbook, tarz. Full shortlist and icon directions in
-`.notes/rename-shortlist-2026-09-01.md`. Reopened as ME-30 on Sep 4 as the
+a local working note. Reopened as ME-30 on Sep 4 as the
 first step of any launch.
 
 ---

@@ -61,8 +61,7 @@ export async function streamUrlFor(
   if (opts?.vonly) {
     params.set("vonly", "1");
     if (opts.vonlyHeight) params.set("h", String(opts.vonlyHeight));
-  }
-  else if (opts?.video) params.set("video", "1");
+  } else if (opts?.video) params.set("video", "1");
   const qs = params.toString();
   return `${base}/stream/${encodeURIComponent(videoId)}${qs ? `?${qs}` : ""}`;
 }
@@ -97,21 +96,50 @@ const prefetched = new Set<string>();
  * The server itself is idempotent on a per-file basis (checks .part /
  * .webm existence), so re-firing is cheap but still skippable.
  */
-export async function prefetchStream(videoId: string): Promise<void> {
-  if (!isPremium()) return;
-  if (prefetched.has(videoId)) return;
-  prefetched.add(videoId);
+export type PrefetchOutcome = "started" | "skipped" | "busy" | "failed";
+
+export async function prefetchStream(
+  videoId: string,
+  opts?: {
+    /** Warm the video-only DASH track rather than the audio download.
+     *  It is a separate file on disk, so it needs its own warm. */
+    vonly?: boolean;
+    /** Height cap. Must match what the companion will ask for, or the
+     *  warmed file lands under a different name and the play still waits. */
+    vonlyHeight?: number;
+  },
+): Promise<PrefetchOutcome> {
+  if (!isPremium()) return "skipped";
+  const height = opts?.vonly ? (opts.vonlyHeight ?? 1080) : 0;
+  // Per variant, not per id: warming the audio must not mark the much
+  // larger video file as already done.
+  const key = opts?.vonly ? `${videoId}:vo${height}` : videoId;
+  if (prefetched.has(key)) return "skipped";
+  prefetched.add(key);
   try {
     const base = await getStreamBaseUrl();
     // Fire-and-forget — server returns 200/202 immediately and caches
     // bytes in the background. fetch() only rejects on network errors, so an
     // HTTP 4xx/5xx (yt-dlp spawn/extractor failure) resolves normally — drop
     // the warm mark on an error status so the id is retried later.
-    const res = await fetch(`${base}/prefetch/${encodeURIComponent(videoId)}`);
-    if (!res.ok) prefetched.delete(videoId);
+    const params = new URLSearchParams();
+    if (opts?.vonly) {
+      params.set("vonly", "1");
+      params.set("h", String(height));
+    }
+    const qs = params.toString();
+    const res = await fetch(
+      `${base}/prefetch/${encodeURIComponent(videoId)}${qs ? `?${qs}` : ""}`,
+    );
+    if (res.ok) return "started";
+    prefetched.delete(key);
+    // 429 is admission control declining under pressure, not a failure:
+    // the server did no work at all, so this one is worth retrying once.
+    return res.status === 429 ? "busy" : "failed";
   } catch {
     // If it fails we'll just fall through to on-demand fetch later.
-    prefetched.delete(videoId);
+    prefetched.delete(key);
+    return "failed";
   }
 }
 

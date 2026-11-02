@@ -50,6 +50,7 @@ import { usePlayerCoverDrag } from "@/lib/player-drag";
 import { usePlaybackStore, currentTrack } from "@/lib/store/playback";
 import {
   useTrackSourceStore,
+  wantsVideoStream,
   type SourceKind,
 } from "@/lib/store/track-source";
 import { findAlternateVideoId } from "@/lib/innertube/alternate-source";
@@ -302,7 +303,18 @@ export function SourceToggle({ track }: { track: QueueTrack }) {
   const setPreferVideo = useTrackSourceStore((s) => s.setPreferVideo);
   const [busy, setBusy] = useState<SourceKind | null>(null);
 
-  const selected: SourceKind = record?.selected ?? "song";
+  // What is ACTUALLY streaming, not what the record happens to say.
+  // Reading `record.selected` alone lit the Video side for a seeded
+  // video-native track that was still playing audio, and because the
+  // button then looked active, clicking it hit the `target === selected`
+  // early return below and did nothing. The toggle has to answer the
+  // same question the engine asks, or it can offer a state it cannot
+  // reach.
+  const selected: SourceKind = useTrackSourceStore((s) =>
+    wantsVideoStream(track.videoId, s.byVideoId, s.preferVideo)
+      ? "video"
+      : "song",
+  );
 
   const switchTo = async (target: SourceKind, opts?: { auto?: boolean }) => {
     if (busy || target === selected) return;

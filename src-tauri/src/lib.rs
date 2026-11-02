@@ -29,11 +29,11 @@ mod app_nap;
 mod applog;
 mod authfs;
 mod identity;
-mod appid;
 mod cast;
 mod discord;
 mod lastfm;
 mod media;
+mod notch;
 mod session;
 mod stream_proxy;
 mod ytdlp;
@@ -47,91 +47,10 @@ fn sanitize_video_id(id: &str) -> bool {
 }
 
 /// Platform-native symmetric "encrypt with current user's credentials"
-/// primitive. On Windows we use DPAPI (CryptProtectData) — the blob is
-/// only decryptable by the same Windows user on the same machine. Linux and
-/// macOS use AES-256-GCM and keep only the random data key in the native
-/// credential store (Secret Service or Keychain).
-///
-/// A fixed `ENTROPY` byte string is mixed in so a *different* app
-/// running as the same user can't trivially pass our blob to
-/// CryptUnprotectData and get our cookies out. This is a small hurdle
-/// against generic credential-stealer malware, not a real boundary —
-/// any attacker with our binary can read the entropy string.
+/// primitive. Linux and macOS use AES-256-GCM over a random data key. Where
+/// that key is kept differs per platform (Secret Service on Linux, a 0600
+/// file on macOS); see `encryption_key` below for why.
 mod secure_store {
-    #[cfg(windows)]
-    // Keeps the historical "ytm-native" tag on purpose: this string is
-    // baked into every existing encrypted cookie jar, and changing it
-    // would orphan them all. It's an opaque salt, not a product name.
-    const ENTROPY: &[u8] = b"ytm-native/cookies.enc v1";
-
-    #[cfg(windows)]
-    pub fn encrypt(plain: &[u8]) -> Result<Vec<u8>, String> {
-        use std::ptr;
-        use windows_sys::Win32::Foundation::LocalFree;
-        use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
-        unsafe {
-            let in_blob = CRYPT_INTEGER_BLOB {
-                cbData: plain.len() as u32,
-                pbData: plain.as_ptr() as *mut u8,
-            };
-            let ent_blob = CRYPT_INTEGER_BLOB {
-                cbData: ENTROPY.len() as u32,
-                pbData: ENTROPY.as_ptr() as *mut u8,
-            };
-            let mut out_blob: CRYPT_INTEGER_BLOB = std::mem::zeroed();
-            let ok = CryptProtectData(
-                &in_blob,
-                ptr::null(),
-                &ent_blob,
-                ptr::null_mut(),
-                ptr::null(),
-                0,
-                &mut out_blob,
-            );
-            if ok == 0 {
-                return Err("CryptProtectData failed".into());
-            }
-            let data =
-                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
-            LocalFree(out_blob.pbData as _);
-            Ok(data)
-        }
-    }
-
-    #[cfg(windows)]
-    pub fn decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
-        use std::ptr;
-        use windows_sys::Win32::Foundation::LocalFree;
-        use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
-        unsafe {
-            let in_blob = CRYPT_INTEGER_BLOB {
-                cbData: encrypted.len() as u32,
-                pbData: encrypted.as_ptr() as *mut u8,
-            };
-            let ent_blob = CRYPT_INTEGER_BLOB {
-                cbData: ENTROPY.len() as u32,
-                pbData: ENTROPY.as_ptr() as *mut u8,
-            };
-            let mut out_blob: CRYPT_INTEGER_BLOB = std::mem::zeroed();
-            let ok = CryptUnprotectData(
-                &in_blob,
-                ptr::null_mut(),
-                &ent_blob,
-                ptr::null_mut(),
-                ptr::null(),
-                0,
-                &mut out_blob,
-            );
-            if ok == 0 {
-                return Err("CryptUnprotectData failed".into());
-            }
-            let data =
-                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
-            LocalFree(out_blob.pbData as _);
-            Ok(data)
-        }
-    }
-
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     const KEYRING_MAGIC: &[u8; 5] = b"YTBC1";
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -609,36 +528,37 @@ async fn write_last_refresh(app: &tauri::AppHandle, id: &str, at: i64) -> Result
     authfs::write_atomic(last_refresh_path(app, id), at.to_string().into_bytes(), 0o600).await
 }
 
+/// `refresh-interval-mins` in the app data dir, see
+/// `session::parse_interval_override`. Read every pass of the refresh loop,
+/// so writing or deleting the file lands on the next pass (after a running
+/// attempt and its tick) and needs no rebuild; missing or unreadable means
+/// the default.
+async fn refresh_interval_secs(app: &tauri::AppHandle) -> i64 {
+    let path = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("refresh-interval-mins");
+    match tokio::fs::read_to_string(path).await {
+        Ok(text) => {
+            session::parse_interval_override(&text).unwrap_or(session::REFRESH_INTERVAL_SECS)
+        }
+        Err(_) => session::REFRESH_INTERVAL_SECS,
+    }
+}
+
 /// Browser UA the login and refresh WebViews both present to Google. Kept
 /// identical so the session Google issues to the login window is the
-/// same one the refresh window later renews. The claimed browser must match
-/// the actual webview engine: WebView2 presents Chrome, while WKWebView must
-/// present Safari or Google rejects the sign-in as an insecure browser.
+/// same one the refresh window later renews. These are outbound fingerprints,
+/// not a claim about the host: the non-macOS arm deliberately tells Google it
+/// is Chrome on Windows, while WKWebView must present Safari or Google rejects
+/// the sign-in as an insecure browser.
 #[cfg(not(target_os = "macos"))]
 const YT_LOGIN_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 #[cfg(target_os = "macos")]
 const YT_LOGIN_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
      (KHTML, like Gecko) Version/17.6 Safari/605.1.15";
-
-/// WebView2 browser args shared by the login window and the session-keeper.
-/// Both open the same per-account profile directory, and WebView2 requires
-/// every instance on a shared user-data folder to pass identical args, so
-/// these have to match. They also stop both windows from grabbing the
-/// hardware media keys or running a media session (which would hijack
-/// play/pause from the real player), and block autoplay so a hidden keeper
-/// never starts making sound on its own.
-const YT_WEBVIEW_ARGS: &str = "--disable-features=HardwareMediaKeyHandling,MediaSessionService \
-     --autoplay-policy=user-gesture-required";
-
-/// WebView2 browser args for windows on the DEFAULT user-data folder — the
-/// main window and the floating player. Must stay byte-identical to
-/// `additionalBrowserArgs` in `tauri.conf.json`: WebView2 refuses to create
-/// a second webview on the same user-data folder with different args, so a
-/// mismatch makes `open_player_window` fail and the floating player never
-/// appears. (The first three disabled features are wry's own defaults,
-/// which the conf.json value extends.)
-const APP_WEBVIEW_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,HardwareMediaKeyHandling,MediaSessionService";
 
 /// Legacy single-account path — kept only for migration. New code
 /// should resolve cookies via `active_cookies_path`.
@@ -1441,7 +1361,7 @@ async fn cleanup_login_artifacts(app: &tauri::AppHandle) {
 /// succeeds with whatever Google session is already in the shared
 /// WebView2 user data dir — and there's no way for the user to pick a
 /// different identity. The temp profile is deleted on close (success
-/// or cancellation); our DPAPI-encrypted jar is the canonical store.
+/// or cancellation); our encrypted jar is the canonical store.
 ///
 /// Emits `login-success` (payload: new account id) on success and
 /// `login-cancelled` on close-without-auth.
@@ -1499,8 +1419,6 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
         // session was minted under one browser and renewed under another —
         // exactly the login/refresh divergence Google reads as replay.
         .user_agent(YT_LOGIN_UA)
-        // Must match the session-keeper's args (shared profile folder).
-        .additional_browser_args(YT_WEBVIEW_ARGS)
         // Surface the current origin in the title so the user can spot
         // a redirect to an unexpected host (anti-phishing).
         .on_page_load(|win, payload| {
@@ -1713,7 +1631,91 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
 /// cookie store keeps answering with whatever it already held. On macOS
 /// this counter follows `webView:didFinishNavigation:`, which a failed
 /// provisional navigation never reaches.
+///
+/// Only loads of music.youtube.com count, since the parked about:blank
+/// finishes too. The URL wry hands the hook is the webview's current one,
+/// which can already be a pending request, so a blank page finishing
+/// right after a `navigate` would count. A manual refresh can overlap a
+/// park and a late callback has no bound, so this is a residual, noted
+/// here, not closed.
 static KEEPER_PAGE_LOADS: AtomicU64 = AtomicU64::new(0);
+
+/// Anything that happens to the keeper, process-wide: a build, a
+/// `navigate`, a page-load event of any kind, a refresh returning. The
+/// park is a debounce on it: the page is blanked `KEEPER_PARK_AFTER` after
+/// the last activity, whatever it was. A navigation still provisional
+/// after that long is cancelled with it and the next refresh asks again,
+/// with two exceptions that leave it to finish or fail on its own: the
+/// build's first navigation, before anything has committed (no eval may
+/// be queued then, see `KEEPER_COMMITTED_GEN`), and one over a page that
+/// is already blank (the eval is a no-op there). That is the contract,
+/// rather than a timer per interleaving of WebKit's callbacks, which do
+/// not carry the navigation they belong to.
+static KEEPER_ACTIVITY: AtomicU64 = AtomicU64::new(0);
+
+/// The keeper build in force: bumped before each build and carried by
+/// that build's page-load callbacks, so a callback from a keeper since
+/// replaced can be told apart and retired.
+static KEEPER_BUILD_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// The build that last committed a page. A park runs only when it is the
+/// build in force: wry queues `eval` until a webview's first commit and
+/// runs the queue on it, so a park submitted before that would blank the
+/// first page that does load, and a commit reported by a retired keeper
+/// must not stand in for one.
+static KEEPER_COMMITTED_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// How long the keeper stays on a page after the last activity. Past the
+/// refresh's poll, whose own sleeps total 18 s, with room for the cookie
+/// reads and the commit; the capture is owned data once taken, and a
+/// refresh still polling when the park fires may fail this cycle (the
+/// cookie store survives the park, so it may also still capture) and
+/// retries on the next.
+const KEEPER_PARK_AFTER: Duration = Duration::from_secs(45);
+
+/// Ask the keeper to blank its page `KEEPER_PARK_AFTER` from now unless
+/// something else happens to it first, see `KEEPER_ACTIVITY`. Main thread
+/// only: the activity counter is written there, so the check and the
+/// submission of the `eval` are one step. The script itself runs when
+/// WebKit gets to it, and nothing confirms that it did. The page checks
+/// itself before replacing, so a park landing on about:blank does nothing
+/// and the parked page's own events do not re-park forever. `replace` so
+/// the parked page gets no history entry of its own; the entries before
+/// it stay, and whether WebKit keeps the old page cached for them is what
+/// the memory sampler has to show.
+fn arm_keeper_park(win: tauri::WebviewWindow) {
+    let seen = KEEPER_ACTIVITY.load(Ordering::Relaxed);
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(KEEPER_PARK_AFTER).await;
+        let page = win.clone();
+        let _ = win.run_on_main_thread(move || {
+            if KEEPER_ACTIVITY.load(Ordering::Relaxed) != seen
+                || KEEPER_COMMITTED_GEN.load(Ordering::Relaxed)
+                    != KEEPER_BUILD_GEN.load(Ordering::Relaxed)
+            {
+                return;
+            }
+            let _ =
+                page.eval("if (location.href !== 'about:blank') location.replace('about:blank')");
+        });
+    });
+}
+
+/// Counts the refresh returning as activity and arms the park, whichever
+/// way it returned. A navigation that never commits (offline) fires no
+/// page-load event at all, and without this the previous page stayed up
+/// until the next refresh.
+struct ParkKeeperOnReturn(tauri::WebviewWindow);
+
+impl Drop for ParkKeeperOnReturn {
+    fn drop(&mut self) {
+        let page = self.0.clone();
+        let _ = self.0.run_on_main_thread(move || {
+            KEEPER_ACTIVITY.fetch_add(1, Ordering::Relaxed);
+            arm_keeper_park(page);
+        });
+    }
+}
 
 /// The live "session-keeper" WebView for `id`: a hidden window on
 /// music.youtube.com that reuses the account's persisted profile. As a
@@ -1721,11 +1723,14 @@ static KEEPER_PAGE_LOADS: AtomicU64 = AtomicU64::new(0);
 /// keeps the server-side session (and its rotating cookies) warm, which
 /// plain HTTP replay cannot do. Built ONCE and reused; any keeper left
 /// over from a previously-active account is closed first, so at most one
-/// runs at a time. Returns (window, just_created).
+/// runs at a time. Between refreshes the window stays but its page does
+/// not, see `refresh_account_cookies`. Returns the window and, for a
+/// keeper built by this call, the `KEEPER_PAGE_LOADS` baseline its first
+/// load counts against; `None` for a reused one.
 async fn ensure_session_keeper(
     app: &tauri::AppHandle,
     id: &str,
-) -> Result<(tauri::WebviewWindow, bool), String> {
+) -> Result<(tauri::WebviewWindow, Option<u64>), String> {
     if !account_webview_dir(app, id).exists() {
         return Err(format!("no persisted profile for {id}"));
     }
@@ -1738,20 +1743,39 @@ async fn ensure_session_keeper(
         }
     }
     if let Some(win) = app.get_webview_window(&label) {
-        return Ok((win, false));
+        return Ok((win, None));
     }
     let url = "https://music.youtube.com/"
         .parse::<tauri::Url>()
         .map_err(|e| e.to_string())?;
+    // Activity, see the park. `build` names the webview about to exist:
+    // its callbacks carry it, and a park runs only once this build has
+    // committed, since wry queues evals until then and a keeper this one
+    // replaces may still report a commit of its own. Bumped on the main
+    // thread in the same step as the liveness baseline is read: the
+    // replaced keeper's callbacks run there too, so each one either counts
+    // before the baseline or is retired, never in between.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.run_on_main_thread(move || {
+        KEEPER_ACTIVITY.fetch_add(1, Ordering::Relaxed);
+        let build = KEEPER_BUILD_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = tx.send((build, KEEPER_PAGE_LOADS.load(Ordering::Relaxed)));
+    })
+    .map_err(|e| format!("session-keeper main thread: {e}"))?;
+    let (build, loads_before) = rx
+        .await
+        .map_err(|_| "session-keeper main thread went away".to_string())?;
     // Hidden, undecorated, focus-less, off-screen, no taskbar entry. Built
-    // once and reused (not re-created every cycle), so there is no recurring
-    // window creation to flash on screen; the window-state plugin is told to
-    // never restore keeper windows (see `with_filter` in `run`), so a saved
+    // once and reused (not re-created every cycle): there is no recurring
+    // window creation to flash on screen, and wry activates the app every
+    // time it builds a webview, hidden or not, which is not something to
+    // repeat every twenty minutes. The window-state plugin is told to never
+    // restore keeper windows (see `with_filter` in `run`), so a saved
     // "visible" state can't drag it back on-screen next launch either. The
     // webview still loads and keeps the session alive regardless of
     // visibility or position.
     let win = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
-        .title("YTubic session keeper")
+        .title("Radif session keeper")
         .visible(false)
         .decorations(false)
         .focused(false)
@@ -1760,14 +1784,32 @@ async fn ensure_session_keeper(
         .inner_size(1024.0, 768.0)
         .data_directory(account_webview_dir(app, id))
         .user_agent(YT_LOGIN_UA)
-        .additional_browser_args(YT_WEBVIEW_ARGS)
         // Registered on the webview, so it fires for every later
         // `navigate()` too — which is what lets a refresh tell "reloaded
         // and Google answered" from "offline, nothing happened".
-        .on_page_load(|_win, payload| {
-            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+        .on_page_load(move |win, payload| {
+            // Runs on the main thread (WebKit delivers its navigation
+            // delegate there, in order), for every event and any host: each
+            // one is activity, and each one re-arms the park. A callback
+            // from a keeper this one has replaced is retired here: its
+            // window is closing, and its loads must not count for the
+            // current one.
+            if build != KEEPER_BUILD_GEN.load(Ordering::Relaxed) {
+                return;
+            }
+            KEEPER_ACTIVITY.fetch_add(1, Ordering::Relaxed);
+            let event = payload.event();
+            if matches!(event, tauri::webview::PageLoadEvent::Started) {
+                KEEPER_COMMITTED_GEN.store(build, Ordering::Relaxed);
+            }
+            // Only a finished Google load is evidence the refresh reached
+            // Google, see `KEEPER_PAGE_LOADS`.
+            if matches!(event, tauri::webview::PageLoadEvent::Finished)
+                && payload.url().host_str() == Some("music.youtube.com")
+            {
                 KEEPER_PAGE_LOADS.fetch_add(1, Ordering::Relaxed);
             }
+            arm_keeper_park(win);
         })
         .build()
         .map_err(|e| format!("build session-keeper: {e}"))?;
@@ -1775,23 +1817,42 @@ async fn ensure_session_keeper(
     // when the external page finishes loading, this puts it straight back to
     // hidden so the user never sees a stray music.youtube.com window.
     let _ = win.hide();
-    Ok((win, true))
+    // The build's own navigation may never report back (offline), so the
+    // build arms a park like any other activity.
+    let page = win.clone();
+    let _ = win.run_on_main_thread(move || arm_keeper_park(page));
+    Ok((win, Some(loads_before)))
 }
 
 /// Refresh the replayed cookie snapshot for `id` from its live session-
 /// keeper WebView. Reloads the keeper to force fresh authenticated
 /// requests (which renews the session and rotates its short-lived
-/// cookies), reads the full cookie set, and overwrites `cookies.enc`. The
-/// keeper window is left OPEN for next time.
+/// cookies), reads the full cookie set, and overwrites `cookies.enc`.
+///
+/// The keeper does not stay on music.youtube.com between refreshes: 45 s
+/// after the last thing that happened to it (a page-load event, a
+/// `navigate`, this function returning) the page is parked on about:blank,
+/// see `KEEPER_ACTIVITY`. Left up, the WebContent process behind a page nobody looks at was
+/// measured at 260 MB ten minutes after launch and 1.0 GB after eight and a
+/// half idle hours (Sep 10 2026). The window itself stays: wry activates
+/// the app whenever it builds a webview, so closing and rebuilding one
+/// every twenty minutes is not free. The session is in WebKit's cookie
+/// store, which the page does not own, and the next refresh navigates back
+/// and finds it signed in the same way the first load after a launch does.
 ///
 /// This is what survives Google's ~2h leash on *extracted* cookies: the
 /// bound browser session behind the keeper stays live, so the snapshot we
 /// replay never goes stale.
 ///
-/// Every path that is not [`RefreshOutcome::Committed`] leaves the existing
-/// jar and its success stamp exactly as they were, so we never clobber a
-/// usable jar with an empty one and never let a failed attempt look like a
-/// completed refresh.
+/// Every path that returns before the commit leaves the existing jar and
+/// its success stamp as they were, so a usable jar is never clobbered with
+/// an empty one and a failed attempt never looks like a completed refresh.
+/// The commit itself can report Failed with more on disk than that says:
+/// `write_atomic` renames before it syncs the directory and can fail after
+/// the rename, so a failed jar write may already have swapped the jar in,
+/// and a failed stamp write after it may already have moved the deadline.
+/// Both err the same way, a refresh credited with less than it did, and
+/// the loop backs off and tries again either way.
 async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOutcome {
     // Serialize refreshes so the periodic timer and a manual trigger can't
     // reload the keeper / rewrite the jar on top of each other.
@@ -1807,20 +1868,35 @@ async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOut
         return RefreshOutcome::Deferred(e);
     }
 
-    // Read before the keeper exists, so a just-built one's first load counts.
+    // Read before the keeper is touched, so a load it finishes from here on
+    // counts. A keeper built by this call hands back its own baseline, read
+    // on the main thread in the step that retired the previous keeper's
+    // callbacks, so none of theirs can slip in between.
     let loads_before = KEEPER_PAGE_LOADS.load(Ordering::Relaxed);
-    let (win, created) = match ensure_session_keeper(app, id).await {
+    let (win, built) = match ensure_session_keeper(app, id).await {
         Ok(v) => v,
         Err(e) if session::is_environment_unavailable(&e) => {
             return RefreshOutcome::Deferred(e)
         }
         Err(e) => return RefreshOutcome::Failed(e),
     };
+    let created = built.is_some();
+    let loads_before = built.unwrap_or(loads_before);
+    // Returning is activity too, whichever way, see `ParkKeeperOnReturn`.
+    let _park_on_return = ParkKeeperOnReturn(win.clone());
     // A reused keeper is reloaded to force fresh authenticated traffic; a
     // just-created one is already loading the URL from the builder.
     if !created {
         if let Ok(u) = "https://music.youtube.com/".parse::<tauri::Url>() {
-            let _ = win.navigate(u);
+            // Counted, navigated and armed in one main-thread step: a park
+            // deciding on the activity count cannot slip in between, and a
+            // navigate that never reports back still ends in a park.
+            let page = win.clone();
+            let _ = win.run_on_main_thread(move || {
+                KEEPER_ACTIVITY.fetch_add(1, Ordering::Relaxed);
+                let _ = page.navigate(u);
+                arm_keeper_park(page);
+            });
         }
     }
 
@@ -1942,14 +2018,16 @@ async fn refresh_account_cookies(app: &tauri::AppHandle, id: &str) -> RefreshOut
     }
 
     if let Err(e) = authfs::write_atomic(account_cookies_path(app, id), encrypted, 0o600).await {
-        // A storage failure keeps the previous jar, so the session is
-        // intact; it is the attempt that failed, and it must never reach
-        // the UI as "signed out".
+        // The jar on disk is whichever the write got to (the failure can
+        // come after the rename), and either way this attempt learned
+        // nothing about the session: it must never reach the UI as
+        // "signed out".
         return RefreshOutcome::Failed(format!("write refreshed cookies: {e}"));
     }
     // The success deadline derives from this stamp and nothing else, so an
-    // unwritable stamp means the refresh did not fully commit: leave the
-    // deadline where it was and let the loop back off and try again.
+    // unwritable stamp means the refresh did not fully commit: report it,
+    // so the loop backs off and tries again, whether or not the rename had
+    // already landed.
     if let Err(e) = write_last_refresh(app, id, now_ts()).await {
         return RefreshOutcome::Failed(format!("write refresh stamp: {e}"));
     }
@@ -1966,15 +2044,16 @@ enum RefreshOutcome {
     /// Nothing was written and nothing was learned. Does not advance the
     /// success deadline and does not count as a session failure.
     Deferred(String),
-    /// The attempt ran and failed. The previous jar is untouched.
+    /// The attempt ran and failed. Nothing was learned; what is on disk is
+    /// whatever the attempt got to, see `refresh_account_cookies`.
     Failed(String),
 }
 
 /// Can the platform credential store be read right now?
 ///
 /// Only Linux and macOS keep the jar's key outside the process (Secret
-/// Service / Keychain); Windows DPAPI needs no UI session, so there is
-/// nothing to probe there.
+/// Service / Keychain), so they are the only platforms with anything to
+/// probe.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn credential_store_ready() -> Result<(), String> {
     match tokio::task::spawn_blocking(|| secure_store::encrypt(b"probe")).await {
@@ -2069,8 +2148,12 @@ async fn refresh_active_session(app: tauri::AppHandle) -> Result<bool, String> {
 async fn run_refresh_loop(app: tauri::AppHandle) {
     let wake = session::wake::signal();
     let mut retry = session::RetryState::default();
-    let mut interval =
-        session::REFRESH_INTERVAL_SECS + session::jitter(session::REFRESH_JITTER_SECS, jitter_seed());
+    let mut base = session::REFRESH_INTERVAL_SECS;
+    let mut interval = base + session::jitter(session::REFRESH_JITTER_SECS, jitter_seed());
+    // The success stamp the last attempt saw. A stamp that has moved since
+    // is a commit this loop did not make (the manual refresh command), and
+    // an attempt after one is on schedule, whatever the retry counters say.
+    let mut stamp_at_last_attempt: Option<i64> = None;
     // Both conditions can hold for hours, so they log the transition and
     // then stay quiet.
     let mut warned_profileless: Option<String> = None;
@@ -2079,6 +2162,14 @@ async fn run_refresh_loop(app: tauri::AppHandle) {
 
     loop {
         let now = now_ts();
+        // A change re-rolls the jitter too, so the deadline can move by up
+        // to two minutes either way on top of the change itself.
+        let wanted = refresh_interval_secs(&app).await;
+        if wanted != base {
+            eprintln!("[refresh] interval {} min (was {})", wanted / 60, base / 60);
+            base = wanted;
+            interval = base + session::jitter(session::REFRESH_JITTER_SECS, jitter_seed());
+        }
         // Read the index directly rather than through `read_index`: an
         // unreadable one would otherwise log on every tick, and this is the
         // one condition nothing in the app can heal by itself.
@@ -2123,12 +2214,37 @@ async fn run_refresh_loop(app: tauri::AppHandle) {
                 }
                 if session::should_attempt(now, due, retry.next_attempt_at()) {
                     attempted = true;
+                    // One line per attempt, before the outcome: a failed one
+                    // has to show how old the snapshot was, and a trial of
+                    // the interval needs the real gap, not the configured
+                    // one (a wake can pull an attempt forward).
+                    let why = if retry.forced_due() {
+                        "wake"
+                    } else if retry.is_retrying() && last == stamp_at_last_attempt {
+                        "retry"
+                    } else {
+                        "due"
+                    };
+                    stamp_at_last_attempt = last;
+                    // A stamp from the future is a backward clock jump, which
+                    // `due_at` already treats as due; say so rather than
+                    // printing a negative age. Saturating: the stamp is
+                    // whatever parsed from the file.
+                    let age = match last {
+                        Some(t) if t > now => "future".to_string(),
+                        Some(t) => format!("{}m", now.saturating_sub(t) / 60),
+                        None => "none".to_string(),
+                    };
+                    eprintln!(
+                        "[refresh] {active}: attempt ({why}), snapshot age {age}, interval {}m",
+                        interval / 60
+                    );
                     retry.on_attempt();
                     match refresh_account_cookies(&app, &active).await {
                         RefreshOutcome::Committed => {
                             retry.on_committed();
-                            interval = session::REFRESH_INTERVAL_SECS
-                                + session::jitter(session::REFRESH_JITTER_SECS, jitter_seed());
+                            interval =
+                                base + session::jitter(session::REFRESH_JITTER_SECS, jitter_seed());
                             if warned_deferred {
                                 warned_deferred = false;
                                 eprintln!("[refresh] desktop session is available again");
@@ -2385,7 +2501,7 @@ async fn open_player_window(
         "player",
         WebviewUrl::App("index.html?floating-player=1".into()),
     )
-    .title("YTubic — player")
+    .title("Radif — player")
     .decorations(false)
     .inner_size(360.0, 720.0)
     .min_inner_size(320.0, 560.0)
@@ -2397,9 +2513,6 @@ async fn open_player_window(
     // handler entirely is purely upside. The doc string for this
     // method literally calls out HTML5 DnD on Windows as the use case.
     .disable_drag_drop_handler()
-    // Shares the default user-data folder with the main window, so the
-    // args must match the main window's `additionalBrowserArgs` exactly.
-    .additional_browser_args(APP_WEBVIEW_ARGS)
     .build()
     .map_err(|e| e.to_string())?;
     // Dev builds: orange taskbar icon, same as the main window.
@@ -2798,29 +2911,43 @@ struct AuthContext {
     cookie: String,
     #[serde(rename = "pageId")]
     page_id: Option<String>,
+    /// The account the cookie and page id were read for, `None` when the
+    /// context is anonymous. What lets a caller bind an answer to an
+    /// account rather than to whoever was active when the jar was read.
+    #[serde(rename = "accountId")]
+    account_id: Option<String>,
 }
 
 #[tauri::command]
 async fn get_auth_context(app: tauri::AppHandle, host: String) -> Result<AuthContext, String> {
+    let anonymous = || AuthContext { cookie: String::new(), page_id: None, account_id: None };
+    // One index read for the id, the jar and the page id. Read twice, an
+    // account switch between the reads paired one account's cookies with
+    // another's channel, or with another's id.
+    let idx = match read_index_checked(&app).await {
+        IndexRead::Loaded(idx) => idx,
+        IndexRead::Absent => return Ok(anonymous()),
+        IndexRead::Corrupt(e) | IndexRead::Unavailable(e) => {
+            return Err(format!("auth unavailable: {e}"))
+        }
+    };
+    let Some(id) = idx.active.clone() else {
+        return Ok(anonymous());
+    };
     // Reject rather than hand back an empty context when the jar exists but
     // cannot be read: an empty context means "this user is anonymous", and
     // the caller caches it. One dark-wake keychain miss used to make every
     // InnerTube request for the next five minutes go out signed out.
-    let cookie = match read_active_jar(&app).await {
+    let cookie = match read_jar(&app, &id).await {
         JarRead::Loaded(jar) => session::cookie_header(&jar, &host, session::INNERTUBE_PATH, now_ts()),
         JarRead::Absent => String::new(),
         JarRead::Unavailable(e) => return Err(format!("auth unavailable: {e}")),
     };
-    let page_id = if cookie.is_empty() {
-        None
-    } else {
-        let idx = read_index(&app).await;
-        idx.accounts
-            .iter()
-            .find(|a| idx.active.as_deref() == Some(a.id.as_str()))
-            .and_then(|a| a.page_id.clone())
-    };
-    Ok(AuthContext { cookie, page_id })
+    if cookie.is_empty() {
+        return Ok(anonymous());
+    }
+    let page_id = idx.accounts.iter().find(|a| a.id == id).and_then(|a| a.page_id.clone());
+    Ok(AuthContext { cookie, page_id, account_id: Some(id) })
 }
 
 /// Singleflight for cookie-refresh runs, so the periodic timer and a manual
@@ -3312,14 +3439,6 @@ fn resolve_stream_ytdlp(app: tauri::AppHandle, video_id: String) -> Result<Strin
         command.arg("--cookies").arg(path);
     }
     command.arg(&url);
-    // Windows: a console-less GUI process spawning the console-subsystem
-    // yt-dlp.exe with default flags makes Windows flash a console window
-    // on every resolve. CREATE_NO_WINDOW suppresses it.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
     let output = command.output().map_err(|e| format!("spawn yt-dlp: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3358,11 +3477,6 @@ fn resolve_hls_stream(app: tauri::AppHandle, video_id: String) -> Result<String,
     ]);
     command.args(ytdlp::js_runtime_args());
     command.arg(&url);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
     let output = command
         .output()
         .map_err(|e| format!("spawn yt-dlp: {e}"))?;
@@ -4303,10 +4417,6 @@ fn spawn_downloader(
             cmd.arg("--cookies").arg(path);
         }
         cmd.arg(&url);
-        // Windows: suppress the console window for the child yt-dlp.exe
-        // (see resolve_stream_ytdlp for rationale).
-        #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -4603,25 +4713,32 @@ async fn proxy_respond(
         Ok(Some(span)) => {
             let w = stream_proxy::window_span(&span);
             match stream_proxy::serve_span(&srv.http, &state, &part_path, &final_path, &w).await {
-                Ok(bytes) => {
-                    // Label the response from what was ACTUALLY delivered
-                    // — a passthrough may legally return a shorter span
-                    // than requested, and headers must never overpromise
-                    // the body.
-                    let end = w.start + bytes.len() as u64 - 1;
+                Ok(body) => {
+                    // Label the response from the length the body has
+                    // committed to, not from the span we asked for. A
+                    // passthrough may legally deliver a shorter span than
+                    // requested, and headers must never overpromise the
+                    // body.
+                    let end = w.start + body.len as u64 - 1;
                     eprintln!(
-                        "[proxy] {video_id}: 206 {}-{end}/{total} ({} bytes, {:.2}s)",
+                        "[proxy] {video_id}: 206 {}-{end}/{total} ({} bytes, {:.2}s to headers)",
                         w.start,
-                        bytes.len(),
+                        body.len,
                         t0.elapsed().as_secs_f32()
                     );
+                    let span_body = match body.source {
+                        stream_proxy::SpanSource::Memory(b) => axum::body::Body::from(b),
+                        stream_proxy::SpanSource::Stream(rx) => axum::body::Body::from_stream(
+                            tokio_stream::wrappers::ReceiverStream::new(rx),
+                        ),
+                    };
                     Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
                         .header(header::CONTENT_TYPE, mime)
-                        .header(header::CONTENT_LENGTH, bytes.len())
+                        .header(header::CONTENT_LENGTH, body.len)
                         .header(header::CONTENT_RANGE, format!("bytes {}-{end}/{total}", w.start))
                         .header(header::ACCEPT_RANGES, "bytes")
-                        .body(axum::body::Body::from(bytes))
+                        .body(span_body)
                         .unwrap()
                         .into_response()
                 }
@@ -4905,11 +5022,18 @@ async fn prefetch_handler(
     // Preferred: start (or join) a range-proxy download. proxy_ensure
     // claims the downloads slot atomically itself, so a concurrent
     // /stream or /prefetch can't start a second writer for the key.
-    if proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key, true)
-        .await
-        .is_ok()
-    {
-        return StatusCode::ACCEPTED;
+    match proxy_ensure(&srv, &video_id, variant, &target_dir, &map_key, true).await {
+        Ok(_) => return StatusCode::ACCEPTED,
+        // A deliberate skip is NOT a failure and must not fall through to
+        // the legacy downloader below: that spawns the uncapped yt-dlp the
+        // skip existed to prevent. 429 tells the client this was refused
+        // for pressure, not broken, so it can retry once; any other error
+        // is a real proxy failure and still earns the legacy path.
+        Err(e) if e == stream_proxy::SKIPPED => {
+            eprintln!("[proxy] {video_id}: prefetch declined (resolver busy), not falling back");
+            return StatusCode::TOO_MANY_REQUESTS;
+        }
+        Err(_) => {}
     }
     if final_path.exists() {
         return StatusCode::OK;
@@ -5078,7 +5202,7 @@ fn runtime_icon(app: &tauri::AppHandle) -> tauri::image::Image<'static> {
 /// it sat there as a red dot that ignored the system appearance. This is the
 /// same play glyph with the disc dropped, black on transparency.
 ///
-/// Everywhere else keeps the app icon: Windows and Linux trays expect colour.
+/// Everywhere else keeps the app icon: Linux trays expect colour.
 fn tray_icon(app: &tauri::AppHandle) -> tauri::image::Image<'static> {
     #[cfg(target_os = "macos")]
     {
@@ -5093,7 +5217,7 @@ fn tray_icon(app: &tauri::AppHandle) -> tauri::image::Image<'static> {
 }
 
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
-    let show_item = MenuItem::with_id(app, "show", "Show YTubic", true, None::<&str>)?;
+    let show_item = MenuItem::with_id(app, "show", "Show Radif", true, None::<&str>)?;
     let play_item = MenuItem::with_id(app, "play_pause", "Play / Pause", true, Some("Space"))?;
     let prev_item = MenuItem::with_id(app, "prev", "Previous", true, None::<&str>)?;
     let next_item = MenuItem::with_id(app, "next", "Next", true, None::<&str>)?;
@@ -5112,13 +5236,13 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         // No-op off macOS; there it's what makes the glyph track the menu bar.
         .icon_as_template(cfg!(target_os = "macos"))
         .tooltip(if cfg!(debug_assertions) {
-            "YTubic (dev)"
+            "Radif (dev)"
         } else {
-            "YTubic"
+            "Radif"
         })
         .menu(&menu)
-        // macOS menu-bar extras conventionally open on left-click. Windows
-        // and Linux keep left-click reserved for restoring the main window.
+        // macOS menu-bar extras conventionally open on left-click. Linux
+        // keeps left-click reserved for restoring the main window.
         .show_menu_on_left_click(cfg!(target_os = "macos"))
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => show_main_window(app),
@@ -5156,12 +5280,6 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Register + pin the app's Windows identity (AppUserModelID) so the SMTC
-    // media tile (and notifications, taskbar) resolve to "YTubic" + icon rather
-    // than "Unknown app". Must run before any window is created. No-op off
-    // Windows.
-    appid::init();
-
     // rustls 0.23 refuses to pick a crypto backend for you when more than one
     // is compiled in, and panics the first time anything opens a TLS socket.
     // Both are: `ring` and `aws-lc-rs` arrive under the same rustls via
@@ -5206,10 +5324,14 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ))
+        // The LaunchAgent file is named after app_name, which defaults to
+        // productName. Installs from before the rename have YTubic.plist;
+        // a new name would leave it behind, still launching at login.
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name("YTubic")
+                .build(),
+        )
         .manage(state)
         .manage(CloseBehavior::default())
         .manage(authfs::MutationLocks::default())
@@ -5268,6 +5390,7 @@ pub fn run() {
             pick_cache_folder,
             focus_main_window,
             open_player_window,
+            notch::notch_set_enabled,
             close_player_window,
             set_now_playing,
             set_playback_activity,
@@ -5325,6 +5448,19 @@ pub fn run() {
             // From here on stderr lands in the app log with timestamps,
             // however the app was launched.
             applog::init(app.handle());
+            // The login entry stores this copy's path. A fresh Radif.app
+            // next to an old YTubic.app would otherwise keep launching the
+            // old one at login, so rewrite it while enabled. Not in dev: it
+            // would point the real login entry at the debug binary.
+            if !cfg!(debug_assertions) {
+                use tauri_plugin_autostart::ManagerExt;
+                let autolaunch = app.autolaunch();
+                if autolaunch.is_enabled().unwrap_or(false) {
+                    if let Err(e) = autolaunch.enable() {
+                        eprintln!("[autostart] refresh failed: {e}");
+                    }
+                }
+            }
             // The cookie key's home on macOS; must precede the first
             // encrypt/decrypt, which the session load below performs.
             if let Ok(dir) = app.path().app_data_dir() {
@@ -5392,16 +5528,14 @@ pub fn run() {
                 tokio::time::sleep(Duration::from_secs(20)).await;
                 run_refresh_loop(refresh_handle).await;
             });
-            // Native media controls: the SMTC tile on Windows (Quick Settings /
-            // volume flyout) and MPRIS on Linux, plus the hardware media keys.
-            // setup() runs on the main thread, which souvlaki requires and where
-            // the main window's HWND is available.
+            // Native media controls: MPRIS on Linux, plus the hardware media
+            // keys. setup() runs on the main thread, which souvlaki requires.
             // macOS is deliberately excluded: it has its own
             // MPRemoteCommandCenter bridge (now_playing.rs), and letting both
             // register would fight over the system Now Playing entry.
             // media_update/media_clear no-op when init never ran (CONTROLS
             // stays None).
-            #[cfg(any(windows, target_os = "linux"))]
+            #[cfg(target_os = "linux")]
             media::init(app.handle());
             if let Err(e) = build_tray(app.handle()) {
                 eprintln!("[tray] build failed: {e}");

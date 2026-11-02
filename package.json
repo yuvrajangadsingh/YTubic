@@ -1,7 +1,7 @@
 {
-  "name": "ytubic",
+  "name": "radif",
   "private": true,
-  "version": "0.4.9",
+  "version": "0.5.0",
   "license": "GPL-3.0-only",
   "packageManager": "pnpm@10.33.1",
   "type": "module",

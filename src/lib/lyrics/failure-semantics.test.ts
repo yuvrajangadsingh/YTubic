@@ -1,5 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { LyricsRateLimitError, shouldRetryLyricsQuery } from "./errors";
+import { InnerTubeHttpError } from "@/lib/innertube/shared";
+import {
+  LYRICS_OPS,
+  describeLyricsError,
+  LyricsHttpError,
+  LyricsRateLimitError,
+  LyricsTimeoutError,
+  shouldRetryLyricsQuery,
+  type LyricsOp,
+} from "./errors";
 
 // `vi.resetModules()` gives the providers a fresh copy of ./errors, so the
 // class they throw is not the one imported above. `setup` hands back the
@@ -21,6 +30,11 @@ import { LyricsRateLimitError, shouldRetryLyricsQuery } from "./errors";
  */
 
 vi.mock("@tauri-apps/plugin-http", () => ({ fetch: vi.fn() }));
+// The InnerTube transport asks the Rust side for the auth context before
+// a request and hands Set-Cookie lines back after; an empty jar is fine.
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(async () => ({ cookie: null, pageId: null })),
+}));
 
 type Route = (url: string) => { status?: number; body?: unknown } | "reject";
 
@@ -199,5 +213,195 @@ describe("a real answer is still an answer", () => {
       url.includes("/api/get") ? { status: 404 } : { body: [] },
     );
     await expect(fetchLrclibLyrics(TRACK)).resolves.toBeNull();
+  });
+});
+
+/**
+ * The log line a failed provider produces. Provider errors quote response
+ * bodies, and the app log is a file on disk, so the body has to go.
+ */
+describe("describeLyricsError", () => {
+  it("names the request and the status from our own typed error", () => {
+    expect(
+      describeLyricsError(new LyricsHttpError(503, "Musixmatch token.get")),
+    ).toBe("Musixmatch token.get HTTP 503");
+    expect(describeLyricsError(new LyricsHttpError(404, "LRCLIB /get"))).toBe(
+      "LRCLIB /get HTTP 404",
+    );
+  });
+
+  // The old scrubber read a status back out of message text, and with it
+  // whatever else the text held. A plain Error is now opaque on purpose.
+  it("does not read a status out of a plain message", () => {
+    expect(
+      describeLyricsError(
+        new Error("Musixmatch HTTP 503: <html>upstream said no</html>"),
+      ),
+    ).toBe("failed");
+  });
+
+  it("names a rate limit without quoting the token", () => {
+    expect(
+      describeLyricsError(
+        new LyricsRateLimitError("Musixmatch token UpgradeOnly_abc123"),
+      ),
+    ).toBe("rate limited");
+  });
+
+  it("names a timeout from our own type and from AbortSignal.timeout", () => {
+    expect(describeLyricsError(new LyricsTimeoutError())).toBe("timed out");
+    expect(
+      describeLyricsError(new DOMException("took too long", "TimeoutError")),
+    ).toBe("timed out");
+  });
+
+  it("never quotes the body a JSON parse choked on", () => {
+    const parsed = (() => {
+      try {
+        JSON.parse("sessionToken_abc123");
+        return null;
+      } catch (e) {
+        return e;
+      }
+    })();
+    expect(describeLyricsError(parsed)).toBe("response was not JSON");
+  });
+
+  /**
+   * Why this is a classifier and not a scrubber. Every one of these walked
+   * through a redact-the-bad-parts version: credentials in a URL authority,
+   * an IPv6 host, a data: payload, a body quoted before the status, a bare
+   * token, an address, and a message that merely looked like a parse error.
+   * None of them is a type we throw, so none of them is described.
+   */
+  it.each([
+    [
+      "credentials in the authority",
+      "sending request for url (https://user:secret@127.0.0.1/x)",
+    ],
+    [
+      "an IPv6 host",
+      "sending request for url (https://[::1]:8080/ws?usertoken=secret)",
+    ],
+    ["a data payload", "failed on data:text/plain;base64,c2VjcmV0VG9rZW4="],
+    ["a blob url", "failed on blob:null/9f8e-secretToken"],
+    [
+      "a body before the status",
+      'server said {"key":"secretToken"} then HTTP 503',
+    ],
+    ["a bare token", "rejected token sk_live_secretToken0123456789"],
+    ["an address", "Genius rejected signup for nobody@example.com"],
+    [
+      "a parse-shaped message",
+      "Unexpected token 's', \"secretToken\" is not valid JSON",
+    ],
+  ])("says only 'failed' for %s", (_what, message) => {
+    expect(describeLyricsError(new Error(message))).toBe("failed");
+  });
+
+  it("copies nothing from an error's own name or class", () => {
+    class ProviderGone extends Error {
+      override name = "SecretToken";
+    }
+    expect(describeLyricsError(new ProviderGone("host down at 10.0.0.4"))).toBe(
+      "failed",
+    );
+    const lying = new LyricsHttpError(
+      500,
+      "https://x/?usertoken=secret" as LyricsOp,
+    );
+    expect(describeLyricsError(lying)).toBe("HTTP 500");
+  });
+
+  it("reads status and op once and prints the list's copy of the name", () => {
+    let reads = 0;
+    const hostile = Object.create(LyricsHttpError.prototype) as LyricsHttpError;
+    Object.defineProperty(hostile, "status", {
+      get: () => (reads++ === 0 ? 503 : "secretToken@example.com"),
+    });
+    Object.defineProperty(hostile, "op", {
+      get: () => (reads++ === 1 ? "Genius page" : "secretToken@example.com"),
+    });
+    expect(describeLyricsError(hostile)).toBe("Genius page HTTP 503");
+    expect(reads).toBe(2);
+  });
+
+  it("prints no name that is not on the list, however plain it looks", () => {
+    // The old shape check took any token-shaped string. A name from the
+    // list is the only thing that reaches the log now.
+    const plain = new LyricsHttpError(500, "secretToken" as LyricsOp);
+    expect(describeLyricsError(plain)).toBe("HTTP 500");
+  });
+
+  it("gives a getter that rewrites the list nothing for its trouble", () => {
+    const hostile = Object.create(LyricsHttpError.prototype) as LyricsHttpError;
+    Object.defineProperty(hostile, "status", { get: () => 503 });
+    Object.defineProperty(hostile, "op", {
+      get: () => {
+        Reflect.set(LYRICS_OPS, "0", "secretToken");
+        return "secretToken";
+      },
+    });
+    expect(describeLyricsError(hostile)).toBe("HTTP 503");
+    expect(LYRICS_OPS[0]).toBe("Genius search");
+  });
+
+  it("does not consult an Array.prototype.find a getter swapped in", () => {
+    // Freezing the list protects its entries, not the methods it inherits.
+    const original = Array.prototype.find;
+    const hostile = Object.create(LyricsHttpError.prototype) as LyricsHttpError;
+    Object.defineProperty(hostile, "status", { get: () => 503 });
+    Object.defineProperty(hostile, "op", {
+      get: () => {
+        Reflect.set(Array.prototype, "find", () => "secretToken");
+        return "secretToken";
+      },
+    });
+    try {
+      expect(describeLyricsError(hostile)).toBe("HTTP 503");
+    } finally {
+      Reflect.set(Array.prototype, "find", original);
+    }
+  });
+
+  it("names the status of a failed YouTube Music hop, nothing else", () => {
+    const e = new InnerTubeHttpError("next", 503, "secretToken in the body");
+    expect(describeLyricsError(e)).toBe("YouTube Music HTTP 503");
+    expect(e.message).toContain("HTTP 503");
+  });
+
+  it("refuses a status that is not a real one", () => {
+    expect(describeLyricsError(new LyricsHttpError(1e15, "LRCLIB /get"))).toBe(
+      "http error",
+    );
+    expect(describeLyricsError(new LyricsHttpError(7, "LRCLIB /get"))).toBe(
+      "http error",
+    );
+  });
+
+  it("stays cheap on a long message", () => {
+    const started = Date.now();
+    describeLyricsError(new Error("x".repeat(64 * 1024)));
+    expect(Date.now() - started).toBeLessThan(50);
+  });
+});
+
+/**
+ * The first hop of the YouTube Music lookup does not go through a lyrics
+ * module at all; it is the shared InnerTube transport, so its failure has
+ * to be typed at the source for the describer to name it.
+ */
+describe("the YouTube Music transport", () => {
+  it("throws its typed error from the shared post, and the describer names it", async () => {
+    await setup(() => ({ status: 503, body: "secretToken in the body" }));
+    const shared = await import("@/lib/innertube/shared");
+    const errors = await import("./errors");
+    const err: unknown = await shared.rawNext({ videoId: "x" }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(shared.InnerTubeHttpError);
+    expect(errors.describeLyricsError(err)).toBe("YouTube Music HTTP 503");
+    expect(errors.describeLyricsError(err)).not.toContain("secret");
   });
 });

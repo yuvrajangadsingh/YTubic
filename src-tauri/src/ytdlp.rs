@@ -12,8 +12,8 @@
 //!
 //! # Why macOS takes the directory build
 //!
-//! Windows and Linux get the single-file release. macOS deliberately does
-//! not: `yt-dlp_macos` is a PyInstaller *onefile* bundle, which unpacks
+//! Linux gets the single-file release. macOS deliberately does not:
+//! `yt-dlp_macos` is a PyInstaller *onefile* bundle, which unpacks
 //! its ~100 bundled dylibs into a brand-new temp directory on every single
 //! launch. Because the path is new each time, the kernel's code-signature
 //! cache never hits and dyld re-hashes every dylib from scratch — the
@@ -34,8 +34,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 use tokio::io::AsyncWriteExt;
 
-#[cfg(windows)]
-const BINARY_NAME: &str = "yt-dlp.exe";
 /// The archive names its entry point after the platform, not plain `yt-dlp`.
 #[cfg(target_os = "macos")]
 const BINARY_NAME: &str = "yt-dlp_macos";
@@ -56,9 +54,6 @@ const DOWNLOAD_PART: &str = "yt-dlp.part";
 /// Official builds. The `latest/download/` URL redirects to the newest
 /// release asset, so no GitHub API call (and no rate limit) is involved.
 /// macOS takes the directory bundle — see the module comment for why.
-#[cfg(windows)]
-const DOWNLOAD_URL: &str =
-    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
 #[cfg(target_os = "macos")]
 const DOWNLOAD_URL: &str =
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos.zip";
@@ -74,11 +69,8 @@ const UPDATE_TIMEOUT: Duration = Duration::from_secs(180);
 /// Hard cap on the first-run download (~12 MB single-file, ~52 MB zip).
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
 /// Where the managed executable lives for this install. On macOS that is
-/// one level deeper than the others: the entry point inside the unpacked
+/// one level deeper than on Linux: the entry point inside the unpacked
 /// bundle directory.
 pub fn managed_path(app: &tauri::AppHandle) -> PathBuf {
     let dir = app
@@ -155,19 +147,12 @@ pub fn js_runtime_args() -> &'static [String] {
 /// either way an install we did not know about should still win over
 /// nothing.
 fn find_deno() -> Option<PathBuf> {
-    #[cfg(windows)]
-    const DENO: &str = "deno.exe";
-    #[cfg(not(windows))]
     const DENO: &str = "deno";
 
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(home) = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-    {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         candidates.push(home.join(".deno").join("bin").join(DENO));
     }
-    #[cfg(not(windows))]
     candidates.extend(
         [
             "/opt/homebrew/bin",
@@ -255,8 +240,6 @@ pub async fn ensure(app: tauri::AppHandle) {
 async fn probe_path_install() -> bool {
     let mut cmd = tokio::process::Command::new("yt-dlp");
     cmd.arg("--version");
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
     match cmd.status().await {
@@ -334,7 +317,6 @@ async fn download(managed: &Path) -> Result<(), String> {
 
     #[cfg(not(target_os = "macos"))]
     {
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = tokio::fs::set_permissions(
@@ -545,8 +527,6 @@ async fn latest_release_tag() -> Option<String> {
 async fn installed_version(managed: &Path) -> Option<String> {
     let mut cmd = tokio::process::Command::new(managed);
     cmd.arg("--version");
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
     let out = cmd.output().await.ok()?;
     if !out.status.success() {
         return None;
@@ -559,13 +539,11 @@ async fn installed_version(managed: &Path) -> Option<String> {
     }
 }
 
-/// Windows / Linux: the single-file release replaces itself in place.
+/// Linux: the single-file release replaces itself in place.
 #[cfg(not(target_os = "macos"))]
 async fn run_self_update(managed: &Path) {
     let mut cmd = tokio::process::Command::new(managed);
     cmd.arg("-U");
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     // The timeout below drops the output() future — without this the

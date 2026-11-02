@@ -191,9 +191,20 @@ export function useTrackMenuController(item: ShelfItem) {
       toast.error(`Failed: ${String(e)}`);
     }
   };
-  const runAddToPlaylist = async (p: UserPlaylist) => {
+  const runAddToPlaylist = async (p: UserPlaylist, force = false) => {
     try {
-      await addToPlaylist(p.id, item.id);
+      const result = await addToPlaylist(p.id, item.id, { force });
+      if (result === "duplicate") {
+        // YouTube refused because the song is already there; nothing was
+        // added. Offer the same choice YouTube Music's own dialog does.
+        toast(`Already in ${p.title}`, {
+          action: {
+            label: "Add anyway",
+            onClick: () => void runAddToPlaylist(p, true),
+          },
+        });
+        return;
+      }
       // The playlist page keys its data as ["playlist-pages", id] (with a
       // possibly VL-prefixed id), so ["playlist", p.id] never matched and
       // the invalidation was a no-op. Prefix-match every open playlist page.
@@ -212,7 +223,9 @@ export function useTrackMenuController(item: ShelfItem) {
     // this restores membership, not position.
     const undoRemove = async () => {
       try {
-        await addToPlaylist(removal.playlistId, item.id);
+        // The removed entry may have been one of two copies; the undo puts
+        // that copy back, so YouTube's duplicate check has to be skipped.
+        await addToPlaylist(removal.playlistId, item.id, { force: true });
         await qc.invalidateQueries({ queryKey: ["playlist-pages-v2"] });
         toast.success("Added back (at the end of the playlist)");
       } catch (e) {

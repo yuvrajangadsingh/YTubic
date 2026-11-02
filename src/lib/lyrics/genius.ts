@@ -5,7 +5,11 @@ import {
   normalizeForMatch,
   normalizeTitleForMatch,
 } from "@/lib/lyrics/match";
-import { LyricsRateLimitError } from "@/lib/lyrics/errors";
+import {
+  LyricsHttpError,
+  LyricsRateLimitError,
+  type LyricsOp,
+} from "@/lib/lyrics/errors";
 
 /**
  * Genius (https://genius.com) — plain text only. The official API
@@ -73,11 +77,11 @@ export async function fetchGeniusLyrics(
 }
 
 /** A lookup that failed is not evidence of absence. */
-function throwForStatus(status: number, what: string): never {
+function throwForStatus(status: number, what: LyricsOp): never {
   if (status === 429) {
     throw new LyricsRateLimitError(`${what} rate limited (429)`);
   }
-  throw new Error(`${what} ${status}`);
+  throw new LyricsHttpError(status, what);
 }
 
 async function findSongUrl(

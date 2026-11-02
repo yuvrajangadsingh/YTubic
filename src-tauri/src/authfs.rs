@@ -58,23 +58,9 @@ fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
     }
 }
 
-#[cfg(not(unix))]
-fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
-    file.sync_all()
-}
-
-#[cfg(unix)]
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     let handle = std::fs::File::open(dir)?;
     sync_file(&handle)
-}
-
-/// Windows has no portable way to open a directory as a `File`, so the
-/// rename's durability is left to NTFS's own metadata journal. The file
-/// fsync and the atomic rename above still hold there.
-#[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 /// Replace `path` with `bytes`, atomically and durably.
@@ -98,9 +84,6 @@ pub(crate) fn write_atomic_blocking(path: &Path, bytes: &[u8], mode: u32) -> Res
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
     std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-
-    #[cfg(not(unix))]
-    let _ = mode;
 
     let mut collisions = 0_u8;
     loop {

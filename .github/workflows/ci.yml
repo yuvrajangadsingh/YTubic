@@ -45,9 +45,8 @@ jobs:
         # macOS is the only shipped platform. Ubuntu stays as a cheap
         # one-minute canary for non-mac Rust mistakes. Windows was dropped
         # on 2026-09-04: it was the slowest job and it blocked three PRs
-        # over a test that will never run there; the Windows-only code
-        # paths (DPAPI store, CREATE_NO_WINDOW) are no longer compiled in
-        # CI, which is a known trade.
+        # over a test that will never run there. The Windows-only code
+        # paths (DPAPI store, CREATE_NO_WINDOW) were deleted afterwards.
         os:
           - macos-latest
           - ubuntu-22.04

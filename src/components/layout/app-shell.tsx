@@ -27,11 +27,13 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAudioEngine } from "@/lib/audio-engine";
 import { useCacheAutoClean } from "@/lib/cache-cleanup";
 import { usePlaybackNotifications } from "@/lib/playback-notifications";
+import { useNotchPeek } from "@/lib/notch";
 import { useLastfmScrobbler } from "@/lib/lastfm-scrobbler";
 import { useYtdlpSetup } from "@/lib/ytdlp";
 import { useUpdateStartupCheck } from "@/lib/updater";
 import { useWhatsNewOnUpdate } from "@/lib/store/whats-new";
 import { pickHighResThumbnail } from "@/components/shared/thumbnail";
+import { resetLyricsSelectionLog } from "@/lib/lyrics/sources";
 import { usePlaybackStore, currentTrack } from "@/lib/store/playback";
 import { useLayoutStore } from "@/lib/store/layout";
 import { usePremiumStatusSync } from "@/lib/store/premium";
@@ -103,6 +105,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   useDiscordPresenceSync();
   useCacheAutoClean();
   usePlaybackNotifications();
+  useNotchPeek();
   useLastfmScrobbler();
   const mode = useLayoutStore((s) => s.mode);
   const setMode = useLayoutStore((s) => s.setMode);
@@ -116,6 +119,12 @@ export function AppShell({ children }: { children: ReactNode }) {
   const hasTrack = usePlaybackStore(
     (s) => s.index >= 0 && s.index < s.queue.length,
   );
+  // The lyrics log announces its pick afresh once the player has been
+  // dropped and a track is played again. The views cannot see that gap;
+  // this component stays mounted through it.
+  useEffect(() => {
+    if (!hasTrack) resetLyricsSelectionLog();
+  }, [hasTrack]);
   // Set when we close the floating window programmatically (queue emptied)
   // so the player-window-closed handler doesn't mistake it for the user
   // clicking X and revert the persisted floating layout preference.
@@ -221,7 +230,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-background">
           {background === "ambient" && <BackgroundCover />}
           {/* Custom title bar spans the full window width so the
-              Windows-style min/max/close buttons land in the actual
+              min/max/close buttons land in the actual
               top-right corner, not behind the floating player. */}
           <TopBar />
           <div className="relative flex min-h-0 flex-1">

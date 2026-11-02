@@ -1,3 +1,4 @@
+import { appLog } from "@/lib/app-log";
 import {
   collectContinuationItems,
   innertubePost,
@@ -162,25 +163,61 @@ function readRun(node: YtNode | undefined): string {
   return runs.map((r) => r.text ?? "").join("");
 }
 
+export type AddToPlaylistResult = "added" | "duplicate";
+
+/**
+ * YouTube runs its own duplicate check on this call: a song already in
+ * the playlist is refused and nothing is added (ytmusicapi documents the
+ * refusal and the dedupeOption that turns the check off; the refusal's
+ * body has not been captured here yet). That case is reported as
+ * "duplicate" rather than thrown; `force` turns the check off up front,
+ * which is what YouTube Music's own Add anyway button does.
+ */
 export async function addToPlaylist(
   playlistId: string,
   videoId: string,
-): Promise<void> {
+  opts: { force?: boolean } = {},
+): Promise<AddToPlaylistResult> {
+  const action: Record<string, unknown> = {
+    action: "ACTION_ADD_VIDEO",
+    addedVideoId: videoId,
+  };
+  if (opts.force) action.dedupeOption = "DEDUPE_OPTION_SKIP";
   const json = await innertubePost(
     "browse/edit_playlist",
-    {
-      playlistId,
-      actions: [{ action: "ACTION_ADD_VIDEO", addedVideoId: videoId }],
-    },
+    { playlistId, actions: [action] },
     AUTHED,
   );
   // edit_playlist returns HTTP 200 even when it rejects the edit (not the
   // owner, stale cookies, …) — surface the envelope status so the
   // optimistic "Added to <playlist>" toast doesn't lie.
   const status = json?.status as string | undefined;
-  if (status && status !== "STATUS_SUCCEEDED") {
-    throw new Error(`edit_playlist failed: ${status}`);
-  }
+  if (status === "STATUS_SUCCEEDED") return "added";
+  if (isDuplicateRefusal(json, videoId)) return "duplicate";
+  if (!status) return "added";
+  // Any other refusal is unexpected; keep its shape for the next look.
+  appLog(`edit_playlist ${status}: ${JSON.stringify(json).slice(0, 1500)}`);
+  throw new Error(`edit_playlist failed: ${status}`);
+}
+
+/**
+ * The duplicate refusal is recognised by its retry, not its wording: the
+ * expectation is that the response carries an add of this same video with
+ * dedupeOption DEDUPE_OPTION_SKIP (the dialog's Add anyway). Where that
+ * sits in the tree is not pinned down, so the whole response is walked;
+ * the depth cap only guards against a runaway, JSON has no cycles.
+ */
+export function isDuplicateRefusal(json: YtNode, videoId: string): boolean {
+  const visit = (node: unknown, depth: number): boolean => {
+    if (depth > 64 || !node || typeof node !== "object") return false;
+    if (Array.isArray(node)) return node.some((n) => visit(n, depth + 1));
+    const o = node as Record<string, unknown>;
+    if (o.dedupeOption === "DEDUPE_OPTION_SKIP" && o.addedVideoId === videoId) {
+      return true;
+    }
+    return Object.values(o).some((v) => visit(v, depth + 1));
+  };
+  return visit(json, 0);
 }
 
 /**

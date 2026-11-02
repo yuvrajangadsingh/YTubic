@@ -158,24 +158,57 @@ export function initFloatingTrackSourceBridge(): void {
 export function resolveStreamId(
   displayedId: string,
   byVideoId: Record<string, TrackSources>,
+  preferVideo = false,
 ): string {
   const rec = byVideoId[displayedId];
   if (!rec) return displayedId;
-  if (rec.selected === "video" && rec.video) return rec.video;
+  // These two answers have to agree. If this hands back the video id
+  // while `wantsVideoStream` says audio, the master streams the music
+  // video's audio track under a UI that says Song, and the toggle cannot
+  // get back because it is already showing the state you want.
+  if (wantsVideoStream(displayedId, byVideoId, preferVideo) && rec.video) {
+    return rec.video;
+  }
+  // Not streaming video. `selected` still names the default file for a
+  // row that IS a video, so that keeps its own id. It must never
+  // redirect a SONG row to a different file while the gate says audio:
+  // one record is aliased under both ids, so a song row can read
+  // `selected: "video"` with `video` pointing at the other file.
+  if (rec.selected === "video" && rec.video === displayedId) return rec.video;
   return rec.song;
 }
 
 /**
- * Whether the stream for `displayedId` should be the actual video file
- * (progressive h264, `?video=1` on the local server) instead of the
- * audio-only download. Requires the user's explicit switch — seeded
- * records with `selected: "video"` (video-native queue items) keep
- * streaming audio-only until the user asks for the video.
+ * Whether the stream for `displayedId` should be the video file instead
+ * of the audio-only download.
+ *
+ * An explicit per-track choice wins in both directions: picking Song on
+ * a track keeps it audio even while the global video mode is on.
+ *
+ * With no explicit choice, sticky video mode counts, but only once the
+ * record already names the video counterpart. Two reasons for that
+ * condition. `resolveStreamId` substitutes the video id only when
+ * `selected` is "video", so claiming video any earlier would ask for a
+ * video-only track of the SONG file. And a track whose counterpart has
+ * yet to be hunted has nothing to stream.
+ *
+ * This does not widen which tracks stream video: PlayerBar's sticky
+ * effect sets `chosen` on exactly these records a tick later anyway. It
+ * moves the decision into the same render as the track change. Before,
+ * the companion effect ran once with video off, and its cleanup put the
+ * artwork back up before the next run rebuilt the whole companion.
  */
 export function wantsVideoStream(
   displayedId: string,
   byVideoId: Record<string, TrackSources>,
+  preferVideo = false,
 ): boolean {
   const rec = byVideoId[displayedId];
-  return !!rec && rec.selected === "video" && rec.chosen === true;
+  if (!rec) return false;
+  if (rec.chosen === true) return rec.selected === "video";
+  // Sticky mode is a mode, not a per-track identity, so it is read from
+  // `preferVideo` rather than written into `selected`. Writing it into
+  // `selected` made turning the mode off leave upcoming tracks pointed
+  // at the video cut's audio with no way back.
+  return preferVideo && !!rec.video;
 }

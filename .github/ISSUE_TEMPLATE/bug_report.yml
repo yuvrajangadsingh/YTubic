@@ -23,7 +23,6 @@ body:
     attributes:
       label: Platform
       options:
-        - Windows
         - Linux (beta)
         - macOS (beta)
     validations:
@@ -32,7 +31,7 @@ body:
     id: os
     attributes:
       label: OS version / distro
-      placeholder: "Windows 11 24H2 / Ubuntu 24.04 / macOS 15.5"
+      placeholder: "macOS 15.5 / Ubuntu 24.04"
   - type: dropdown
     id: signed-in
     attributes:

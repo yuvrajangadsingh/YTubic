@@ -1,6 +1,7 @@
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { rawNext } from "@/lib/innertube/shared";
 import type { Lyrics, TimedLine } from "@/lib/lyrics/types";
+import { LyricsHttpError } from "@/lib/lyrics/errors";
 
 /**
  * YouTube Music's own lyrics, over InnerTube.
@@ -183,7 +184,7 @@ async function fetchLyricsPage(
     body: JSON.stringify({ browseId, context: { client: ANDROID_MUSIC } }),
     signal,
   });
-  if (!r.ok) throw new Error(`YouTube Music browse ${r.status}`);
+  if (!r.ok) throw new LyricsHttpError(r.status, "YouTube Music browse");
   const res = (await r.json()) as YtNode;
 
   const rows = parseLyricRows(res);

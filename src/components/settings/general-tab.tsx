@@ -6,6 +6,7 @@ import {
   BellIcon,
   Loader2Icon,
   LogInIcon,
+  PanelTopIcon,
   RocketIcon,
   UserRoundIcon,
   XIcon,
@@ -114,6 +115,8 @@ function BehaviorGroup() {
   const setPlaybackNotifications = useSettingsStore(
     (s) => s.setPlaybackNotifications,
   );
+  const notchSongPeek = useSettingsStore((s) => s.notchSongPeek);
+  const setNotchSongPeek = useSettingsStore((s) => s.setNotchSongPeek);
 
   const qc = useQueryClient();
   const autostart = useQuery({
@@ -139,7 +142,7 @@ function BehaviorGroup() {
       <SettingRow
         icon={RocketIcon}
         title="Launch at startup"
-        description="Start YTubic automatically when you log in."
+        description="Start Radif automatically when you log in."
         control={
           <Switch
             checked={!!autostart.data}
@@ -161,13 +164,27 @@ function BehaviorGroup() {
           />
         }
       />
+      {IS_MAC && (
+        <SettingRow
+          icon={PanelTopIcon}
+          title="Show playback at the notch"
+          description="When a song starts, pauses or resumes, the notch grows for a moment to show it."
+          control={
+            <Switch
+              checked={notchSongPeek}
+              onCheckedChange={setNotchSongPeek}
+              aria-label="Show playback at the notch"
+            />
+          }
+        />
+      )}
       <SettingRow
         icon={XIcon}
         title={IS_MAC ? "Close to menu bar" : "Close to tray"}
         description={
           IS_MAC
-            ? "Hide YTubic to the menu bar when you close the window instead of quitting."
-            : "Hide YTubic to the tray when you press ✕ instead of quitting."
+            ? "Hide Radif to the menu bar when you close the window instead of quitting."
+            : "Hide Radif to the tray when you press ✕ instead of quitting."
         }
         control={
           <Switch

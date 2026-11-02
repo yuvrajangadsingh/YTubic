@@ -23,6 +23,7 @@ import {
   LogOutIcon,
   ExternalLinkIcon,
   CheckIcon,
+  RefreshCwIcon,
 } from "lucide-react";
 import {
   Sidebar,
@@ -79,7 +80,11 @@ import {
   credentialState,
   liveAccountState,
 } from "@/lib/auth-presence";
-import { accountInfoQuery, authLoggedInQuery } from "@/lib/store/auth-queries";
+import {
+  accountInfoQuery,
+  activeAccountIdQuery,
+  authLoggedInQuery,
+} from "@/lib/store/auth-queries";
 import { usePremiumStore } from "@/lib/store/premium";
 import {
   removeAccount,
@@ -130,12 +135,12 @@ export function AppSidebar() {
          *  16px). In collapsed mode the row centers it like the
          *  centered menu icons below. */}
         <img
-          src="/ytubic-icon.svg"
-          alt="YTubic"
+          src="/radif-icon.svg"
+          alt="Radif"
           className="size-7 shrink-0"
         />
         <span className="text-xl font-semibold leading-none tracking-tight transition-opacity duration-200 group-data-[collapsible=icon]:hidden">
-          YTubic
+          Radif
         </span>
         {IS_BETA_PLATFORM && (
           <span
@@ -411,6 +416,32 @@ function SidebarPlaylists({
               </ContextMenu>
             </SidebarMenuItem>
           ))}
+
+          {/* A failed browse used to be invisible: the rows above read
+              `library.data ?? []`, so a launch before the network was up
+              (Sep 10 2026) showed only Liked songs for eight hours and
+              nothing re-asked. The window-focus refetch covers the usual
+              way back; this row covers the rest and says what happened.
+              Gated on a confirmed login because refetch() ignores
+              `enabled`, and an anonymous library browse answers with the
+              explore page, which would land in the library cache. With no
+              data the retry puts the query back to pending, so the row
+              goes away and comes back only if the retry fails too; with
+              stale data retained the row stays, so it is disabled while
+              a fetch is running rather than restarting it. */}
+          {loggedIn.data === true && library.isError ? (
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                tooltip="Couldn't load playlists"
+                className={MENU_BTN_CLS}
+                disabled={library.isFetching}
+                onClick={() => void library.refetch()}
+              >
+                <RefreshCwIcon />
+                <span>Couldn't load playlists. Retry</span>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          ) : null}
         </SidebarMenu>
       </SidebarGroupContent>
     </SidebarGroup>
@@ -463,7 +494,10 @@ function UserProfile() {
   const [confirmSignOut, setConfirmSignOut] = useState(false);
   const loggedIn = useQuery(authLoggedInQuery);
   const credentials = credentialState(loggedIn.data, loggedIn.isError);
-  const account = useQuery(accountInfoQuery(credentials === "authenticated"));
+  const activeId = useQuery(activeAccountIdQuery);
+  const account = useQuery(
+    accountInfoQuery(credentials === "authenticated", activeId.data),
+  );
   const accounts = useAccounts();
   const premiumStatus = usePremiumStore((s) => s.status);
 
@@ -692,8 +726,8 @@ function UserProfile() {
               <DialogTitle>Sign out?</DialogTitle>
               <DialogDescription>
                 {email
-                  ? `This signs ${email} out of YTubic.`
-                  : "This signs the current account out of YTubic."}{" "}
+                  ? `This signs ${email} out of Radif.`
+                  : "This signs the current account out of Radif."}{" "}
                 Your library and playlists stay on YouTube Music; signing
                 back in restores them.
               </DialogDescription>

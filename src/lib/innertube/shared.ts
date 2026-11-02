@@ -1,6 +1,7 @@
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { invoke } from "@tauri-apps/api/core";
 import type { ShelfItem, ShelfMore, Thumbnail } from "./types";
+import { appLog } from "@/lib/app-log";
 
 export type YtNode = Record<string, any>;
 
@@ -100,9 +101,14 @@ async function sha1Hex(text: string): Promise<string> {
  * Cookie header plus the active brand-channel page id, as one unit.
  * They describe the same identity, so caching them separately could
  * pair fresh cookies with a stale channel (or vice versa) across a
- * sign-in or a channel switch.
+ * sign-in or a channel switch. `accountId` names that identity, null
+ * for an anonymous context, so a caller can insist on it.
  */
-type AuthContext = { cookie: string; pageId: string | null };
+type AuthContext = {
+  cookie: string;
+  pageId: string | null;
+  accountId: string | null;
+};
 
 /**
  * The auth context could not be read at all: the login keychain was
@@ -125,11 +131,27 @@ export class AuthUnavailableError extends Error {
   }
 }
 
+/**
+ * The request was for one account and the credentials on hand are for
+ * another. Raised before anything is sent: the caller asked for an
+ * answer bound to an account, and an answer fetched with the wrong
+ * cookies would be cached and recorded under that account's name. This
+ * is the gap between an account switch or a sign-in and the queries
+ * re-keying to the new id, where a refetch under the old key goes out
+ * with the new jar.
+ */
+export class AuthIdentityMismatchError extends Error {
+  constructor() {
+    super("credentials on hand are for a different account");
+    this.name = "AuthIdentityMismatchError";
+  }
+}
+
 /** Whether a caller can fall back to an anonymous request. */
 export type AuthMode = "required" | "optional";
 
 // In-process cache for the auth context. Without it every browse / search
-// / next call invokes the Rust side, which hits disk + DPAPI-decrypts the
+// / next call invokes the Rust side, which hits disk + decrypts the
 // jar (a 1000-track playlist scroll would do that 10+ times for no gain).
 // TTL keeps us responsive to silent re-logins (different webview session
 // dropping a fresh SID); `resetAuthCache()` is the explicit invalidation
@@ -257,13 +279,25 @@ export async function captureSetCookies(res: Response): Promise<void> {
  */
 export async function authHeaders(
   mode: AuthMode = "optional",
+  forAccount?: string | null,
 ): Promise<Record<string, string>> {
+  // A bound request never goes out anonymous: an unreadable context is
+  // an error for it whatever the mode, and so is an anonymous one.
+  const bound = forAccount !== undefined;
   let ctx: AuthContext;
   try {
     ctx = await loadAuthContext();
   } catch (e) {
-    if (mode === "required") throw e;
+    if (mode === "required" || bound) throw e;
     return {};
+  }
+  if (bound && ctx.accountId !== forAccount) {
+    // The cache can be older than the key: the startup dedup remaps
+    // account ids with no accounts-changed event to reset it. One fresh
+    // read before refusing, so a mismatch is only ever a live one.
+    resetAuthCache();
+    ctx = await loadAuthContext();
+    if (ctx.accountId !== forAccount) throw new AuthIdentityMismatchError();
   }
   const { cookie, pageId } = ctx;
   if (!cookie) return {};
@@ -280,40 +314,112 @@ export async function authHeaders(
   return headers;
 }
 
+/**
+ * Above this, a POST logs where its time went. The Premium check's
+ * 67-76s outliers (Sep 2026) were recorded as one number wrapped around
+ * the whole call, which covers a jar read over IPC, the request, the
+ * cookie merge (it takes the account's mutation lock) and the body
+ * parse. One number cannot name the phase that stalled, and each phase
+ * has a different fix. Fast calls stay silent.
+ */
+const SLOW_POST_MS = 3_000;
+
 export async function innertubePost(
   endpoint: string,
   body: Record<string, unknown>,
-  opts: { auth?: AuthMode } = {},
+  opts: {
+    auth?: AuthMode;
+    /**
+     * Bind the request to this account (null: to no account). Sent only
+     * with that account's credentials, otherwise it fails with
+     * `AuthIdentityMismatchError` before anything goes out.
+     */
+    forAccount?: string | null;
+    connectTimeoutMs?: number;
+  } = {},
 ): Promise<YtNode> {
   // `endpoint` may already carry query params (reload continuations are
   // passed as `browse?ctoken=…` — the server ignores them in the body).
   const url = `https://music.youtube.com/youtubei/v1/${endpoint}${
     endpoint.includes("?") ? "&" : "?"
   }prettyPrint=false`;
-  const auth = await authHeaders(opts.auth);
-  const visitor = loadVisitorData();
-  const visitorHeader: Record<string, string> = visitor
-    ? { "X-Goog-Visitor-Id": visitor }
-    : {};
-  const res = await tauriFetch(url, {
-    method: "POST",
-    headers: { ...BASE_HEADERS, ...visitorHeader, ...auth },
-    body: JSON.stringify({ context: buildContext(), ...body }),
-  });
-
-  // Before the error bail: Google rotates cookies on 4xx responses too.
-  await captureSetCookies(res);
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(
-      `InnerTube ${endpoint} → HTTP ${res.status}: ${text.slice(0, 300)}`,
+  const started = Date.now();
+  const done: string[] = [];
+  let phase = "auth";
+  let phaseStart = started;
+  const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+  const enter = (next: string) => {
+    const now = Date.now();
+    done.push(`${phase} ${secs(now - phaseStart)}`);
+    phase = next;
+    phaseStart = now;
+  };
+  const reportIfSlow = (outcome: string) => {
+    const total = Date.now() - started;
+    if (total < SLOW_POST_MS) return;
+    // Close whatever was still running: on a failure that phase is the
+    // one that stalled, and phases never reached simply do not appear.
+    // Carrying unfinished marks at the start time instead put the whole
+    // elapsed on `body` and a negative number on the phase that threw.
+    const parts = [...done, `${phase} ${secs(Date.now() - phaseStart)}`];
+    appLog(
+      `[innertube] ${endpoint} ${outcome} in ${secs(total)}: ${parts.join(" ")}`,
     );
-  }
+  };
 
-  const json = (await res.json()) as YtNode;
-  captureVisitorData(json);
-  return json;
+  try {
+    const auth = await authHeaders(opts.auth, opts.forAccount);
+    enter("fetch");
+    const visitor = loadVisitorData();
+    const visitorHeader: Record<string, string> = visitor
+      ? { "X-Goog-Visitor-Id": visitor }
+      : {};
+    // A fresh init object every call: the HTTP plugin deletes
+    // `connectTimeout` off whatever it is handed before building the
+    // Request, so a hoisted literal would lose the cap after one use.
+    const res = await tauriFetch(url, {
+      method: "POST",
+      headers: { ...BASE_HEADERS, ...visitorHeader, ...auth },
+      body: JSON.stringify({ context: buildContext(), ...body }),
+      ...(opts.connectTimeoutMs === undefined
+        ? {}
+        : { connectTimeout: opts.connectTimeoutMs }),
+    });
+    enter("cookies");
+
+    // Before the error bail: Google rotates cookies on 4xx responses too.
+    await captureSetCookies(res);
+    enter("body");
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new InnerTubeHttpError(endpoint, res.status, text.slice(0, 300));
+    }
+
+    const json = (await res.json()) as YtNode;
+    captureVisitorData(json);
+    reportIfSlow("ok");
+    return json;
+  } catch (e) {
+    reportIfSlow("failed");
+    throw e;
+  }
+}
+
+/**
+ * A non-OK InnerTube response, with the status as a number so a log line
+ * can name it without reading the message. The message is what it always
+ * was: the endpoint, the status and a slice of the body, for the places
+ * that print it (`describeAuthError` trims it to the status).
+ */
+export class InnerTubeHttpError extends Error {
+  constructor(
+    readonly endpoint: string,
+    readonly status: number,
+    body: string,
+  ) {
+    super(`InnerTube ${endpoint} → HTTP ${status}: ${body}`);
+  }
 }
 
 /**

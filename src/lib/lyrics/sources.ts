@@ -1,10 +1,16 @@
+import { useEffect } from "react";
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { fetchLrclibLyrics } from "@/lib/lyrics/lrclib";
 import { fetchMusixmatchLyrics } from "@/lib/lyrics/musixmatch";
 import { fetchGeniusLyrics } from "@/lib/lyrics/genius";
 import { fetchYtMusicLyrics } from "@/lib/lyrics/ytmusic";
 import { rejectSiteChrome } from "@/lib/lyrics/plausibility";
-import { shouldRetryLyricsQuery } from "@/lib/lyrics/errors";
+import {
+  describeLyricsError,
+  LyricsTimeoutError,
+  shouldRetryLyricsQuery,
+} from "@/lib/lyrics/errors";
+import { appLog } from "@/lib/app-log";
 import { cleanTrackTitle, lyricsArtist } from "@/lib/track-meta";
 import type { Lyrics } from "@/lib/lyrics/types";
 import type { QueueTrack } from "@/lib/store/playback";
@@ -49,8 +55,52 @@ function lyricsTimeoutSignal(ms: number): AbortSignal {
     return AbortSignal.timeout(ms);
   }
   const controller = new AbortController();
-  setTimeout(() => controller.abort(new Error("lyrics fetch timed out")), ms);
+  setTimeout(() => controller.abort(new LyricsTimeoutError()), ms);
   return controller.signal;
+}
+
+function lineCount(l: Lyrics): number {
+  return l.kind === "timed"
+    ? l.lines.length
+    : l.text.split("\n").filter((line) => line.trim()).length;
+}
+
+/**
+ * One line per provider attempt, and one when the pick moves.
+ *
+ * Four providers race and the winner is re-derived as the slower ones
+ * land, so a panel can legitimately show one source's words and then
+ * another's a second later. Answering "why did it change" needs both
+ * halves: which provider answered with what, and when the pick moved.
+ * None of this path logged anything before.
+ */
+function logAttempt(
+  source: LyricsSource,
+  run: () => Promise<Lyrics | null>,
+): Promise<Lyrics | null> {
+  const t0 = Date.now();
+  const secs = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
+  return run().then(
+    (lyrics) => {
+      appLog(
+        lyrics
+          ? `[lyrics] ${source} ${lyrics.kind} in ${secs()}: ${lineCount(lyrics)} lines`
+          : `[lyrics] ${source} no match in ${secs()}`,
+      );
+      return lyrics;
+    },
+    (e: unknown) => {
+      // Describing must never replace the rejection it describes.
+      let why = "failed";
+      try {
+        why = describeLyricsError(e);
+      } catch {
+        /* keep the default */
+      }
+      appLog(`[lyrics] ${source} failed in ${secs()}: ${why}`);
+      throw e;
+    },
+  );
 }
 
 /**
@@ -92,6 +142,11 @@ export function useLyricsSources(
   // all, so all three text providers stay disabled, and YTM returns 47
   // line-synced lines for it.
   const verifiable = !!artistName?.trim();
+  // The two enablement conditions, named once: the settled check below
+  // has to know which providers were ever going to be asked, and reading
+  // that off a second copy of the expressions would drift.
+  const askYtMusic = !!track?.videoId && enabled;
+  const askByText = !!track && enabled && verifiable;
 
   // Keyed on the videoId alone. No title, no artist, nothing to normalise.
   const ytmusic = useQuery({
@@ -99,11 +154,13 @@ export function useLyricsSources(
     // v1 entries that hydrate from the persisted cache without running it.
     queryKey: ["lyrics", "ytmusic-v2", track?.videoId],
     queryFn: () =>
-      fetchYtMusicLyrics(
-        track!.videoId,
-        lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
-      ).then(rejectSiteChrome("YouTube Music")),
-    enabled: !!track?.videoId && enabled,
+      logAttempt("ytmusic", () =>
+        fetchYtMusicLyrics(
+          track!.videoId,
+          lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
+        ).then(rejectSiteChrome("YouTube Music")),
+      ),
+    enabled: askYtMusic,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
   });
@@ -136,16 +193,18 @@ export function useLyricsSources(
       track?.duration,
     ],
     queryFn: () =>
-      fetchLrclibLyrics(
-        {
-          title: title!,
-          artist: artistName,
-          album: track?.album,
-          duration: track?.duration,
-        },
-        lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
-      ).then(rejectSiteChrome("LRCLIB")),
-    enabled: !!track && enabled && verifiable,
+      logAttempt("lrclib", () =>
+        fetchLrclibLyrics(
+          {
+            title: title!,
+            artist: artistName,
+            album: track?.album,
+            duration: track?.duration,
+          },
+          lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
+        ).then(rejectSiteChrome("LRCLIB")),
+      ),
+    enabled: askByText,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
   });
@@ -154,15 +213,17 @@ export function useLyricsSources(
     // v4: site-chrome gate; orphan v3 entries that bypass it from the cache.
     queryKey: ["lyrics", "musixmatch-v4", title, artistName, track?.duration],
     queryFn: () =>
-      fetchMusixmatchLyrics(
-        {
-          title: title!,
-          artist: artistName,
-          duration: track?.duration,
-        },
-        lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
-      ).then(rejectSiteChrome("Musixmatch")),
-    enabled: !!track && enabled && verifiable,
+      logAttempt("musixmatch", () =>
+        fetchMusixmatchLyrics(
+          {
+            title: title!,
+            artist: artistName,
+            duration: track?.duration,
+          },
+          lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
+        ).then(rejectSiteChrome("Musixmatch")),
+      ),
+    enabled: askByText,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
   });
@@ -171,14 +232,16 @@ export function useLyricsSources(
     // v4: site-chrome gate; orphan v3 entries that bypass it from the cache.
     queryKey: ["lyrics", "genius-v4", title, artistName],
     queryFn: () =>
-      fetchGeniusLyrics(
-        {
-          title: title!,
-          artist: artistName,
-        },
-        lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
-      ).then(rejectSiteChrome("Genius")),
-    enabled: !!track && enabled && verifiable,
+      logAttempt("genius", () =>
+        fetchGeniusLyrics(
+          {
+            title: title!,
+            artist: artistName,
+          },
+          lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
+        ).then(rejectSiteChrome("Genius")),
+      ),
+    enabled: askByText,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
   });
@@ -207,6 +270,156 @@ export function useLyricsSources(
   }
 
   const isLoading = SOURCE_ORDER.some((s) => queries[s].isLoading);
+  // Every source has answered, one way or the other. Not `!isFetching`: a
+  // query that is disabled, paused offline or still restoring from the
+  // persisted cache is pending with nothing in flight, and counting that as
+  // an answer reports "no source had it" before anyone has spoken.
+  const settled = SOURCE_ORDER.every((s) => {
+    // A provider that was never enabled is not going to answer. Waiting
+    // on one means the "nothing found" line never appears at all, which
+    // is the state a track with no artist string sits in.
+    if (!(s === "ytmusic" ? askYtMusic : askByText)) return true;
+    return queries[s].isSuccess || queries[s].isError;
+  });
 
-  return { queries, best, isLoading };
+  return { queries, best, isLoading, settled };
+}
+
+/**
+ * `shown` is the pick already written for `videoId`: a source and kind, ""
+ * once "nothing found" has been written, and null when this track has had
+ * no line yet. "" and null have to stay distinct or the empty result reads
+ * as already logged and is never written at all.
+ */
+type SelectionLogState = { videoId: string; shown: string | null };
+
+/**
+ * Module scope rather than a ref: `useLyricsSources` has two callers, the
+ * panel and the audio engine, and each hook instance owns its own refs and
+ * effects. Per-instance state wrote the same pick once per caller.
+ */
+let selectionLog: SelectionLogState = { videoId: "", shown: null };
+
+/**
+ * Forget what has been announced. The shell calls this when the queue
+ * empties and the player, and every lyrics view with it, is dropped: the
+ * views cannot see that gap (nothing is mounted to see it), and without
+ * the reset the pick from before it survived and swallowed the line when
+ * the same track was played again from cache. Not from the views' own
+ * unmount: the player bar stays mounted behind the fullscreen player, a
+ * remount in the same commit (StrictMode) is not a gap, and two views
+ * sharing one state must not reset each other. Tests use it too.
+ */
+export function resetLyricsSelectionLog(): void {
+  selectionLog = { videoId: "", shown: null };
+}
+
+/**
+ * What a change of pick should announce, and the state to carry forward.
+ * Pure so the sequencing can be tested without mounting anything, the same
+ * reason `shouldRetryLyricsQuery` lives outside its hook. The wording is
+ * the hook's business; this only decides whether there is anything to say.
+ *
+ * `shown` describes what the panel is rendering, "" for no source at all.
+ * A track change resets even on the silent path: without that, leaving a
+ * track before any provider answered and coming straight back to a cached
+ * hit compared the cached pick against the pick from the previous visit
+ * and dropped it as unchanged.
+ */
+export function nextSelectionLine(
+  prev: SelectionLogState,
+  next: { videoId: string; shown: string; settled: boolean },
+): { state: SelectionLogState; event: "first" | "switch" | "none" | null } {
+  const state =
+    prev.videoId === next.videoId
+      ? prev
+      : { videoId: next.videoId, shown: null };
+  // Silent until there is something to say: a pick, or every provider
+  // that was going to run having answered with nothing.
+  if (!next.shown && !next.settled) return { state, event: null };
+  if (state.shown === next.shown) return { state, event: null };
+  const carried = { videoId: next.videoId, shown: next.shown };
+  if (!next.shown) return { state: carried, event: "none" };
+  return { state: carried, event: state.shown === null ? "first" : "switch" };
+}
+
+/**
+ * One line whenever the words on screen change source.
+ *
+ * Takes what the panel renders, not the race winner. The user can pin a
+ * source in the panel, and a log naming the winner would name a provider
+ * nobody is reading. Four providers race and the pick is re-derived as the
+ * slower ones land, so the panel can legitimately show one source's words
+ * and then another's a second later; that is the half of the story the
+ * per-attempt lines cannot tell.
+ */
+/** What the selected provider's query is doing, as far as the log cares. */
+export type SelectedSourceState = "loading" | "settled" | "skipped" | "failed";
+
+/**
+ * The dedup key for what the panel is rendering, "" for nothing.
+ *
+ * `sourceState` is what keeps a pinned provider that is still loading
+ * apart from one that finished with nothing. Without it "genius none" was
+ * built the moment Genius was selected, which is a truthy key, which
+ * announced a miss before Genius had answered and then called its arrival
+ * a switch. "skipped" is the third case: a pinned provider the track gave
+ * nothing to search by, which is not a miss and not "no source had"
+ * either, since the race may well have a winner the pin is hiding.
+ * "failed" is the fourth: a provider that errored out, a timeout or a
+ * 503, which is not a miss either, and was logged as one.
+ */
+export function selectionKey(
+  source: LyricsSource | null,
+  lyrics: Lyrics | null,
+  sourceState: SelectedSourceState,
+): string {
+  if (!source) return "";
+  if (lyrics) return `${source} ${lyrics.kind}`;
+  if (sourceState === "loading") return "";
+  return `${source} ${sourceState === "settled" ? "none" : sourceState}`;
+}
+
+export function useLyricsSelectionLog(
+  videoId: string | undefined,
+  source: LyricsSource | null,
+  lyrics: Lyrics | null,
+  settled: boolean,
+  sourceState: SelectedSourceState,
+  /** The providers that errored out, joined, "" for none. */
+  failed: string,
+): void {
+  const shown = selectionKey(source, lyrics, sourceState);
+  const hasLyrics = !!lyrics;
+  useEffect(() => {
+    if (!videoId) return;
+    const { state, event } = nextSelectionLine(selectionLog, {
+      videoId,
+      shown,
+      settled,
+    });
+    selectionLog = state;
+    if (!event) return;
+    if (event === "none") {
+      // An empty race in which something errored out is not every source
+      // having looked and found nothing; say so, and which ones failed.
+      appLog(
+        failed
+          ? `[lyrics] no lyrics available for ${videoId} (failed: ${failed})`
+          : `[lyrics] no source had ${videoId}`,
+      );
+    } else if (hasLyrics) {
+      appLog(
+        event === "first"
+          ? `[lyrics] showing ${shown} for ${videoId}`
+          : `[lyrics] switched to ${shown} for ${videoId}`,
+      );
+    } else if (sourceState === "skipped") {
+      appLog(`[lyrics] ${source} was not asked for ${videoId}`);
+    } else if (sourceState === "failed") {
+      appLog(`[lyrics] ${source} failed for ${videoId}`);
+    } else {
+      appLog(`[lyrics] ${source} has nothing for ${videoId}`);
+    }
+  }, [videoId, shown, settled, source, hasLyrics, sourceState, failed]);
 }

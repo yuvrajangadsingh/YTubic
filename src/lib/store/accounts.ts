@@ -5,7 +5,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { resetInnertube } from "@/lib/innertube/client";
 import { fetchChannelList } from "@/lib/innertube/channels";
-import { accountInfoQuery, authLoggedInQuery } from "@/lib/store/auth-queries";
+import {
+  accountInfoQuery,
+  activeAccountIdQuery,
+  authLoggedInQuery,
+  useRereadActiveIdOnMismatch,
+} from "@/lib/store/auth-queries";
 import { clearPrefetchMemo } from "@/lib/stream";
 import { openChannelPicker } from "@/lib/store/channel-picker";
 import { usePlaybackStore } from "@/lib/store/playback";
@@ -100,6 +105,15 @@ export function useLoginSuccessListener(): void {
       // the data first, so the effect only ever sees a fresh pair.
       void qc.resetQueries({ queryKey: ["active-account-id"] });
       void qc.resetQueries({ queryKey: ["account-info"] });
+      // The Premium verdict belongs to the account that was active a
+      // moment ago, and it is now recorded against the active account id.
+      // Left in the cache it would be paired with the new id and stored
+      // as that account's answer, where it would stand for a day.
+      void qc.resetQueries({ queryKey: ["premium-status"] });
+      // The store holds that same verdict, and nothing clears it until
+      // the new id lands. A slow id read left the previous account's
+      // Premium active, with no deadline, for as long as the read took.
+      usePremiumStore.setState({ status: null, standInUntil: null });
       // A Google account can hold several YouTube channels, and the
       // library/likes belong to the channel rather than the account.
       // Right after a fresh sign-in is the moment to offer the choice,
@@ -192,7 +206,7 @@ export function useAccountsChangedListener(): void {
       //    per-track Song↔Video preferences, cached Premium status.
       useSearchHistory.getState().clear();
       useTrackSourceStore.setState({ byVideoId: {} });
-      usePremiumStore.setState({ status: null });
+      usePremiumStore.setState({ status: null, standInUntil: null });
 
       // 4. In-memory caches that wrap network state.
       resetInnertube();
@@ -242,13 +256,15 @@ export function useAccountMetaBackfill(): void {
   const qc = useQueryClient();
 
   const loggedIn = useQuery(authLoggedInQuery);
-  const account = useQuery(accountInfoQuery(loggedIn.data === true));
-
-  const activeId = useQuery({
-    queryKey: ["active-account-id"],
-    queryFn: () => invoke<string | null>("get_active_account_id"),
-    staleTime: 30_000,
-  });
+  const activeId = useQuery(activeAccountIdQuery);
+  // Keyed by the id it is paired with below, so a focus refetch of the
+  // id landing mid-switch cannot pair the new id with the previous
+  // account's meta: the observer moves to the new key, which has no
+  // data until an answer bound to that account lands.
+  const account = useQuery(
+    accountInfoQuery(loggedIn.data === true, activeId.data),
+  );
+  useRereadActiveIdOnMismatch(account.error);
 
   const id = activeId.data ?? null;
   const name = account.data?.name ?? "";

@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { motion } from "motion/react";
@@ -57,6 +64,29 @@ const FULLSCREEN_LYRICS_VIEWPORT_RATIO = 0.22;
  * blink. Failed loads bubble up so the caller can advance its
  * candidate list.
  */
+/**
+ * The stage paints its own text colours instead of inheriting the theme.
+ *
+ * Two reasons. It is always dark, so light mode would otherwise put
+ * near-black text on it. And the theme's secondary grey cannot be read
+ * over art-tinted ground at any scrim that leaves the art visible: over a
+ * white cover under the old 30% scrim it measured 1.23:1, and the title
+ * itself only 2.02:1 (Chaar Diwaari, "Banda Kaam Ka", which is a white
+ * sleeve). #D9D9D9 against the stage the 65% scrim now produces measures
+ * 4.89:1, and 4.31:1 if the noise layer above it is treated as solid
+ * white rather than the +-5/255 dither it is.
+ */
+const STAGE_PALETTE = {
+  "--background": "oklch(0.145 0 0)",
+  "--foreground": "oklch(0.985 0 0)",
+  "--muted-foreground": "oklch(0.882 0 0)",
+  // Light mode's surface is white at 85%: anything on `bg-surface-active`
+  // over the dark stage (the volume control's popovers) would put grey
+  // text on near-white, measured 1.23:1 when the old lyrics nudge pill
+  // sat here. This is the dark theme's value, 8.8:1 for the same text.
+  "--surface-active": "oklch(0 0 0 / 60%)",
+} as CSSProperties;
+
 function AmbientBackdrop({
   url,
   onError,
@@ -384,9 +414,14 @@ export function FullscreenPlayer({ onClose }: { onClose: () => void }) {
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         transition={{ duration: 0.18, ease: "easeOut" }}
-        style={accentStyle}
+        style={{ ...accentStyle, ...STAGE_PALETTE }}
+        // text-foreground is not redundant with the palette: the title,
+        // the transport icons and the chevron inherit the body's colour,
+        // which the theme has already resolved by the time it reaches
+        // them, so the token override alone left them near-black in
+        // light mode (2.84:1 over a white sleeve).
         className={cn(
-          "fixed inset-0 z-50 flex flex-col overflow-hidden bg-background",
+          "fixed inset-0 z-50 flex flex-col overflow-hidden bg-background text-foreground",
           chromeHidden && "cursor-none",
         )}
         role="dialog"
@@ -402,9 +437,15 @@ export function FullscreenPlayer({ onClose }: { onClose: () => void }) {
             setFailedArt((prev) => new Set(prev).add(failed))
           }
         />
-        {/* Light scrim only — Apple Music's fullscreen keeps the blurred
-            art vivid and bright; a heavy black wash buried it. */}
-        <div aria-hidden className="absolute inset-0 bg-black/30" />
+        {/* Apple Music keeps the blurred art vivid, and 30% was picked to
+            match that. It only works on art that is dark to begin with: a
+            white sleeve came through this scrim at luminance 0.45 and
+            every label on the stage disappeared. 65% is what the text
+            above the art needs, and it is a fixed number on purpose. A
+            scrim measured off the artwork would still leave a bright
+            patch under the labels on a half-dark cover, since blur-[80px]
+            does not average a 1400px stage into one colour. */}
+        <div aria-hidden className="absolute inset-0 bg-black/65" />
         {/* On notched MacBooks a native-fullscreen Space reserves a black
             band beside the camera housing that apps cannot paint. Fade
             the backdrop to black toward the top edge so that band blends
@@ -458,6 +499,11 @@ export function FullscreenPlayer({ onClose }: { onClose: () => void }) {
                   size="icon"
                   aria-label="Exit full screen"
                   onClick={onClose}
+                  // Backed, because in video mode the frame sits above both
+                  // scrims and a white frame put the white chevron at
+                  // 1.04:1. 60% black keeps it at 5.5:1 over pure white and
+                  // costs nothing over the artwork stage, which is dark.
+                  className="bg-black/60 hover:bg-black/75 hover:text-foreground"
                 >
                   <ChevronDownIcon />
                 </Button>
@@ -480,17 +526,26 @@ export function FullscreenPlayer({ onClose }: { onClose: () => void }) {
             )}
           >
             {streamKind === "video" ? (
+              // Backed like the chevron: the frame sits above both scrims,
+              // and where the bottom gradient reaches these labels a white
+              // frame left the title at 1.36:1 and the artist line at
+              // 1.22:1. 65% black (the artwork stage's own scrim) puts the
+              // title and the transport icons (foreground, 98.5% white) at
+              // 6.68:1 and the muted artist and time labels at 4.89:1 over
+              // pure white; the gradient beneath only adds to that.
               <div
                 className={cn(
-                  "relative flex w-[min(44rem,84vw)] min-w-0 flex-col gap-0.5 pb-1 text-center transition-opacity duration-500",
+                  "relative flex w-[min(44rem,84vw)] min-w-0 flex-col gap-0.5 rounded-2xl bg-black/65 px-6 pb-3 pt-4 text-center transition-opacity duration-500",
                   chromeHidden && "pointer-events-none opacity-0",
                 )}
               >
-                <VideoQualityBadge className="absolute -top-1 right-0" />
-                <span className="max-w-full truncate text-xl font-semibold">
+                <VideoQualityBadge className="absolute right-2 top-2" />
+                {/* Side padding keeps a long title out from under the
+                    badge, both sides so the centred text stays centred. */}
+                <span className="max-w-full truncate px-12 text-xl font-semibold">
                   {track.title}
                 </span>
-                <span className="max-w-full truncate text-sm text-muted-foreground">
+                <span className="max-w-full truncate px-12 text-sm text-muted-foreground">
                   {artistLine}
                 </span>
                 <div className="mt-3 flex w-full flex-col gap-2">{controls}</div>

@@ -71,9 +71,10 @@ export type PlaybackState = {
    *  to the video source) or the audio-only download. The fullscreen
    *  player uses this to swap the artwork for the live video surface. */
   streamKind: "audio" | "video";
-  /** Native pixel height of the active video surface (companion or
-   *  muxed), for the quality badge. null while no frames are loaded. */
-  streamVideoHeight: number | null;
+  /** Native pixel size of the active video surface (companion or
+   *  muxed), for the quality badge and its menu. null while no frames
+   *  are loaded. */
+  streamVideoSize: { width: number; height: number } | null;
   /** True while the companion video is stalled waiting for data (its
    *  audio master keeps playing). Drives the buffering spinner. */
   videoBuffering: boolean;
@@ -90,6 +91,9 @@ export type PlaybackState = {
   muted: boolean;
   /** Current playhead, seconds. */
   position: number;
+  /** How many times the queue has run out (last track done, repeat off):
+   *  lets the audio engine tell that stop from a pause. */
+  queueEnded: number;
   /** Real duration (from audio element, once loaded). */
   duration: number;
   /** When the user drags the slider, we seek here on release. */
@@ -132,7 +136,7 @@ export type PlaybackState = {
   setStatus: (status: LoadStatus, error?: string) => void;
   setStreamUrl: (url?: string) => void;
   setStreamKind: (kind: "audio" | "video") => void;
-  setStreamVideoHeight: (height: number | null) => void;
+  setStreamVideoSize: (size: { width: number; height: number } | null) => void;
   setVideoBuffering: (v: boolean) => void;
   setVideoStartup: (v: "idle" | "waiting" | "ready" | "fallback") => void;
   /** Fill in a queue track's duration when it arrived without one
@@ -234,7 +238,7 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
   error: undefined,
   streamUrl: undefined,
   streamKind: "audio",
-  streamVideoHeight: null,
+  streamVideoSize: null,
   videoBuffering: false,
   videoStartup: "idle",
 
@@ -243,6 +247,7 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
   muted: false,
   position: 0,
   duration: 0,
+  queueEnded: 0,
   pendingSeek: undefined,
 
   playNow: (track, extras) => {
@@ -455,7 +460,7 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
     let nextIndex = index + 1;
     if (nextIndex >= queue.length) {
       if (repeat !== "all") {
-        set({ playing: false, position: 0 });
+        set({ playing: false, position: 0, queueEnded: get().queueEnded + 1 });
         return;
       }
       // Looping with shuffle on → reshuffle so the next pass isn't identical.
@@ -516,7 +521,7 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
   setStatus: (status, error) => set({ status, error }),
   setStreamUrl: (streamUrl) => set({ streamUrl }),
   setStreamKind: (streamKind) => set({ streamKind }),
-  setStreamVideoHeight: (streamVideoHeight) => set({ streamVideoHeight }),
+  setStreamVideoSize: (streamVideoSize) => set({ streamVideoSize }),
   setVideoBuffering: (videoBuffering) => set({ videoBuffering }),
   setVideoStartup: (videoStartup) => set({ videoStartup }),
   patchTrackDuration: (videoId, seconds) =>
