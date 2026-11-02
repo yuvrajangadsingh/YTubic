@@ -5,15 +5,14 @@
   <p><em>YouTube Music, as an actual Mac app — with the player turned up.</em></p>
 
   <p>
-    <img src="https://img.shields.io/badge/macOS-Apple%20Silicon-2a2933?style=flat-square&labelColor=14131a" alt="macOS, Apple Silicon" />
+    <img src="https://img.shields.io/badge/macOS-Universal-2a2933?style=flat-square&labelColor=14131a" alt="macOS, Intel and Apple Silicon" />
     <img src="https://img.shields.io/badge/license-GPL--3.0-2a2933?style=flat-square&labelColor=14131a" alt="GPL-3.0 license" />
     <img src="https://img.shields.io/badge/unofficial-client-2a2933?style=flat-square&labelColor=14131a" alt="Unofficial client" />
   </p>
 
   <p>
     <a href="#install">Install</a> ·
-    <a href="#what-this-fork-adds">What this fork adds</a> ·
-    <a href="#which-one-should-you-use">Which one should you use?</a> ·
+    <a href="#what-it-does">What it does</a> ·
     <a href="#building-it-yourself">Building it</a>
   </p>
 
@@ -36,21 +35,12 @@ that talks to YouTube's API directly and draws its own interface instead of
 wrapping the website, so pages open instantly and playback starts without the
 spinner.
 
-This is a fork of [YTubic](https://github.com/NUber-dev/YTubic) by
-[@NUber-dev](https://github.com/NUber-dev) — their app, their work. It started as
-the macOS port back when upstream was Windows-only; **upstream now ships official
-macOS builds of its own**, so what's left here is a set of player features that
-haven't landed upstream: a fullscreen player, video playback with a quality
-picker, and a chunk of lyrics work. Same GPL-3.0 license.
+It's Mac-only on purpose, and built around the player: songs already in its
+local cache start with no wait, audio comes at up to 271 kbps Opus (YouTube's
+highest-bitrate stream), and the notch can show what's playing.
 
-## Which one should you use?
-
-**Probably [upstream's](https://github.com/NUber-dev/YTubic/releases/latest).**
-It's the maintained one, its Mac build is Universal so it runs on Intel Macs too,
-it updates itself, and it gets fixes first. It also has Windows and Linux builds.
-
-Use this fork if you specifically want the extras below and don't mind that it
-lags upstream and can't auto-update.
+**You need YouTube Music Premium.** On a free account the app won't play songs;
+it shows a Premium prompt instead of serving ads.
 
 ## Install
 
@@ -71,12 +61,16 @@ xattr -cr /Applications/YTubic.app
 That clears the "downloaded from the internet" flag and nothing else. Open the
 app again and it launches normally, this time and every time after.
 
-**4.** Sign in with your Google account. If that account has YouTube Premium you
-get no ads; without it, you get them.
+**4.** Sign in with the Google account that has YouTube Music Premium.
 
-This build is **Apple Silicon only** (M1 or newer — upstream's is Universal if
-you're on Intel). The first song stalls for a few seconds while the app fetches a
-small streaming helper in the background; everything after that is quick.
+**5.** For full-quality audio, install [Deno](https://deno.com) (`brew install
+deno`). The app finds it on its own; without it most songs play at about
+130 kbps.
+
+One download runs on Intel and Apple Silicon Macs. After this it updates
+itself: a banner in the sidebar offers each new version, one click installs it
+and another restarts into it. The first song stalls for a few seconds while the
+app fetches a small streaming helper in the background.
 
 <details>
 <summary>I'd rather not touch Terminal</summary>
@@ -96,10 +90,10 @@ yt-dlp every few days, and restarting it forces the check.
 
 </details>
 
-## What this fork adds
+## What it does
 
-On top of everything upstream already does:
-
+- **A notch peek**, on Macs with a notch: the new song's title slides out of it
+  on a track change, pause and resume. Off by default, one toggle in Settings
 - **A fullscreen player** — Apple Music style, with an ambient backdrop that
   crossfades between tracks and the notch band blended into the artwork
 - **Video mode** — watch the video version of a track at 1080p, 1440p or 4K,
@@ -110,9 +104,6 @@ On top of everything upstream already does:
 - **Accent colour from the cover** — the seek bar, play button and active toggles
   take their colour from the album art instead of staying brand red
 - **Search history** — recent queries saved and offered on the empty search page
-
-## What you get from upstream
-
 - **Instant navigation** — pages prefetched and cached, no reloads, no spinners
 - **A player that moves** — dock it along the bottom or as a right-hand panel, or
   pop it out into a small always-on-top window
@@ -187,7 +178,7 @@ src-tauri/               # Rust backend (axum stream proxy, cookies, media sessi
 
 **[YTubic](https://github.com/NUber-dev/YTubic) by
 [@NUber-dev](https://github.com/NUber-dev)** — the app this is built on.
-Everything except the fork extras listed above is theirs.
+This started as a fork of it in July 2026 and has been its own line since August.
 
 [yt-dlp](https://github.com/yt-dlp/yt-dlp) for audio streaming,
 [LRCLIB](https://lrclib.net) and Musixmatch for synced lyrics, and
@@ -197,5 +188,4 @@ Everything except the fork extras listed above is theirs.
 ## License
 
 [GPL-3.0](LICENSE) — free to use, modify and redistribute; derivative works stay
-open source under the same license. This fork keeps the original copyright and
-license intact.
+open source under the same license. The original copyright and license stay intact.
