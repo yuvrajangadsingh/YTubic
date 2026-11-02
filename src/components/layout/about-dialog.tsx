@@ -15,10 +15,9 @@ import { Button } from "@/components/ui/button";
 import { checkForUpdates } from "@/lib/updater";
 import { IS_BETA_PLATFORM, IS_MAC } from "@/lib/platform";
 import { openWhatsNew } from "@/lib/store/whats-new";
-import { DiscordIcon, GithubIcon } from "@/components/shared/brand-icons";
+import { GithubIcon } from "@/components/shared/brand-icons";
 
-const REPO_URL = "https://github.com/NUber-dev/YTubic";
-const DISCORD_URL = "https://discord.gg/v7JGAWWWj";
+const REPO_URL = "https://github.com/yuvrajangadsingh/YTubic";
 
 const CREDITS: { name: string; role: string; url: string }[] = [
   {
@@ -141,10 +140,6 @@ export function AboutDialog({
         </p>
 
         <div className="flex gap-2">
-          <Button variant="outline" onClick={link(DISCORD_URL)}>
-            <DiscordIcon />
-            Discord
-          </Button>
           <Button variant="outline" onClick={link(REPO_URL)}>
             <GithubIcon />
             GitHub
