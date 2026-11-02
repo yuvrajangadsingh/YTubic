@@ -61,7 +61,7 @@ export function AboutDialog({
       >
         <DialogHeader>
           <div className="flex items-center gap-3">
-            <img src="/ytubic-icon.svg" alt="" className="size-12" />
+            <img src="/radif-icon.svg" alt="" className="size-12" />
             <div className="flex flex-col items-start">
               <DialogTitle className="text-lg">Radif</DialogTitle>
               {/* Version and the What's New link share one row so the

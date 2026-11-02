@@ -1,6 +1,7 @@
 <div align="center">
-  <img src="assets/branding/ytubic-logo-full.svg" width="260"
-       alt="Radif" />
+  <img src="assets/branding/radif-icon.svg" width="128" alt="" />
+
+  <h1>Radif</h1>
 
   <p><em>YouTube Music, as an actual Mac app — with the player turned up.</em></p>
 
@@ -17,7 +18,7 @@
   </p>
 
   <a href="../../releases/latest">
-    <img src="https://img.shields.io/badge/%E2%AC%87%20Download%20for%20macOS-FF0000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" height="52" />
+    <img src="https://img.shields.io/badge/%E2%AC%87%20Download%20for%20macOS-3A2D7A?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" height="52" />
   </a>
 
   <br /><br />

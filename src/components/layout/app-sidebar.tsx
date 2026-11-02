@@ -135,7 +135,7 @@ export function AppSidebar() {
          *  16px). In collapsed mode the row centers it like the
          *  centered menu icons below. */}
         <img
-          src="/ytubic-icon.svg"
+          src="/radif-icon.svg"
           alt="Radif"
           className="size-7 shrink-0"
         />
