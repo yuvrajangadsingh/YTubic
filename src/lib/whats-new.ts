@@ -55,6 +55,48 @@ export type WhatsNewEntry = {
  */
 export const WHATS_NEW: WhatsNewEntry[] = [
   {
+    version: "0.5.0",
+    date: "November 2, 2026",
+    summary: "YTubic is now Radif, with a new icon and a song peek at the notch",
+    changes: [
+      {
+        type: "new",
+        title: "A new name and icon",
+        text: "YTubic was the original project's name and the red play icon looked like YouTube Music's own. This app is Radif now. Your library, sign-in and settings carry over untouched.",
+      },
+      {
+        type: "new",
+        title: "A peek at the notch",
+        text: "On Macs with a notch, the song's title slides out of it when a track starts, pauses or resumes. Long titles scroll across before it closes. Off by default; turn it on in Settings.",
+      },
+      {
+        type: "fixed",
+        title: "Media keys after a long pause",
+        text: "A paused app hidden behind other windows could stop answering the media keys. It now stays awake enough to hear them.",
+      },
+      {
+        type: "fixed",
+        title: "Video mode holds on",
+        text: "Video mode no longer drops back to artwork on every track change, recovers after a stream break, and loads the next track's video before you reach it. The fullscreen controls stay readable over light artwork.",
+      },
+      {
+        type: "fixed",
+        title: "Premium checks after switching accounts",
+        text: "The Premium check is tied to the account it was made for, so switching accounts or signing in again no longer leaves a stale answer blocking playback.",
+      },
+      {
+        type: "improved",
+        title: "Clearer failures",
+        text: "Adding a song that is already in a playlist says so instead of \"Add failed\", and the sidebar offers a Retry row when your playlists fail to load.",
+      },
+      {
+        type: "improved",
+        title: "Lyrics timing is automatic",
+        text: "The manual sync nudge is gone. Padded intros are still aligned automatically.",
+      },
+    ],
+  },
+  {
     version: "0.4.9",
     date: "September 4, 2026",
     summary:
