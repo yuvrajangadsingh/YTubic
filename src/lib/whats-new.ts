@@ -55,6 +55,18 @@ export type WhatsNewEntry = {
  */
 export const WHATS_NEW: WhatsNewEntry[] = [
   {
+    version: "0.5.3",
+    date: "November 4, 2026",
+    summary: "Urdu and other RTL lyrics now right-align",
+    changes: [
+      {
+        type: "fixed",
+        title: "Right-to-left lyrics",
+        text: "Synced lyrics in Urdu, Arabic, Hebrew and other right-to-left scripts now right-align and read right to left, in the fullscreen player and the lyrics panel.",
+      },
+    ],
+  },
+  {
     version: "0.5.2",
     date: "November 3, 2026",
     summary: "Episode cards on Home play again",

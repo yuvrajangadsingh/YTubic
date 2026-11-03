@@ -25,6 +25,7 @@ import {
 } from "@/lib/lyrics/sources";
 import { usePlaybackStore } from "@/lib/store/playback";
 import { estimateLeadInOffset } from "@/lib/lyrics/auto-align";
+import { textDir } from "@/lib/lyrics/text-dir";
 import type { QueueTrack } from "@/lib/store/playback";
 import { cn } from "@/lib/utils";
 
@@ -499,6 +500,7 @@ function TimedLyrics({
               key={i}
               type="button"
               data-line-idx={i}
+              dir={textDir(line.text)}
               onClick={() => seek(line.start + offset)}
               style={{ "--line-o": String(fall) } as React.CSSProperties}
               className={cn(
@@ -533,7 +535,7 @@ function TimedLyrics({
                 // rAF scroll (the column visibly stutter-jumped on
                 // every line change). Snapped blur under motion is
                 // imperceptible; scroll stays pure compositing.
-                "lyrics-line origin-left cursor-pointer rounded-md px-2 py-1 text-left text-lg font-[650] leading-snug opacity-(--line-o) transition-[scale,color,opacity] duration-[1260ms] ease-in-out hover:bg-black/30 hover:blur-none group-hover:duration-200",
+                "lyrics-line origin-left rtl:origin-right cursor-pointer rounded-md px-2 py-1 text-start text-lg font-[650] leading-snug opacity-(--line-o) transition-[scale,color,opacity] duration-[1260ms] ease-in-out hover:bg-black/30 hover:blur-none group-hover:duration-200",
                 isActive
                   ? "scale-[1.04] text-foreground blur-none"
                   : melt === "full"
@@ -579,7 +581,9 @@ function TimedLyrics({
 
 function PlainLyrics({ text }: { text: string }) {
   return (
-    <div className="lyrics-plain lyrics-mask app-scroll h-full overflow-y-auto whitespace-pre-wrap px-2 pt-0 pb-12 text-lg font-medium leading-relaxed text-foreground/90">
+    <div
+      dir="auto"
+      className="lyrics-plain lyrics-mask app-scroll h-full overflow-y-auto whitespace-pre-wrap px-2 pt-0 pb-12 text-lg font-medium leading-relaxed text-foreground/90">
       {text}
     </div>
   );
