@@ -113,6 +113,10 @@ yt-dlp every few days, and restarting it forces the check.
   crossfades between tracks and the notch band blended into the artwork
 - **Video mode** — watch the video version of a track at 1080p, 1440p or 4K,
   through a quality picker that only offers the tiers a given video actually has
+
+  <img src="assets/screenshots/video-quality.jpg" width="360"
+       alt="Video mode in the side player: a music video playing with a 1080p badge, and the quality menu open listing 4K down to 360p" />
+
 - **Lyrics that pick the right record** — matched on identity rather than the
   closest guess, with padded intros auto-aligned
 - **Accent colour from the cover** — the seek bar, play button and active toggles
