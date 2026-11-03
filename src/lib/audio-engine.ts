@@ -302,6 +302,9 @@ export function useAudioEngine() {
   // download takes. Generation-keyed by the resolve token so duplicate
   // ids, retries, and stale listeners can't release someone else's
   // hold. Every route to el.play() must respect it.
+  // Set by the companion effect: brings an already-loaded companion
+  // back on screen at the master's clock after a hold timed out.
+  const joinLateRef = useRef<(() => void) | null>(null);
   const videoHoldRef = useRef<{
     token: number;
     audioReady: boolean;
@@ -333,9 +336,14 @@ export function useAudioEngine() {
     }
   };
   /** Abandon the hold and continue audio-only (timeout / error / mode
-   *  off). Detaches the companion so a late loadeddata can't resurrect
-   *  the video mid-song at the wrong time. */
-  const fallbackHeld = (startup: "fallback" | "idle") => {
+   *  off). On error or mode off the companion is detached. On a timeout
+   *  it keeps loading and joins late: its `loadeddata` then takes the
+   *  no-hold path, which seeks it to the master's clock. A cold 1080p
+   *  fMP4 can need the whole file before WebKit reports metadata (one
+   *  upstream round trip per fragment header); measured 2026-11-03 it
+   *  was ready 3s after the 12s budget ran out, and detaching it then
+   *  cost the video for the whole song. */
+  const fallbackHeld = (startup: "fallback" | "idle", keepVideo = false) => {
     const el = audioRef.current;
     const h = videoHoldRef.current;
     if (!h) return;
@@ -346,9 +354,13 @@ export function useAudioEngine() {
     st.setVideoStartup(startup);
     st.setStreamKind("audio");
     const comp = companionVideoSingleton;
-    if (comp) {
+    if (comp && !keepVideo) {
       comp.removeAttribute("src");
       comp.load();
+    } else if (comp && comp.readyState >= 2) {
+      // Loaded already, the hold was waiting on the audio or a seek:
+      // loadeddata won't fire again, so join now at the master's clock.
+      joinLateRef.current?.();
     }
     if (el && st.playing) void playLocal(el).catch(() => {});
   };
@@ -907,7 +919,7 @@ export function useAudioEngine() {
         () => {
           const h = videoHoldRef.current;
           if (!h || h.token !== token) return;
-          fallbackHeld("fallback");
+          fallbackHeld("fallback", true);
         },
         cap > 1080 ? 20_000 : 12_000,
       );
@@ -1113,6 +1125,15 @@ export function useAudioEngine() {
         void playLocal(video).catch(() => {});
       }
     };
+    const joinLate = () => {
+      if (cancelled) return;
+      const st = usePlaybackStore.getState();
+      st.setStreamKind("video");
+      if (st.videoStartup === "fallback") st.setVideoStartup("ready");
+      syncNow();
+      follow();
+    };
+    joinLateRef.current = joinLate;
     const onLoaded = () => {
       if (cancelled) return;
       const { videoWidth: vw, videoHeight: vh } = video;
@@ -1133,7 +1154,15 @@ export function useAudioEngine() {
         // so a stale canplay can't release a later generation's hold.
         if (h.targetSeconds !== undefined) {
           const onReadyAtTarget = () => {
-            if (cancelled || videoHoldRef.current !== h) return;
+            if (cancelled) return;
+            if (videoHoldRef.current !== h) {
+              // The hold timed out mid seek and kept the companion.
+              const st = usePlaybackStore.getState();
+              if (st.videoStartup === "fallback" && st.streamKind !== "video") {
+                joinLate();
+              }
+              return;
+            }
             h.videoReady = true;
             maybeStartHeld();
           };
@@ -1151,8 +1180,7 @@ export function useAudioEngine() {
         maybeStartHeld();
         return;
       }
-      syncNow();
-      follow();
+      joinLate();
     };
     const onError = () => {
       if (cancelled) return;
@@ -1203,7 +1231,13 @@ export function useAudioEngine() {
       if (videoHoldRef.current) {
         fallbackHeld("fallback");
       } else {
-        usePlaybackStore.getState().setStreamKind("audio");
+        // Also a companion kept past a hold timeout: detach it so a dead
+        // source stops following the master.
+        video.removeAttribute("src");
+        video.load();
+        const st = usePlaybackStore.getState();
+        st.setVideoBuffering(false);
+        st.setStreamKind("audio");
       }
     };
     const onWaiting = () => {
@@ -1350,6 +1384,7 @@ export function useAudioEngine() {
       }
       window.clearInterval(drift);
       video.removeEventListener("loadeddata", onLoaded);
+      if (joinLateRef.current === joinLate) joinLateRef.current = null;
       video.removeEventListener("error", onError);
       video.removeEventListener("waiting", onWaiting);
       video.removeEventListener("playing", onFlowing);
