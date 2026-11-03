@@ -23,8 +23,8 @@
 
   <br /><br />
 
-  <img src="assets/screenshots/artist-page.jpg" width="820"
-       alt="An artist page in Radif, with the player docked at the bottom and synced lyrics open on the right" />
+  <img src="assets/screenshots/fullscreen.jpg" width="820"
+       alt="Radif's fullscreen player: album art and controls on the left, synced lyrics on the right, over a backdrop blurred from the cover" />
 </div>
 
 <br />
@@ -105,6 +105,10 @@ yt-dlp every few days, and restarting it forces the check.
 
 - **A notch peek**, on Macs with a notch: the new song's title slides out of it
   on a track change, pause and resume. Off by default, one toggle in Settings
+
+  <img src="assets/screenshots/notch-peek.jpg" width="560"
+       alt="The notch grown into a small pill showing a pause icon and the song title and artist" />
+
 - **A fullscreen player** — Apple Music style, with an ambient backdrop that
   crossfades between tracks and the notch band blended into the artwork
 - **Video mode** — watch the video version of a track at 1080p, 1440p or 4K,
