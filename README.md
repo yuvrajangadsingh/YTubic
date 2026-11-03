@@ -23,8 +23,8 @@
 
   <br /><br />
 
-  <img src="assets/screenshots/artist-page.jpg" width="820"
-       alt="An artist page in Radif, with the player docked at the bottom and synced lyrics open on the right" />
+  <img src="assets/screenshots/fullscreen.jpg" width="820"
+       alt="Radif's fullscreen player: album art and controls on the left, synced lyrics on the right, over a backdrop blurred from the cover" />
 </div>
 
 <br />
@@ -45,7 +45,17 @@ it shows a Premium prompt instead of serving ads.
 
 ## Install
 
-About two minutes, and most of that is macOS being suspicious of you.
+With [Homebrew](https://brew.sh), one line. It also installs Deno and skips
+the Terminal step below:
+
+```bash
+brew install --cask yuvrajangadsingh/tap/radif
+```
+
+Then sign in with the Google account that has YouTube Music Premium.
+
+Without Homebrew it takes about two minutes, and most of that is macOS being
+suspicious of you.
 
 **1.** [Download the `.dmg`](../../releases/latest) and open it.
 
@@ -59,8 +69,8 @@ certificate, which this one isn't. Open **Terminal** and paste:
 xattr -cr /Applications/Radif.app
 ```
 
-That clears the "downloaded from the internet" flag and nothing else. Open the
-app again and it launches normally, this time and every time after.
+That clears the app's extended attributes, among them the "downloaded from
+the internet" flag that triggers the block. Open the app again and it launches normally, this time and every time after.
 
 **4.** Sign in with the Google account that has YouTube Music Premium.
 
@@ -95,10 +105,18 @@ yt-dlp every few days, and restarting it forces the check.
 
 - **A notch peek**, on Macs with a notch: the new song's title slides out of it
   on a track change, pause and resume. Off by default, one toggle in Settings
+
+  <img src="assets/screenshots/notch-peek.jpg" width="560"
+       alt="The notch grown into a small pill showing a pause icon and the song title and artist" />
+
 - **A fullscreen player** — Apple Music style, with an ambient backdrop that
   crossfades between tracks and the notch band blended into the artwork
 - **Video mode** — watch the video version of a track at 1080p, 1440p or 4K,
   through a quality picker that only offers the tiers a given video actually has
+
+  <img src="assets/screenshots/video-quality.jpg" width="360"
+       alt="Video mode in the side player: a music video playing with a 1080p badge, and the quality menu open listing 4K down to 360p" />
+
 - **Lyrics that pick the right record** — matched on identity rather than the
   closest guess, with padded intros auto-aligned
 - **Accent colour from the cover** — the seek bar, play button and active toggles

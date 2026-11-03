@@ -1,13 +1,13 @@
 // Discord Rich Presence: shows the current track on the user's Discord
-// profile as "Listening to YTubic" with the cover art and a live progress
-// bar. Opt-in (Settings → General); off by default for privacy.
+// profile as "Listening to Radif" with the cover art and a live progress
+// bar. Opt-in (Settings → Integrations); off by default for privacy.
 //
 // Unlike the SMTC controls in `media.rs`, the Discord IPC client is a plain
 // socket/named-pipe with no COM/main-thread constraint, so we don't marshal
 // onto the UI thread. Instead everything runs on a dedicated worker thread
 // that owns the client and handles the messy parts Discord forces on us:
 //   * Discord may be closed, launched later, or quit mid-session — the worker
-//     lazily (re)connects and retries on a 15s tick, never blocking the app.
+//     lazily (re)connects and retries on a 2s tick, never blocking the app.
 //   * Discord rate-limits activity updates, so the frontend only pushes on
 //     track / play-state change (not the 2s SMTC position refresh), and the
 //     worker additionally dedupes identical presences.
@@ -21,17 +21,13 @@ use discord_rich_presence::activity::{Activity, ActivityType, Assets, Timestamps
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use tauri::State;
 
-// Discord Application ID. Create an application named "YTubic" at
-// https://discord.com/developers/applications — the name is exactly what
-// Discord renders after "Listening to". Then either set the env var at build
-// time (`YTUBIC_DISCORD_APP_ID=...`) or replace the "" default below with the
-// Application ID string. While this is empty the worker simply never connects,
-// so the feature is a no-op until a real ID is provided.
+// Discord Application ID of the "Radif" app in the Discord developer portal.
+// Its name is exactly what Discord renders after "Listening to". Client IDs
+// are not secret, they ship in every client that renders the presence. A
+// build can point at another app with `YTUBIC_DISCORD_APP_ID=...`.
 const APP_ID: &str = match option_env!("YTUBIC_DISCORD_APP_ID") {
     Some(id) => id,
-    // Public "YTubic" application ID (client IDs are not secret — they ship in
-    // every client that renders the presence). Overridable via the env var.
-    None => "1525085261418074152",
+    None => "1567077704359088279",
 };
 
 // Small logo badge shown in the corner of the cover art. Discord can't read a
