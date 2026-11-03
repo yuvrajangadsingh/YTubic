@@ -69,8 +69,8 @@ certificate, which this one isn't. Open **Terminal** and paste:
 xattr -cr /Applications/Radif.app
 ```
 
-That clears the "downloaded from the internet" flag and nothing else. Open the
-app again and it launches normally, this time and every time after.
+That clears the app's extended attributes, among them the "downloaded from
+the internet" flag that triggers the block. Open the app again and it launches normally, this time and every time after.
 
 **4.** Sign in with the Google account that has YouTube Music Premium.
 
