@@ -55,6 +55,18 @@ export type WhatsNewEntry = {
  */
 export const WHATS_NEW: WhatsNewEntry[] = [
   {
+    version: "0.5.2",
+    date: "November 3, 2026",
+    summary: "Episode cards on Home play again",
+    changes: [
+      {
+        type: "fixed",
+        title: "Episode cards on Home",
+        text: "Some cards on Home, like episodes in Forgotten favorites, failed with \"The operation is not supported.\" They now play, and cards with nothing playable are left out.",
+      },
+    ],
+  },
+  {
     version: "0.5.1",
     date: "November 3, 2026",
     summary: "Videos that take a while to load still show up",

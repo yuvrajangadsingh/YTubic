@@ -981,14 +981,25 @@ export function mapTwoRowItem(raw: YtNode): ShelfItem | null {
         : 1;
     kind = ratio > 1.4 ? "video" : "song";
   } else if (browseEndpoint?.browseId) {
-    id = browseEndpoint.browseId;
+    const browseId: string = browseEndpoint.browseId;
     const pageType =
       browseEndpoint.browseEndpointContextSupportedConfigs
         ?.browseEndpointContextMusicConfig?.pageType ?? "";
     const mapped = pageTypeToKind(pageType);
     if (mapped) {
+      id = browseId;
       kind = mapped;
       if (mapped === "artist") round = true;
+    } else {
+      // A page the app has no screen for, like an episode's "MPED" +
+      // videoId page. The browseId is not a video id (playing it fails
+      // with "operation is not supported"), so play the card's own
+      // button target, or the id inside MPED, or drop the card.
+      id =
+        (raw.thumbnailOverlay ?? raw.overlay)?.musicItemThumbnailOverlayRenderer
+          ?.content?.musicPlayButtonRenderer?.playNavigationEndpoint
+          ?.watchEndpoint?.videoId ??
+        (browseId.startsWith("MPED") ? browseId.slice(4) : "");
     }
   }
 

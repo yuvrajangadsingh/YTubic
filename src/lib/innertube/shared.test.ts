@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   mapShelfWrapper,
+  mapTwoRowItem,
   readMenuNavigation,
   splitSetCookieHeader,
   type YtNode,
@@ -205,5 +206,49 @@ describe("readMenuNavigation", () => {
       },
     };
     expect(readMenuNavigation(raw).albumId).toBe("MPREb_first");
+  });
+});
+
+describe("mapTwoRowItem on a page the app has no screen for", () => {
+  const episodeCard = (overlayVideoId?: string): YtNode => ({
+    title: { runs: [{ text: "Pehle Bhi Main" }] },
+    subtitle: { runs: [{ text: "4 min 30 sec" }] },
+    navigationEndpoint: {
+      browseEndpoint: {
+        browseId: "MPEDlwv_0SEJ4NQ",
+        browseEndpointContextSupportedConfigs: {
+          browseEndpointContextMusicConfig: {
+            pageType: "MUSIC_PAGE_TYPE_NON_MUSIC_AUDIO_TRACK_PAGE",
+          },
+        },
+      },
+    },
+    ...(overlayVideoId && {
+      thumbnailOverlay: {
+        musicItemThumbnailOverlayRenderer: {
+          content: {
+            musicPlayButtonRenderer: {
+              playNavigationEndpoint: { watchEndpoint: { videoId: overlayVideoId } },
+            },
+          },
+        },
+      },
+    }),
+  });
+
+  it("plays the card's own button target, never the browseId", () => {
+    const item = mapTwoRowItem(episodeCard("btnVideo123"));
+    expect(item?.kind).toBe("song");
+    expect(item?.id).toBe("btnVideo123");
+  });
+
+  it("falls back to the video id inside an MPED browseId", () => {
+    expect(mapTwoRowItem(episodeCard())?.id).toBe("lwv_0SEJ4NQ");
+  });
+
+  it("drops a card with no playable id at all", () => {
+    const card = episodeCard();
+    card.navigationEndpoint.browseEndpoint.browseId = "FEmusic_unknown";
+    expect(mapTwoRowItem(card)).toBeNull();
   });
 });
