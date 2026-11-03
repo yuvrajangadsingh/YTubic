@@ -55,6 +55,23 @@ export type WhatsNewEntry = {
  */
 export const WHATS_NEW: WhatsNewEntry[] = [
   {
+    version: "0.5.1",
+    date: "November 3, 2026",
+    summary: "Videos that take a while to load still show up",
+    changes: [
+      {
+        type: "fixed",
+        title: "Slow videos no longer fall back to audio for the whole song",
+        text: "If a video took longer than about 12 seconds to start, the song played on with just the artwork. Now the music starts on time and the video joins in as soon as it is ready.",
+      },
+      {
+        type: "fixed",
+        title: "Discord shows Radif",
+        text: "Rich Presence on Discord now says \"Listening to Radif\" instead of the old name.",
+      },
+    ],
+  },
+  {
     version: "0.5.0",
     date: "November 2, 2026",
     summary: "YTubic is now Radif, with a new icon and a song peek at the notch",
