@@ -71,7 +71,7 @@ souvlaki = "0.7"
 # Discord Rich Presence: talks to the local Discord client over its IPC
 # socket / named pipe (no native deps beyond that). Off by default; opt-in
 # from Settings. See src/discord.rs. Set YTUBIC_DISCORD_APP_ID at build time
-# (or edit APP_ID) to the Application ID of a Discord app named "YTubic".
+# (or edit APP_ID) to the Application ID of another Discord app.
 discord-rich-presence = "0.2"
 # MD5 for Last.fm request signing (api_sig = md5 of sorted params + secret).
 # Tiny, single-purpose crate. See src/lastfm.rs.

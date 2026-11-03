@@ -30,7 +30,7 @@ type State = {
    *  lives in `src-tauri/src/notch.rs`, fed by the media bridge. */
   notchSongPeek: boolean;
   /** Broadcast the current track to Discord as a Rich Presence status
-   *  ("Listening to YTubic"). Off by default — opt-in for privacy.
+   *  ("Listening to Radif"). Off by default — opt-in for privacy.
    *  The IPC worker lives in `src-tauri/src/discord.rs`. */
   discordRichPresence: boolean;
   /** Scrobble every played track to the connected Last.fm account. Only
