@@ -3,7 +3,7 @@
 
   <h1>Radif</h1>
 
-  <p><em>YouTube Music, as an actual Mac app — with the player turned up.</em></p>
+  <p><em>A YouTube Music app for the Mac.</em></p>
 
   <p>
     <img src="https://img.shields.io/badge/macOS-Universal-2a2933?style=flat-square&labelColor=14131a" alt="macOS, Intel and Apple Silicon" />
@@ -29,23 +29,20 @@
 
 <br />
 
-YouTube Music in a browser tab is fine right up until you want it to behave like
-an app — media keys that actually work, a Now Playing card in Control Center, a
-window that doesn't vanish into thirty other tabs. Radif is a desktop client
-that talks to YouTube's API directly and draws its own interface instead of
-wrapping the website, so pages open instantly and playback starts without the
-spinner.
+Radif plays YouTube Music in its own Mac window instead of a browser tab. It
+talks to YouTube Music's API and draws its own interface rather than wrapping
+the website, so media keys work and Now Playing shows up in Control Center.
 
-It's Mac-only on purpose, and built around the player: songs already in its
-local cache start with no wait, audio comes at up to 271 kbps Opus (YouTube's
-highest-bitrate stream), and the notch can show what's playing.
+It is Mac only. Songs still in its local cache play without downloading
+again, audio comes at up to 271 kbps Opus, and the notch can show what's
+playing.
 
-**You need YouTube Music Premium.** On a free account the app won't play songs;
-it shows a Premium prompt instead of serving ads.
+**You need YouTube Music Premium.** On a free account it won't play songs. It
+shows a Premium prompt instead of serving ads.
 
 ## Install
 
-With [Homebrew](https://brew.sh), one line. It also installs Deno and skips
+With [Homebrew](https://brew.sh) it's one line, and it installs Deno and skips
 the Terminal step below:
 
 ```bash
@@ -54,92 +51,87 @@ brew install --cask yuvrajangadsingh/tap/radif
 
 Then sign in with the Google account that has YouTube Music Premium.
 
-Without Homebrew it takes about two minutes, and most of that is macOS being
-suspicious of you.
+Without Homebrew:
 
 **1.** [Download the `.dmg`](../../releases/latest) and open it.
 
 **2.** Drag **Radif** onto the Applications folder.
 
-**3.** Open it. macOS will refuse, saying *"Apple could not verify Radif is free
-of malware"* — that happens to every app not signed with Apple's $99-a-year
-certificate, which this one isn't. Open **Terminal** and paste:
+**3.** Open it. macOS refuses with *"Apple could not verify Radif is free of
+malware"*, because the app isn't signed with Apple's $99-a-year certificate.
+Open **Terminal** and paste:
 
 ```bash
 xattr -cr /Applications/Radif.app
 ```
 
-That clears the app's extended attributes, among them the "downloaded from
-the internet" flag that triggers the block. Open the app again and it launches normally, this time and every time after.
+That clears the app's extended attributes, including the "downloaded from the
+internet" flag that causes the block. After that it opens normally.
 
 **4.** Sign in with the Google account that has YouTube Music Premium.
 
 **5.** For full-quality audio, install [Deno](https://deno.com) (`brew install
-deno`). The app finds it on its own; without it most songs play at about
+deno`). The app finds it on its own. Without it most songs play at about
 130 kbps.
 
-One download runs on Intel and Apple Silicon Macs. After this it updates
-itself: a banner in the sidebar offers each new version, one click installs it
-and another restarts into it. The first song stalls for a few seconds while the
-app fetches a small streaming helper in the background.
+The same download runs on Intel and Apple Silicon. It updates itself: a banner
+in the sidebar offers each new version, one click installs it and another
+restarts into it. On first launch the app downloads yt-dlp (about 50 MB), so
+the first song waits for that.
 
 <details>
 <summary>I'd rather not touch Terminal</summary>
 
-Try to open Radif, let macOS block it, then go to **System Settings → Privacy &
-Security** and scroll to the bottom. There'll be a line about Radif being
-blocked with an **Open Anyway** button next to it. Same result, more clicking.
+Try to open Radif and let macOS block it. Then go to **System Settings →
+Privacy & Security** and scroll down. There's a line about Radif being blocked,
+with an **Open Anyway** button.
 
 </details>
 
 <details>
 <summary>Playback suddenly stopped working</summary>
 
-YouTube changes its streaming internals every so often and everything breaks
-until yt-dlp ships a fix, usually within days. The app updates its own copy of
-yt-dlp every few days, and restarting it forces the check.
+YouTube changes its streaming internals now and then, and playback breaks
+until yt-dlp ships a fix, usually within days. The app checks for a new yt-dlp
+when it launches, at most once every three days.
 
 </details>
 
 ## What it does
 
-- **A notch peek**, on Macs with a notch: the new song's title slides out of it
-  on a track change, pause and resume. Off by default, one toggle in Settings
+The fullscreen player shows the cover and synced lyrics over a backdrop taken
+from the artwork, and it crossfades when the track changes. Lyrics come from
+YouTube Music, LRCLIB, Musixmatch and Genius. The app checks that a result is
+for the song that's playing, prefers timed lyrics, and tries to shift the
+timing when an upload has a padded intro.
 
-  <img src="assets/screenshots/notch-peek.jpg" width="560"
-       alt="The notch grown into a small pill showing a pause icon and the song title and artist" />
+Video mode plays the music video for a track, with a quality picker from 360p
+up to 4K.
 
-- **A fullscreen player** — Apple Music style, with an ambient backdrop that
-  crossfades between tracks and the notch band blended into the artwork
-- **Video mode** — watch the video version of a track at 1080p, 1440p or 4K,
-  through a quality picker that only offers the tiers a given video actually has
+<img src="assets/screenshots/video-quality.jpg" width="360"
+     alt="Video mode in the side player: a music video playing with a 1080p badge, and the quality menu open listing 4K down to 360p" />
 
-  <img src="assets/screenshots/video-quality.jpg" width="360"
-       alt="Video mode in the side player: a music video playing with a 1080p badge, and the quality menu open listing 4K down to 360p" />
+On a Mac with a notch, the song title can slide out of it when a track starts,
+pauses or resumes. It's off by default; turn it on in Settings.
 
-- **Lyrics that pick the right record** — matched on identity rather than the
-  closest guess, with padded intros auto-aligned
-- **Accent colour from the cover** — the seek bar, play button and active toggles
-  take their colour from the album art instead of staying brand red
-- **Search history** — recent queries saved and offered on the empty search page
-- **Instant navigation** — pages prefetched and cached, no reloads, no spinners
-- **A player that moves** — dock it along the bottom or as a right-hand panel, or
-  pop it out into a small always-on-top window
-- **Synced lyrics** — line by line, from LRCLIB and Musixmatch
-- **Cover art at full size** — upgraded to the high-resolution studio version
-- **Your whole library** — playlists, likes, albums, artists, search with
-  filters, radio queues, and playlist suggestions
-- **Mac media controls** — media keys, Now Playing in Control Center and on the
-  lock screen, playback state kept in sync both ways
+<img src="assets/screenshots/notch-peek.jpg" width="560"
+     alt="The notch grown into a small pill showing a pause icon and the song title and artist" />
 
-> **This is an unofficial client.** It isn't affiliated with, endorsed by, or
-> sponsored by Google or YouTube; "YouTube" and "YouTube Music" are trademarks of
-> Google LLC. Audio streams through [yt-dlp](https://github.com/yt-dlp/yt-dlp)
-> and can break whenever YouTube changes its internals. Use at your own risk.
+Also: in the side and fullscreen players the seek bar and buttons take their
+colour from the cover, cover art is upgraded to a high-resolution version when
+one exists, and recent searches are kept. The player can sit along the bottom,
+on the right, or in a small window you can pin on top. Playlists, likes,
+albums, artists, search with filters and radio are all there, and media keys
+and Now Playing stay in sync with the app both ways.
+
+> Radif is an unofficial client. It isn't affiliated with, endorsed by, or
+> sponsored by Google or YouTube. "YouTube" and "YouTube Music" are trademarks
+> of Google LLC. Audio streams through [yt-dlp](https://github.com/yt-dlp/yt-dlp)
+> and can break when YouTube changes its internals. Use at your own risk.
 
 ## Building it yourself
 
-Needs Node 20+, Rust, and pnpm.
+You need Node 20+, Rust and pnpm.
 
 ```bash
 pnpm install
@@ -147,10 +139,10 @@ pnpm tauri dev            # run it
 pnpm tauri build --bundles app,dmg   # build a .dmg
 ```
 
-The build lands in `src-tauri/target/release/bundle/`. One gotcha worth knowing:
-Tauri's output `.app` is only linker-signed, which macOS reads as tampering on
-another machine — sign it before you hand it to anyone, otherwise they get
-"Radif is damaged" with no way past it:
+The build lands in `src-tauri/target/release/bundle/`. The `develop` branch is
+set to sign with a local dev certificate, so build it with
+`--config '{"bundle":{"macOS":{"signingIdentity":"-"}}}'` instead. If you give
+the app to someone else and their Mac says "Radif is damaged", sign it ad hoc:
 
 ```bash
 codesign --force --deep --sign - Radif.app
@@ -160,18 +152,18 @@ codesign --force --deep --sign - Radif.app
 <summary>Checks, stack, and layout</summary>
 
 ```bash
-pnpm test         # vitest unit tests (pure parsers/matchers)
+pnpm test         # vitest unit tests
 pnpm lint         # eslint
 pnpm format       # prettier --write
 pnpm build        # tsc + vite production build
 ```
 
-CI (`.github/workflows/ci.yml`) runs typecheck, lint, tests, build and
-`cargo check` on every push and PR.
+CI (`.github/workflows/ci.yml`) runs the build, typecheck, lint, tests and
+the Rust tests on every PR and every push to main.
 
-Tauri 2 (Rust backend, WKWebView on macOS) with React 19 and TypeScript on the
-front, built by Vite 7, styled with Tailwind v4 and shadcn/ui, routed by TanStack
-Router, data through TanStack Query, client state in Zustand.
+Tauri 2 (Rust backend, WKWebView on macOS) with React 19 and TypeScript, built
+with Vite 7, styled with Tailwind v4 and shadcn/ui, TanStack Router and Query,
+and Zustand for client state.
 
 ```
 src/
@@ -182,7 +174,7 @@ src/
 │   └── shared/          # Track list/rows, cards, shelves, context menus
 ├── lib/
 │   ├── innertube/       # Raw InnerTube client + parsers
-│   ├── lyrics/          # LRCLIB / Musixmatch sources + LRC parser
+│   ├── lyrics/          # Lyrics sources + LRC parser
 │   ├── store/           # Zustand stores
 │   ├── audio-engine.ts  # Playback engine
 │   └── stream.ts        # Stream URL resolver (localhost proxy)
@@ -194,19 +186,19 @@ src-tauri/               # Rust backend (axum stream proxy, cookies, media sessi
 
 ## Credits
 
-**[YTubic](https://github.com/NUber-dev/YTubic) by
-[@NUber-dev](https://github.com/NUber-dev)** — the app this is built on.
-This started as a fork of it in July 2026 and has been its own line since August.
+Radif started in July 2026 as a fork of [YTubic](https://github.com/NUber-dev/YTubic)
+by [@NUber-dev](https://github.com/NUber-dev), and has been its own project
+since August. Most of the app is built on their work.
 
-[yt-dlp](https://github.com/yt-dlp/yt-dlp) for audio streaming,
-[LRCLIB](https://lrclib.net) and Musixmatch for synced lyrics, and
+Thanks to [yt-dlp](https://github.com/yt-dlp/yt-dlp) for audio streaming,
+[LRCLIB](https://lrclib.net), Musixmatch and Genius for lyrics, and
 [Tauri](https://tauri.app), [shadcn/ui](https://ui.shadcn.com) and
-[TanStack](https://tanstack.com) for the stack underneath.
+[TanStack](https://tanstack.com).
 
 The name: a radif is the refrain in a ghazal, the words every couplet comes
 back to.
 
 ## License
 
-[GPL-3.0](LICENSE) — free to use, modify and redistribute; derivative works stay
-open source under the same license. The original copyright and license stay intact.
+[GPL-3.0](LICENSE). Free to use, change and share. If you distribute a version
+you changed, its source has to be available under the same license. The original copyright and license stay intact.
