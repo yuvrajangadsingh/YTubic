@@ -45,7 +45,17 @@ it shows a Premium prompt instead of serving ads.
 
 ## Install
 
-About two minutes, and most of that is macOS being suspicious of you.
+With [Homebrew](https://brew.sh), one line. It also installs Deno and skips
+the Terminal step below:
+
+```bash
+brew install --cask yuvrajangadsingh/tap/radif
+```
+
+Then sign in with the Google account that has YouTube Music Premium.
+
+Without Homebrew it takes about two minutes, and most of that is macOS being
+suspicious of you.
 
 **1.** [Download the `.dmg`](../../releases/latest) and open it.
 
