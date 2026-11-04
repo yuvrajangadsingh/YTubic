@@ -55,6 +55,18 @@ export type WhatsNewEntry = {
  */
 export const WHATS_NEW: WhatsNewEntry[] = [
   {
+    version: "0.5.4",
+    date: "November 4, 2026",
+    summary: "Signing out now removes saved Google cookies",
+    changes: [
+      {
+        type: "fixed",
+        title: "Sign-out removes saved Google cookies",
+        text: "Signing out now deletes the plain-text cookie copy kept for yt-dlp and what the app's web view stores for Google and YouTube. If you signed out of every account on an older version, the next launch clears them. Web view storage is shared between accounts, so if you added more than one, the others will need signing in again once their saved cookies stop working.",
+      },
+    ],
+  },
+  {
     version: "0.5.3",
     date: "November 4, 2026",
     summary: "Urdu and other RTL lyrics now right-align",
