@@ -926,8 +926,7 @@ async fn ytdlp_cookie_file(app: &tauri::AppHandle) -> Option<PathBuf> {
         // failure mode.
         return None;
     }
-    let dir = app.path().app_data_dir().ok()?.join("ytdlp-cookies");
-    let path = dir.join("cookies.txt");
+    let path = ytdlp_cookie_dir(app)?.join("cookies.txt");
     // yt-dlp rewrites this file when YouTube rotates a cookie mid-run, so
     // it has to be our own copy and never the real jar.
     //
@@ -939,11 +938,133 @@ async fn ytdlp_cookie_file(app: &tauri::AppHandle) -> Option<PathBuf> {
     // own mid-run rewrites are already discarded rather than merged back.
     let locks = app.state::<authfs::MutationLocks>();
     let _guard = locks.inner().account(&id).await;
+    // The jar above was read before this lock. A sign-out that won the race
+    // has deleted the account by now, and this write would put its decrypted
+    // session back on disk. Both sign-out paths change the index under this
+    // lock, so the index tells us.
+    if read_index(app).await.active.as_deref() != Some(id.as_str()) {
+        return None;
+    }
     if let Err(e) = authfs::write_atomic(path.clone(), jar.into_bytes(), 0o600).await {
         eprintln!("[auth] yt-dlp cookie export: {e}");
         return None;
     }
     Some(path)
+}
+
+fn ytdlp_cookie_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+    Some(app.path().app_data_dir().ok()?.join("ytdlp-cookies"))
+}
+
+fn remove_dir_if_present(dir: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("remove {}: {e}", dir.display())),
+    }
+}
+
+/// Does a WebKit site record or cookie domain belong to Google or YouTube?
+/// Wider than the jar's filter: Google also sets session cookies on country
+/// domains like google.co.in, and a sign-out has to take those too.
+#[cfg(any(target_os = "macos", test))]
+fn is_google_site(name: &str) -> bool {
+    let bare = name.trim_start_matches('.');
+    ["google.", "youtube."]
+        .iter()
+        .any(|site| bare.starts_with(site) || bare.contains(&format!(".{site}")))
+}
+
+/// Remove everything WebKit stores for Google and YouTube, cookies first among
+/// it, and check the cookies really went.
+///
+/// On macOS that store is not per account. wry ignores `data_directory` there,
+/// so the login window, every keeper and the main window share one default
+/// store, and removing one account takes the live session of any other with
+/// it. That account keeps its jar and has to sign in again once the jar stops
+/// working. The main window's localStorage lives in the same store, so this
+/// goes site by site and never uses `clear_all_browsing_data`.
+///
+/// Native calls because `WebviewWindow::delete_cookie` can't do this: the
+/// `cookie` crate strips the leading dot, so it asks WebKit to delete
+/// `google.com` and a stored `.google.com` session cookie survives. Always the
+/// main window: a keeper may already be queued for destruction.
+#[cfg(target_os = "macos")]
+async fn remove_google_site_data(app: &tauri::AppHandle) -> Result<(), String> {
+    let win = app
+        .get_webview_window("main")
+        .ok_or_else(|| "no main window to reach the cookie store".to_string())?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    win.with_webview(move |webview| unsafe {
+        use block2::RcBlock;
+        use objc2::rc::Retained;
+        use objc2::runtime::AnyObject;
+        use objc2::{class, msg_send};
+        use objc2_foundation::{NSArray, NSString};
+        let wk: *mut AnyObject = webview.inner().cast();
+        if wk.is_null() {
+            return;
+        }
+        let config: Retained<AnyObject> = msg_send![wk, configuration];
+        let store: Retained<AnyObject> = msg_send![&*config, websiteDataStore];
+        let types: Retained<AnyObject> =
+            msg_send![class!(WKWebsiteDataStore), allWebsiteDataTypes];
+        let (fetch_store, fetch_types) = (store.clone(), types.clone());
+        let on_fetch = RcBlock::new(move |records: *mut NSArray<AnyObject>| {
+            let google: Vec<Retained<AnyObject>> = (*records)
+                .to_vec()
+                .into_iter()
+                .filter(|record| {
+                    let name: Retained<NSString> = msg_send![&**record, displayName];
+                    is_google_site(&name.to_string())
+                })
+                .collect();
+            let google = NSArray::from_retained_slice(&google);
+            let tx = tx.clone();
+            let on_removed = RcBlock::new(move || {
+                let _ = tx.send(());
+            });
+            let _: () = msg_send![
+                &*fetch_store,
+                removeDataOfTypes: &*fetch_types,
+                forDataRecords: &*google,
+                completionHandler: &*on_removed
+            ];
+        });
+        let _: () = msg_send![
+            &*store,
+            fetchDataRecordsOfTypes: &*types,
+            completionHandler: &*on_fetch
+        ];
+    })
+    .map_err(|e| format!("reach the cookie store: {e}"))?;
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .map_err(|_| "timed out clearing WebKit's Google data".to_string())?;
+    let left = win
+        .cookies()
+        .map_err(|e| format!("read cookies: {e}"))?
+        .iter()
+        .filter(|c| c.domain().is_some_and(is_google_site))
+        .count();
+    if left > 0 {
+        return Err(format!("{left} Google cookies survived the delete"));
+    }
+    Ok(())
+}
+
+/// Delete what a sign-out leaves outside `accounts/`: the plaintext yt-dlp
+/// export and, on macOS, the Google session in WebKit's store. Elsewhere that
+/// session lives in the account's own profile, which is already gone.
+///
+/// Never call this holding an auth lock: it waits on the main thread, and
+/// `resolve_stream_ytdlp` can block the main thread on an account lock.
+async fn forget_session_leftovers(app: &tauri::AppHandle) -> Result<(), String> {
+    let export =
+        remove_dir_if_present(&ytdlp_cookie_dir(app).ok_or_else(|| "no app data dir".to_string())?);
+    #[cfg(target_os = "macos")]
+    remove_google_site_data(app).await?;
+    export
 }
 
 /// Serialize a list of cookies into the Netscape cookie-jar format that
@@ -1377,6 +1498,7 @@ async fn cleanup_login_artifacts(app: &tauri::AppHandle) {
 /// "double-reset on dedup" UX bug.
 #[tauri::command]
 async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
+    drop(app.state::<SignedOutSweep>().0.lock().await);
     if let Some(existing) = app.get_webview_window("login") {
         let _ = existing.show();
         let _ = existing.set_focus();
@@ -2582,8 +2704,11 @@ async fn clear_cookies(app: tauri::AppHandle) -> Result<(), String> {
     if legacy.exists() {
         let _ = tokio::fs::remove_file(&legacy).await;
     }
+    drop(_jars);
+    drop(_index);
+    let leftovers = forget_session_leftovers(&app).await;
     let _ = app.emit("accounts-changed", ());
-    Ok(())
+    leftovers
 }
 
 #[tauri::command]
@@ -2662,8 +2787,11 @@ async fn remove_account(app: tauri::AppHandle, id: String) -> Result<(), String>
         idx.active = idx.accounts.first().map(|a| a.id.clone());
     }
     write_index(&app, &idx).await?;
+    drop(_jar);
+    drop(_index);
+    let leftovers = forget_session_leftovers(&app).await;
     let _ = app.emit("accounts-changed", ());
-    Ok(())
+    leftovers
 }
 
 /// Backfill or update meta for an account. Frontend calls this once
@@ -2956,6 +3084,11 @@ async fn get_auth_context(app: tauri::AppHandle, host: String) -> Result<AuthCon
 /// window, which is a process-wide resource.
 #[derive(Default)]
 struct RefreshGuard(tokio::sync::Mutex<()>);
+
+/// Held from `setup` until the signed-out sweep has finished, so `start_login`
+/// can't open a sign-in whose cookies the sweep would then delete.
+#[derive(Default)]
+struct SignedOutSweep(std::sync::Arc<tokio::sync::Mutex<()>>);
 
 /// Merge `Set-Cookie` headers from an InnerTube response into the
 /// active account's jar, mirroring what a browser would do. Google
@@ -5336,6 +5469,7 @@ pub fn run() {
         .manage(CloseBehavior::default())
         .manage(authfs::MutationLocks::default())
         .manage(RefreshGuard::default())
+        .manage(SignedOutSweep::default())
         .manage(discord::spawn())
         .manage(lastfm::LastfmState::default())
         // Idle until the first cast_connect: the session thread and its
@@ -5498,6 +5632,7 @@ pub fn run() {
             eprintln!("[stream-server] ephemeral dir: {ephemeral_dir:?}");
             eprintln!("[stream-server] cover dir: {cover_dir:?}");
             let ytdlp_bin = ytdlp::managed_path(&handle);
+            let sweep_gate = app.state::<SignedOutSweep>().0.clone().try_lock_owned();
             tauri::async_runtime::spawn(async move {
                 migrate_plaintext_cookies(&handle).await;
                 migrate_to_accounts_layout(&handle).await;
@@ -5505,6 +5640,33 @@ pub fn run() {
                 // email-based dedup before the UI reads the list.
                 dedup_accounts_by_identity(&handle).await;
                 cleanup_login_artifacts(&handle).await;
+                // Disposable, rewritten on every use. A yt-dlp still running at
+                // a sign-out can put a removed account's session back here when
+                // it exits, so this goes on every launch, signed in or not.
+                if let Some(dir) = ytdlp_cookie_dir(&handle) {
+                    if let Err(e) = remove_dir_if_present(&dir) {
+                        eprintln!("[auth] launch sweep: {e}");
+                    }
+                }
+                // Sign-outs from before this cleanup existed left Google's data
+                // in WebKit. Its own task: it waits on the main thread.
+                let signed_out = match read_index_checked(&handle).await {
+                    IndexRead::Absent => true,
+                    IndexRead::Loaded(idx) => idx.accounts.is_empty(),
+                    IndexRead::Corrupt(_) | IndexRead::Unavailable(_) => false,
+                };
+                if signed_out {
+                    let app = handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = forget_session_leftovers(&app).await {
+                            eprintln!("[auth] signed-out sweep: {e}");
+                        }
+                        drop(sweep_gate);
+                    });
+                } else {
+                    // This task lives as long as the stream server does.
+                    drop(sweep_gate);
+                }
                 start_stream_server(
                     port,
                     token,
@@ -5765,6 +5927,34 @@ mod tests {
             out.contains("SAPISID\told-sapisid"),
             "untouched cookie survives"
         );
+    }
+
+    #[test]
+    fn google_sites_include_country_domains_and_nothing_lookalike() {
+        for d in [
+            ".youtube.com",
+            "music.youtube.com",
+            "google.com",
+            ".google.com",
+            "accounts.google.com",
+            ".google.co.in",
+        ] {
+            assert!(super::is_google_site(d), "{d}");
+        }
+        for d in ["notyoutube.com", "mygoogle.com", "example.org", "localhost", ""] {
+            assert!(!super::is_google_site(d), "{d}");
+        }
+    }
+
+    #[test]
+    fn removing_the_ytdlp_export_takes_the_whole_dir_and_tolerates_absence() {
+        let dir = std::env::temp_dir().join(format!("radif-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cookies.txt"), "SAPISID").unwrap();
+        std::fs::write(dir.join("cookies.txt.tmp"), "SAPISID").unwrap();
+        super::remove_dir_if_present(&dir).unwrap();
+        assert!(!dir.exists());
+        super::remove_dir_if_present(&dir).unwrap();
     }
 
     #[test]
