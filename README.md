@@ -6,6 +6,11 @@
   <p><em>A YouTube Music app for the Mac.</em></p>
 
   <p>
+    <a href="https://www.yuvrajangadsingh.com/radif">yuvrajangadsingh.com/radif</a> ·
+    Listed on <a href="https://github.com/jaywcjlove/awesome-mac#audio-and-video-tools">awesome-mac</a>
+  </p>
+
+  <p>
     <img src="https://img.shields.io/badge/macOS-Universal-2a2933?style=flat-square&labelColor=14131a" alt="macOS, Intel and Apple Silicon" />
     <img src="https://img.shields.io/badge/license-GPL--3.0-2a2933?style=flat-square&labelColor=14131a" alt="GPL-3.0 license" />
     <img src="https://img.shields.io/badge/unofficial-client-2a2933?style=flat-square&labelColor=14131a" alt="Unofficial client" />
