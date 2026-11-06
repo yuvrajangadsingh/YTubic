@@ -829,11 +829,12 @@ export function useAudioEngine() {
     // change re-resolves too but is a gating event, not a continuity
     // request, so it breaks the carry.
     const prevKey = prevResolveKeyRef.current;
-    const sameTrack =
-      !!prevKey &&
-      prevKey.videoId === videoId &&
-      prevKey.index === index &&
-      prevKey.premiumOk === premiumOk;
+    const sameSlot =
+      !!prevKey && prevKey.videoId === videoId && prevKey.index === index;
+    const sameTrack = sameSlot && prevKey.premiumOk === premiumOk;
+    // The gate lifting on the same slot (Premium status landing after
+    // launch) is not a gating event for a seek made while it was parked.
+    const gateLifted = sameSlot && !prevKey.premiumOk && premiumOk;
     const posBefore = el.currentTime;
     prevResolveKeyRef.current = { videoId, index, premiumOk };
     // Invalidate in-flight resolutions of ANY earlier run before the
@@ -854,7 +855,7 @@ export function useAudioEngine() {
     carrySeekRef.current =
       sameTrack && posBefore > 0.5
         ? { token, seconds: posBefore }
-        : sameTrack && carrySeekRef.current
+        : (sameTrack || gateLifted) && carrySeekRef.current
           ? { token, seconds: carrySeekRef.current.seconds }
           : resume && resume.videoId === videoId
             ? { token, seconds: resume.seconds }
