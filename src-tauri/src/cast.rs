@@ -449,7 +449,9 @@ fn load(
 
     eprintln!(
         "[cast] LOAD url={} ct={} transport={}",
-        media.content_id, media.content_type, session.transport_id
+        redact_stream_url(&media.content_id),
+        media.content_type,
+        session.transport_id
     );
     let status = connection
         .media
@@ -746,6 +748,19 @@ pub async fn cast_disconnect(app: AppHandle, state: State<'_, CastState>) -> Res
     Ok(())
 }
 
+/// The stream URL's first path segment is the stream server's access token,
+/// which must not reach the log.
+fn redact_stream_url(url: &str) -> String {
+    let path_start = url
+        .find("://")
+        .and_then(|scheme| url[scheme + 3..].find('/').map(|i| scheme + 3 + i + 1));
+    let Some(start) = path_start else {
+        return url.to_string();
+    };
+    let end = url[start..].find('/').map_or(url.len(), |i| start + i);
+    format!("{}<token>{}", &url[..start], &url[end..])
+}
+
 /// Launch the Default Media Receiver if needed and start `url` on it.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
@@ -759,7 +774,10 @@ pub async fn cast_load(
     artwork_url: Option<String>,
     duration: f64,
 ) -> Result<(), String> {
-    eprintln!("[cast] cast_load called: {url} ({content_type})");
+    eprintln!(
+        "[cast] cast_load called: {} ({content_type})",
+        redact_stream_url(&url)
+    );
     let request = LoadRequest {
         url,
         content_type,
@@ -819,4 +837,22 @@ pub async fn cast_set_volume(
 #[tauri::command]
 pub fn cast_status(state: State<'_, CastState>) -> Result<CastStatus, String> {
     Ok(state.snapshot())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_stream_url;
+
+    #[test]
+    fn redact_stream_url_hides_the_token_segment() {
+        assert_eq!(
+            redact_stream_url("http://192.168.1.5:5123/abc123def/stream/dQw4w9WgXcQ"),
+            "http://192.168.1.5:5123/<token>/stream/dQw4w9WgXcQ"
+        );
+        assert_eq!(
+            redact_stream_url("http://127.0.0.1:5123/abc123def"),
+            "http://127.0.0.1:5123/<token>"
+        );
+        assert_eq!(redact_stream_url("not a url"), "not a url");
+    }
 }
