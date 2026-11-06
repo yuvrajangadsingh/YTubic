@@ -200,15 +200,22 @@ function persistedQueueIndex(queue: QueueTrack[], index: number): number {
   return safeIndex - Math.max(0, safeIndex - before);
 }
 
-/** Avoid serializing and writing the full queue on every position tick. */
-function createDebouncedStorage(delay = 1000): StateStorage {
+/** Write the full queue at most once per `delay`, not on every position
+ *  tick; the last value in each window is the one written. */
+export function createThrottledStorage(delay = 1000): StateStorage {
   if (typeof window === "undefined") return safeLocalStorage;
   const pending = new Map<string, { value: string; timer: number }>();
   return {
     getItem: (name) => safeLocalStorage.getItem(name),
     setItem: (name, value) => {
       const existing = pending.get(name);
-      if (existing) window.clearTimeout(existing.timer);
+      // A pending write keeps its timer and only takes the newer value:
+      // restarting it on every change meant position ticks starved the
+      // write for as long as a track played.
+      if (existing) {
+        existing.value = value;
+        return;
+      }
       const timer = window.setTimeout(() => {
         const item = pending.get(name);
         if (!item) return;
@@ -590,7 +597,7 @@ export const usePlaybackStore = isFloatingPlayerWindow()
         // Volatile fields (position, status, streamUrl, error,
         // pendingSeek) and `playing` are reset on rehydrate so a fresh
         // launch never auto-blasts audio at you.
-        storage: createJSONStorage(() => createDebouncedStorage()),
+        storage: createJSONStorage(() => createThrottledStorage()),
         partialize: (s) => ({
           queue: compactPersistedQueue(s.queue, s.index),
           index: persistedQueueIndex(s.queue, s.index),
