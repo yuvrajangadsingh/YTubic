@@ -845,12 +845,19 @@ export function useAudioEngine() {
     // rapid double flip re-runs while the playhead is still 0 (the
     // first reload reset it), so an existing same-track carry is
     // retagged to the new generation instead of being dropped.
+    // The first load after launch picks the saved playhead back up, through
+    // the same metadata-time seek a source flip uses. Cleared when a src is
+    // actually set below, not here: the first runs after launch are often
+    // parked by the Premium gate while the account status loads.
+    const resume = usePlaybackStore.getState().resumeAt;
     carrySeekRef.current =
       sameTrack && posBefore > 0.5
         ? { token, seconds: posBefore }
         : sameTrack && carrySeekRef.current
           ? { token, seconds: carrySeekRef.current.seconds }
-          : null;
+          : resume && resume.videoId === videoId
+            ? { token, seconds: resume.seconds }
+            : null;
     // Stop the previous track immediately. Without this the old src keeps
     // playing through the streamUrlFor() round-trip (~50–500 ms), so the
     // user hears the tail of track A bleed into the start of track B.
@@ -967,6 +974,7 @@ export function useAudioEngine() {
         el.src = src;
         loadedSlotRef.current = { videoId, index };
         const st = usePlaybackStore.getState();
+        if (st.resumeAt) usePlaybackStore.setState({ resumeAt: undefined });
         st.setStreamUrl(src);
         const carry = carrySeekRef.current;
         if (carry && carry.token === token) {

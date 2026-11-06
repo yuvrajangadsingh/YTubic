@@ -11,7 +11,7 @@ import type { PlaybackState, QueueTrack } from "@/lib/store/playback";
   location: { search: "?floating-player" },
 };
 
-const { usePlaybackStore, createThrottledStorage } =
+const { usePlaybackStore, resumePoint, createThrottledStorage } =
   await import("@/lib/store/playback");
 
 function track(videoId: string): QueueTrack {
@@ -152,6 +152,22 @@ describe("queueContinuation lifecycle", () => {
     expect(usePlaybackStore.getState().queueContinuation).toBe("tok2");
     usePlaybackStore.getState().setQueueContinuation(undefined);
     expect(usePlaybackStore.getState().queueContinuation).toBeUndefined();
+  });
+});
+
+describe("resumePoint", () => {
+  const t = { ...track("a"), duration: 200 };
+
+  it("resumes the saved playhead of the current track", () => {
+    expect(resumePoint(t, 73)).toEqual({ videoId: "a", seconds: 73 });
+    expect(resumePoint(track("b"), 73)).toEqual({ videoId: "b", seconds: 73 });
+  });
+
+  it("starts over near the start or the end, or with nothing saved", () => {
+    expect(resumePoint(t, 4)).toBeUndefined();
+    expect(resumePoint(t, 195)).toBeUndefined();
+    expect(resumePoint(t, undefined)).toBeUndefined();
+    expect(resumePoint(undefined, 73)).toBeUndefined();
   });
 });
 

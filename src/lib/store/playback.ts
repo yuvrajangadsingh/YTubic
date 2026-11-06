@@ -98,6 +98,9 @@ export type PlaybackState = {
   duration: number;
   /** When the user drags the slider, we seek here on release. */
   pendingSeek?: number;
+  /** Set once at launch from the saved playhead: the engine's first load
+   *  of this track seeks here, and the field is cleared when it does. */
+  resumeAt?: { videoId: string; seconds: number };
 
   /** When true, auto-append radio tracks to the queue when the last one ends. */
   autoRadio: boolean;
@@ -198,6 +201,18 @@ function persistedQueueIndex(queue: QueueTrack[], index: number): number {
   const safeIndex = Math.max(0, Math.min(index, queue.length - 1));
   const before = Math.floor((MAX_PERSISTED_QUEUE_TRACKS - 1) / 2);
   return safeIndex - Math.max(0, safeIndex - before);
+}
+
+/** Where a relaunch picks the current track up: the saved playhead, unless
+ *  it is so near the start or the end that starting over is what the
+ *  listener would want. */
+export function resumePoint(
+  track: QueueTrack | undefined,
+  seconds: number | undefined,
+): { videoId: string; seconds: number } | undefined {
+  if (!track || !seconds || seconds < 5) return undefined;
+  if (track.duration && seconds > track.duration - 10) return undefined;
+  return { videoId: track.videoId, seconds };
 }
 
 /** Write the full queue at most once per `delay`, not on every position
@@ -607,11 +622,16 @@ export const usePlaybackStore = isFloatingPlayerWindow()
           queueContinuation: s.queueContinuation,
           volume: s.volume,
           muted: s.muted,
+          position: Math.floor(s.position),
         }),
         onRehydrateStorage: () => (state) => {
           if (!state) return;
           state.playing = false;
-          state.position = 0;
+          state.resumeAt = resumePoint(
+            state.queue[state.index],
+            state.position,
+          );
+          state.position = state.resumeAt?.seconds ?? 0;
           state.duration = state.queue[state.index]?.duration ?? 0;
           state.status = "idle";
           state.streamUrl = undefined;
