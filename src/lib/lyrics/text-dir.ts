@@ -12,3 +12,15 @@ export function textDir(text: string): "rtl" | "ltr" {
   const first = text.match(STRONG)?.[0];
   return first && RTL.test(first) ? "rtl" : "ltr";
 }
+
+/** Direction for line `i` of a sheet. A line with no letters (the ♪ break
+ *  marker) takes the nearest sung line's direction, earlier lines first;
+ *  otherwise an Urdu song's breaks sat on the left. */
+export function lineDir(texts: string[], i: number): "rtl" | "ltr" {
+  for (let d = 0; d < texts.length; d++) {
+    for (const t of [texts[i - d], texts[i + d]]) {
+      if (t && STRONG.test(t)) return textDir(t);
+    }
+  }
+  return "ltr";
+}
