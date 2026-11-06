@@ -25,7 +25,7 @@ import {
 } from "@/lib/lyrics/sources";
 import { usePlaybackStore } from "@/lib/store/playback";
 import { estimateLeadInOffset } from "@/lib/lyrics/auto-align";
-import { textDir } from "@/lib/lyrics/text-dir";
+import { lineDir } from "@/lib/lyrics/text-dir";
 import type { QueueTrack } from "@/lib/store/playback";
 import { cn } from "@/lib/utils";
 
@@ -300,6 +300,11 @@ function TimedLyrics({
   const rafRef = useRef<number | null>(null);
   const position = usePlaybackStore((s) => s.position);
   const seek = usePlaybackStore((s) => s.seek);
+  // Once per sheet, not per playback tick: a run of breaks scans outward.
+  const dirs = useMemo(() => {
+    const texts = lines.map((l) => l.text);
+    return texts.map((_, i) => lineDir(texts, i));
+  }, [lines]);
   // False while the active line sits above its anchor because the column
   // is already scrolled to the top (a line early in the song): it then
   // overlaps the blur strip, which has to get out of the way.
@@ -500,7 +505,7 @@ function TimedLyrics({
               key={i}
               type="button"
               data-line-idx={i}
-              dir={textDir(line.text)}
+              dir={dirs[i]}
               onClick={() => seek(line.start + offset)}
               style={{ "--line-o": String(fall) } as React.CSSProperties}
               className={cn(
