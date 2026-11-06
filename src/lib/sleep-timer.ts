@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { create } from "zustand";
+import { useCastStore } from "@/lib/store/cast";
 import { usePlaybackStore } from "@/lib/store/playback";
 
 /** Pause playback after a set time or at the end of the current track.
@@ -29,6 +30,19 @@ export const useSleepTimer = create<SleepTimer>()((set) => ({
  *  comes through here, so it keeps the timer armed for the new track. */
 export function pauseIfSleepingAfterTrack(): void {
   if (takeEndOfTrack()) usePlaybackStore.getState().setPlaying(false);
+}
+
+/** The engine's own advance, for a track that ran out or a long outro it
+ *  skips. While casting, "end of track" stops on the receiver's current
+ *  track instead: a LOAD there would start the next one playing. */
+export function advanceAfterTrack(): void {
+  const pb = usePlaybackStore.getState();
+  if (useCastStore.getState().deviceId !== null && takeEndOfTrack()) {
+    if (pb.playing) pb.toggle();
+    return;
+  }
+  pb.next();
+  pauseIfSleepingAfterTrack();
 }
 
 /** Disarm "end of track" if it is set, and say whether it was. Casting

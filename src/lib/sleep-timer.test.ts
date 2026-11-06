@@ -3,11 +3,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const setPlaying = vi.fn();
 const toggle = vi.fn();
 let playing = true;
+const next = vi.fn();
+let deviceId: string | null = null;
 vi.mock("@/lib/store/playback", () => ({
-  usePlaybackStore: { getState: () => ({ setPlaying, toggle, playing }) },
+  usePlaybackStore: {
+    getState: () => ({ setPlaying, toggle, next, playing }),
+  },
+}));
+vi.mock("@/lib/store/cast", () => ({
+  useCastStore: { getState: () => ({ deviceId }) },
 }));
 
 const {
+  advanceAfterTrack,
   pauseIfSleepingAfterTrack,
   takeEndOfTrack,
   useSleepTimer,
@@ -17,6 +25,8 @@ const {
 beforeEach(() => {
   setPlaying.mockClear();
   toggle.mockClear();
+  next.mockClear();
+  deviceId = null;
   playing = true;
   useSleepTimer.getState().clear();
 });
@@ -57,5 +67,24 @@ describe("minutes", () => {
     expect(toggle).toHaveBeenCalledTimes(1);
     expect(useSleepTimer.getState().endsAt).toBeNull();
     stop();
+  });
+});
+
+describe("advanceAfterTrack", () => {
+  it("moves on, then pauses there when end of track is set", () => {
+    useSleepTimer.getState().setAfterTrack();
+    advanceAfterTrack();
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(setPlaying).toHaveBeenCalledWith(false);
+  });
+
+  it("while casting, pauses the receiver on this track instead", () => {
+    deviceId = "tv";
+    useSleepTimer.getState().setAfterTrack();
+    advanceAfterTrack();
+    expect(next).not.toHaveBeenCalled();
+    expect(toggle).toHaveBeenCalledTimes(1);
+    advanceAfterTrack();
+    expect(next).toHaveBeenCalledTimes(1);
   });
 });
