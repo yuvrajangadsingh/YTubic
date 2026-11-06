@@ -51,6 +51,10 @@ type State = {
    *  scrobbling and off by default: an opt-in, since people often keep their
    *  likes intentionally different per platform. See `lib/lastfm.ts`. */
   lastfmLoveSync: boolean;
+  /** Report each listen to the signed-in account's YouTube watch history,
+   *  so the home feed and radio learn from plays here. On by default, the
+   *  same as YouTube's own apps. See `lib/yt-history.ts`. */
+  ytHistory: boolean;
   setCloseAction: (v: CloseButtonAction) => void;
   setCacheAutoClean: (v: CacheAutoCleanPeriod) => void;
   markCacheCleaned: () => void;
@@ -62,6 +66,7 @@ type State = {
   setLastfmEnabled: (v: boolean) => void;
   setLastfmLoveSync: (v: boolean) => void;
   setLastfmAvatar: (v: string | null) => void;
+  setYtHistory: (v: boolean) => void;
   /** Store the account returned by the connect flow and enable scrobbling. */
   setLastfmSession: (username: string, sessionKey: string) => void;
   /** Forget the connected account and stop scrobbling. */
@@ -90,6 +95,7 @@ export const useSettingsStore = create<State>()(
       lastfmUsername: null,
       lastfmAvatar: null,
       lastfmLoveSync: false,
+      ytHistory: true,
       setCloseAction: (closeAction) => set({ closeAction }),
       setCacheAutoClean: (cacheAutoClean) => set({ cacheAutoClean }),
       markCacheCleaned: () => set({ lastCacheCleanAt: Date.now() }),
@@ -103,6 +109,7 @@ export const useSettingsStore = create<State>()(
       setLastfmEnabled: (lastfmEnabled) => set({ lastfmEnabled }),
       setLastfmLoveSync: (lastfmLoveSync) => set({ lastfmLoveSync }),
       setLastfmAvatar: (lastfmAvatar) => set({ lastfmAvatar }),
+      setYtHistory: (ytHistory) => set({ ytHistory }),
       setLastfmSession: (lastfmUsername, lastfmSessionKey) =>
         set({ lastfmUsername, lastfmSessionKey, lastfmEnabled: true }),
       clearLastfmSession: () =>
