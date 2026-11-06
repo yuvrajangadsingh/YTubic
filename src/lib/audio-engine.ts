@@ -10,6 +10,7 @@ import {
   saveTrackMeta,
   streamUrlFor,
 } from "@/lib/stream";
+import { pauseIfSleepingAfterTrack } from "@/lib/sleep-timer";
 import { usePlaybackStore, type QueueTrack } from "@/lib/store/playback";
 import { videoQualityTier } from "@/lib/video-quality-tier";
 import { isCasting, useCastStore } from "@/lib/store/cast";
@@ -425,6 +426,7 @@ export function useAudioEngine() {
         el.pause();
         el.currentTime = 0;
         cur.next();
+        pauseIfSleepingAfterTrack();
       }
     };
     const onDurationChange = () => {
@@ -457,6 +459,7 @@ export function useAudioEngine() {
     const onProgress = () => syncSeekableDuration();
     const onEnded = () => {
       store().next();
+      pauseIfSleepingAfterTrack();
     };
     // External pause/play — the system Now Playing widget or WebKit's
     // built-in media session can pause the element directly, bypassing
@@ -2159,6 +2162,7 @@ export function useAudioEngine() {
     ) {
       outroSkippedRef.current = videoId;
       usePlaybackStore.getState().next();
+      pauseIfSleepingAfterTrack();
     }
   }, [position, duration, metaDuration, playing, videoId]);
 
@@ -2176,6 +2180,7 @@ export function useAudioEngine() {
         );
       }
       usePlaybackStore.getState().next();
+      pauseIfSleepingAfterTrack();
     }
   }, [position, duration, playing, videoId, lastVocal]);
   useEffect(() => {
