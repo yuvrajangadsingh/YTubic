@@ -529,13 +529,18 @@ function TimedLyrics({
                 // next few lines are visible with a steep falloff.
                 // Hovering the column (group-hover, fast duration)
                 // brings everything back for scanning/seeking.
+                // The active line's 1.04 scale grows from the start edge,
+                // so a line that wraps to the full column width would end
+                // 4% past it and get clipped by the scroll container. The
+                // width is cut by the same factor to keep it inside; RTL
+                // lines push to the right edge, where they start.
                 // NOTE: `filter` is deliberately NOT in the transition
                 // list. Animating blur forces WebKit to re-rasterize
                 // every line's layer each frame, which starves the
                 // rAF scroll (the column visibly stutter-jumped on
                 // every line change). Snapped blur under motion is
                 // imperceptible; scroll stays pure compositing.
-                "lyrics-line origin-left rtl:origin-right cursor-pointer rounded-md px-2 py-1 text-start text-lg font-[650] leading-snug opacity-(--line-o) transition-[scale,color,opacity] duration-[1260ms] ease-in-out hover:bg-black/30 hover:blur-none group-hover:duration-200",
+                "lyrics-line w-[calc(100%/1.04)] wrap-break-word origin-left rtl:ml-auto rtl:origin-right cursor-pointer rounded-md px-2 py-1 text-start text-lg font-[650] leading-snug opacity-(--line-o) transition-[scale,color,opacity] duration-[1260ms] ease-in-out hover:bg-black/30 hover:blur-none group-hover:duration-200",
                 isActive
                   ? "scale-[1.04] text-foreground blur-none"
                   : melt === "full"
