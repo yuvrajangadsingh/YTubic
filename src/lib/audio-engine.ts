@@ -846,9 +846,10 @@ export function useAudioEngine() {
     // first reload reset it), so an existing same-track carry is
     // retagged to the new generation instead of being dropped.
     // The first load after launch picks the saved playhead back up, through
-    // the same metadata-time seek a source flip uses. Cleared when a src is
-    // actually set below, not here: the first runs after launch are often
-    // parked by the Premium gate while the account status loads.
+    // the same metadata-time seek a source flip uses. It stays until that
+    // seek lands (the first runs after launch are often parked by the
+    // Premium gate, and a queue edit can re-resolve before metadata); the
+    // store drops it on a seek or when the current track changes.
     const resume = usePlaybackStore.getState().resumeAt;
     carrySeekRef.current =
       sameTrack && posBefore > 0.5
@@ -974,7 +975,6 @@ export function useAudioEngine() {
         el.src = src;
         loadedSlotRef.current = { videoId, index };
         const st = usePlaybackStore.getState();
-        if (st.resumeAt) usePlaybackStore.setState({ resumeAt: undefined });
         st.setStreamUrl(src);
         const carry = carrySeekRef.current;
         if (carry && carry.token === token) {
@@ -984,6 +984,8 @@ export function useAudioEngine() {
               const c = carrySeekRef.current;
               if (!c || c.token !== token) return;
               carrySeekRef.current = null;
+              // A launch resume is spent once its seek lands.
+              usePlaybackStore.setState({ resumeAt: undefined });
               if (token !== resolveTokenRef.current) return;
               // The two cuts can differ in length (MV intros/outros):
               // clamp into the new cut instead of restarting, a

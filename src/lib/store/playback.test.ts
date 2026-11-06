@@ -190,3 +190,25 @@ describe("createThrottledStorage", () => {
     vi.useRealTimers();
   });
 });
+
+describe("launch resume", () => {
+  const resume = { videoId: "a", seconds: 73 };
+
+  it("survives a queue edit that keeps the track, not a seek or a new track", () => {
+    usePlaybackStore.setState({
+      queue: [track("x"), track("a"), track("b")],
+      index: 1,
+      pendingSeek: undefined,
+      resumeAt: resume,
+    });
+    usePlaybackStore.setState({ queue: [track("a"), track("b")], index: 0 });
+    expect(usePlaybackStore.getState().resumeAt).toEqual(resume);
+
+    usePlaybackStore.setState({ pendingSeek: 20 });
+    expect(usePlaybackStore.getState().resumeAt).toBeUndefined();
+
+    usePlaybackStore.setState({ pendingSeek: undefined, resumeAt: resume });
+    usePlaybackStore.setState({ index: 1 });
+    expect(usePlaybackStore.getState().resumeAt).toBeUndefined();
+  });
+});

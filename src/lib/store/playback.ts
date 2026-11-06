@@ -641,6 +641,16 @@ export const usePlaybackStore = isFloatingPlayerWindow()
       }),
     );
 
+// A launch resume is for the restored track only, and only until the
+// listener takes over: a seek, or a different current track, drops it.
+usePlaybackStore.subscribe((s) => {
+  const r = s.resumeAt;
+  if (!r) return;
+  if (s.pendingSeek !== undefined || s.queue[s.index]?.videoId !== r.videoId) {
+    usePlaybackStore.setState({ resumeAt: undefined });
+  }
+});
+
 /** Convenience selector for the currently-playing track (or undefined). */
 export function currentTrack(state: PlaybackState): QueueTrack | undefined {
   if (state.index < 0 || state.index >= state.queue.length) return undefined;
