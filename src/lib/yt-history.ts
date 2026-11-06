@@ -11,6 +11,7 @@ import {
 import { useAccounts } from "@/lib/store/accounts";
 import { useCastStore } from "@/lib/store/cast";
 import { usePlaybackStore } from "@/lib/store/playback";
+import { useSettingsStore } from "@/lib/store/settings";
 import { resolveStreamId, useTrackSourceStore } from "@/lib/store/track-source";
 
 /**
@@ -145,14 +146,19 @@ export async function reportListen(
     // switch or a sign-out, and a brand channel switch keeps the account
     // id, so the page id is compared as well. The player POST is bound to
     // the account and only checked for the channel just before it.
+    // The setting is read again before each request: turning it off while
+    // a report is on its way stops that report too.
     const asListener = async () => {
+      if (!useSettingsStore.getState().ytHistory) return null;
       const auth = await authHeaders("required", account);
       return auth.Authorization && (auth["X-Goog-PageId"] ?? null) === pageId
         ? auth
         : null;
     };
     if (!(await asListener())) {
-      appLog(`[history] ${videoId}: skipped, not signed in as the listener`);
+      appLog(
+        `[history] ${videoId}: skipped, off or not signed in as the listener`,
+      );
       return;
     }
     const player = await innertubePost(
@@ -179,7 +185,9 @@ export async function reportListen(
     // cookies.
     const auth = await asListener();
     if (!auth) {
-      appLog(`[history] ${videoId}: skipped, not signed in as the listener`);
+      appLog(
+        `[history] ${videoId}: skipped, off or not signed in as the listener`,
+      );
       return;
     }
     const res = await tauriFetch(url, {
@@ -217,6 +225,7 @@ export function useYtHistory(): void {
   const active = useAccounts().data?.find((a) => a.isActive);
   const account = active?.id;
   const pageId = active?.pageId ?? null;
+  const enabled = useSettingsStore((s) => s.ytHistory);
 
   // Keyed on the slot as well: the same video can sit at two queue slots.
   // And on the queue's id next to the played one: a video and its song
@@ -225,7 +234,8 @@ export function useYtHistory(): void {
   // starts over, the new stream earns its own 30 s, and so does a new
   // identity.
   useEffect(() => {
-    if (!playedId || !account) return;
+    // Turning it off mid-track drops the listen in progress.
+    if (!enabled || !playedId || !account) return;
     return watchListen(() => void reportListen(playedId, account, pageId));
-  }, [playedId, videoId, index, account, pageId]);
+  }, [enabled, playedId, videoId, index, account, pageId]);
 }

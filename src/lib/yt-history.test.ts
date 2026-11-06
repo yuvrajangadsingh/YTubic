@@ -26,6 +26,10 @@ const setPlayback = (patch: Partial<Playback>) => {
   playback = { ...playback, ...patch };
   subs.forEach((fn) => fn(playback, prev));
 };
+const settings = { ytHistory: true };
+vi.mock("@/lib/store/settings", () => ({
+  useSettingsStore: Object.assign(vi.fn(), { getState: () => settings }),
+}));
 vi.mock("@/lib/store/accounts", () => ({ useAccounts: vi.fn() }));
 vi.mock("@/lib/store/cast", () => ({ useCastStore: vi.fn() }));
 vi.mock("@/lib/store/playback", () => ({
@@ -250,6 +254,23 @@ describe("watchListen", () => {
 });
 
 describe("reportListen", () => {
+  beforeEach(() => {
+    settings.ytHistory = true;
+  });
+
+  it("sends nothing once the setting is off, even mid-report", async () => {
+    settings.ytHistory = false;
+    await reportListen("vid1", "acct", null);
+    expect(innertubePost).not.toHaveBeenCalled();
+    settings.ytHistory = true;
+    innertubePost.mockImplementationOnce(async () => {
+      settings.ytHistory = false;
+      return playerWith(BASE);
+    });
+    await reportListen("vid1", "acct", null);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("sends one signed GET to the url the player response names", async () => {
     const res = { status: 204 };
     fetchMock.mockResolvedValue(res);
