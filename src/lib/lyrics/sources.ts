@@ -5,6 +5,7 @@ import { fetchMusixmatchLyrics } from "@/lib/lyrics/musixmatch";
 import { fetchGeniusLyrics } from "@/lib/lyrics/genius";
 import { fetchYtMusicLyrics } from "@/lib/lyrics/ytmusic";
 import { rejectSiteChrome } from "@/lib/lyrics/plausibility";
+import { useLyricsSkip } from "@/lib/lyrics/skip";
 import {
   describeLyricsError,
   LyricsTimeoutError,
@@ -100,6 +101,22 @@ function logAttempt(
       appLog(`[lyrics] ${source} failed in ${secs()}: ${why}`);
       throw e;
     },
+  );
+}
+
+const NONE_SKIPPED: LyricsSource[] = [];
+
+/** The auto pick: timed beats plain, then `SOURCE_ORDER`, passing over
+ *  the sources the listener skipped for this track. */
+export function pickBest(
+  data: (s: LyricsSource) => Lyrics | null | undefined,
+  skipped: LyricsSource[],
+): LyricsSource | null {
+  const open = SOURCE_ORDER.filter((s) => !skipped.includes(s));
+  return (
+    open.find((s) => data(s)?.kind === "timed") ??
+    open.find((s) => data(s)?.kind === "plain") ??
+    null
   );
 }
 
@@ -253,21 +270,13 @@ export function useLyricsSources(
     genius,
   };
 
-  let best: LyricsSource | null = null;
-  for (const s of SOURCE_ORDER) {
-    if (queries[s].data?.kind === "timed") {
-      best = s;
-      break;
-    }
-  }
-  if (!best) {
-    for (const s of SOURCE_ORDER) {
-      if (queries[s].data?.kind === "plain") {
-        best = s;
-        break;
-      }
-    }
-  }
+  const skipped = useLyricsSkip((s) =>
+    track ? s.byVideo[track.videoId] : undefined,
+  );
+  const best = pickBest(
+    (s) => queries[s].data,
+    skipped ?? NONE_SKIPPED,
+  );
 
   const isLoading = SOURCE_ORDER.some((s) => queries[s].isLoading);
   // Every source has answered, one way or the other. Not `!isFetching`: a
