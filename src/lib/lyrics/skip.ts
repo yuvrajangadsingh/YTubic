@@ -44,3 +44,12 @@ export const useLyricsSkip = create<State>()(
     { name: "ytm:lyrics-skip" },
   ),
 );
+
+// The floating player is another window on the same localStorage key, and
+// persist does not pick up another window's writes by itself: a skip made
+// there would never reach the main window's audio engine.
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (e) => {
+    if (e.key === "ytm:lyrics-skip") void useLyricsSkip.persist.rehydrate();
+  });
+}
