@@ -829,11 +829,12 @@ export function useAudioEngine() {
     // change re-resolves too but is a gating event, not a continuity
     // request, so it breaks the carry.
     const prevKey = prevResolveKeyRef.current;
-    const sameTrack =
-      !!prevKey &&
-      prevKey.videoId === videoId &&
-      prevKey.index === index &&
-      prevKey.premiumOk === premiumOk;
+    const sameSlot =
+      !!prevKey && prevKey.videoId === videoId && prevKey.index === index;
+    const sameTrack = sameSlot && prevKey.premiumOk === premiumOk;
+    // The gate lifting on the same slot (Premium status landing after
+    // launch) is not a gating event for a seek made while it was parked.
+    const gateLifted = sameSlot && !prevKey.premiumOk && premiumOk;
     const posBefore = el.currentTime;
     prevResolveKeyRef.current = { videoId, index, premiumOk };
     // Invalidate in-flight resolutions of ANY earlier run before the
@@ -845,12 +846,20 @@ export function useAudioEngine() {
     // rapid double flip re-runs while the playhead is still 0 (the
     // first reload reset it), so an existing same-track carry is
     // retagged to the new generation instead of being dropped.
+    // The first load after launch picks the saved playhead back up, through
+    // the same metadata-time seek a source flip uses. It stays until that
+    // seek lands (the first runs after launch are often parked by the
+    // Premium gate, and a queue edit can re-resolve before metadata); the
+    // store drops it on a seek or when the current track changes.
+    const resume = usePlaybackStore.getState().resumeAt;
     carrySeekRef.current =
       sameTrack && posBefore > 0.5
         ? { token, seconds: posBefore }
-        : sameTrack && carrySeekRef.current
+        : (sameTrack || gateLifted) && carrySeekRef.current
           ? { token, seconds: carrySeekRef.current.seconds }
-          : null;
+          : resume && resume.videoId === videoId
+            ? { token, seconds: resume.seconds }
+            : null;
     // Stop the previous track immediately. Without this the old src keeps
     // playing through the streamUrlFor() round-trip (~50–500 ms), so the
     // user hears the tail of track A bleed into the start of track B.
@@ -976,6 +985,8 @@ export function useAudioEngine() {
               const c = carrySeekRef.current;
               if (!c || c.token !== token) return;
               carrySeekRef.current = null;
+              // A launch resume is spent once its seek lands.
+              usePlaybackStore.setState({ resumeAt: undefined });
               if (token !== resolveTokenRef.current) return;
               // The two cuts can differ in length (MV intros/outros):
               // clamp into the new cut instead of restarting, a

@@ -98,6 +98,9 @@ export type PlaybackState = {
   duration: number;
   /** When the user drags the slider, we seek here on release. */
   pendingSeek?: number;
+  /** Set once at launch from the saved playhead: the engine's first load
+   *  of this track seeks here, and the field is cleared when it does. */
+  resumeAt?: { videoId: string; seconds: number };
 
   /** When true, auto-append radio tracks to the queue when the last one ends. */
   autoRadio: boolean;
@@ -200,15 +203,34 @@ function persistedQueueIndex(queue: QueueTrack[], index: number): number {
   return safeIndex - Math.max(0, safeIndex - before);
 }
 
-/** Avoid serializing and writing the full queue on every position tick. */
-function createDebouncedStorage(delay = 1000): StateStorage {
+/** Where a relaunch picks the current track up: the saved playhead, unless
+ *  it is so near the start or the end that starting over is what the
+ *  listener would want. */
+export function resumePoint(
+  track: QueueTrack | undefined,
+  seconds: number | undefined,
+): { videoId: string; seconds: number } | undefined {
+  if (!track || !seconds || seconds < 5) return undefined;
+  if (track.duration && seconds > track.duration - 10) return undefined;
+  return { videoId: track.videoId, seconds };
+}
+
+/** Write the full queue at most once per `delay`, not on every position
+ *  tick; the last value in each window is the one written. */
+export function createThrottledStorage(delay = 1000): StateStorage {
   if (typeof window === "undefined") return safeLocalStorage;
   const pending = new Map<string, { value: string; timer: number }>();
   return {
     getItem: (name) => safeLocalStorage.getItem(name),
     setItem: (name, value) => {
       const existing = pending.get(name);
-      if (existing) window.clearTimeout(existing.timer);
+      // A pending write keeps its timer and only takes the newer value:
+      // restarting it on every change meant position ticks starved the
+      // write for as long as a track played.
+      if (existing) {
+        existing.value = value;
+        return;
+      }
       const timer = window.setTimeout(() => {
         const item = pending.get(name);
         if (!item) return;
@@ -590,7 +612,7 @@ export const usePlaybackStore = isFloatingPlayerWindow()
         // Volatile fields (position, status, streamUrl, error,
         // pendingSeek) and `playing` are reset on rehydrate so a fresh
         // launch never auto-blasts audio at you.
-        storage: createJSONStorage(() => createDebouncedStorage()),
+        storage: createJSONStorage(() => createThrottledStorage()),
         partialize: (s) => ({
           queue: compactPersistedQueue(s.queue, s.index),
           index: persistedQueueIndex(s.queue, s.index),
@@ -600,11 +622,16 @@ export const usePlaybackStore = isFloatingPlayerWindow()
           queueContinuation: s.queueContinuation,
           volume: s.volume,
           muted: s.muted,
+          position: Math.floor(s.position),
         }),
         onRehydrateStorage: () => (state) => {
           if (!state) return;
           state.playing = false;
-          state.position = 0;
+          state.resumeAt = resumePoint(
+            state.queue[state.index],
+            state.position,
+          );
+          state.position = state.resumeAt?.seconds ?? 0;
           state.duration = state.queue[state.index]?.duration ?? 0;
           state.status = "idle";
           state.streamUrl = undefined;
@@ -613,6 +640,16 @@ export const usePlaybackStore = isFloatingPlayerWindow()
         },
       }),
     );
+
+// A launch resume is for the restored track only, and only until the
+// listener takes over: a seek, or a different current track, drops it.
+usePlaybackStore.subscribe((s) => {
+  const r = s.resumeAt;
+  if (!r) return;
+  if (s.pendingSeek !== undefined || s.queue[s.index]?.videoId !== r.videoId) {
+    usePlaybackStore.setState({ resumeAt: undefined });
+  }
+});
 
 /** Convenience selector for the currently-playing track (or undefined). */
 export function currentTrack(state: PlaybackState): QueueTrack | undefined {
