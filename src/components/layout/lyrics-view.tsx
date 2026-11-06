@@ -26,6 +26,7 @@ import {
 import { usePlaybackStore } from "@/lib/store/playback";
 import { estimateLeadInOffset } from "@/lib/lyrics/auto-align";
 import { lineDir } from "@/lib/lyrics/text-dir";
+import { useLyricsSkip } from "@/lib/lyrics/skip";
 import type { QueueTrack } from "@/lib/store/playback";
 import { cn } from "@/lib/utils";
 
@@ -67,6 +68,7 @@ export type LyricsViewState = {
   availability: Record<LyricsSource, Availability>;
   /** Estimated lead-in in seconds; positive = lyrics fire later. */
   offset: number;
+  videoId: string | undefined;
 };
 
 /**
@@ -171,6 +173,7 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
     best,
     availability,
     offset: autoOffset,
+    videoId,
   };
 }
 
@@ -606,7 +609,12 @@ export function LyricsSourceButton({
   state: LyricsViewState;
   className?: string;
 }) {
-  const { pref, setPref, best, availability } = state;
+  const { pref, setPref, best, availability, videoId } = state;
+  const skipped = useLyricsSkip((s) =>
+    videoId ? s.byVideo[videoId] : undefined,
+  );
+  const skip = useLyricsSkip((s) => s.skip);
+  const reset = useLyricsSkip((s) => s.reset);
 
   return (
     <DropdownMenu>
@@ -638,6 +646,18 @@ export function LyricsSourceButton({
           </span>
           {pref === "auto" ? <CheckIcon className="size-4" /> : null}
         </DropdownMenuItem>
+        {/* The per-song escape: a pinned source is for every song, and
+            wrong words on one song should not cost the rest theirs. */}
+        {pref === "auto" && videoId && best ? (
+          <DropdownMenuItem onSelect={() => skip(videoId, best)}>
+            Wrong lyrics? Try another source
+          </DropdownMenuItem>
+        ) : null}
+        {pref === "auto" && videoId && skipped?.length ? (
+          <DropdownMenuItem onSelect={() => reset(videoId)}>
+            Use skipped sources again
+          </DropdownMenuItem>
+        ) : null}
         <DropdownMenuSeparator />
         {SOURCE_ORDER.map((s) => {
           const a = availability[s];
