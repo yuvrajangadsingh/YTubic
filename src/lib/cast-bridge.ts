@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { takeEndOfTrack } from "@/lib/sleep-timer";
 import { usePlaybackStore } from "@/lib/store/playback";
 import { useCastStore } from "@/lib/store/cast";
 import { castUrlFor, streamUrlFor } from "@/lib/stream";
@@ -76,7 +77,14 @@ export function useCastBridge(): void {
       if (s.state !== prev.state) pb.setPlaying(s.state === "playing");
       // The receiver reaching the end of a track is our cue to advance,
       // since the local element is paused and will never fire `ended`.
-      if (s.state === "idle" && prev.state === "playing") pb.next();
+      // A sleep timer set to the end of the track stops here instead.
+      if (
+        s.state === "idle" &&
+        prev.state === "playing" &&
+        !takeEndOfTrack()
+      ) {
+        pb.next();
+      }
     });
   }, [deviceId]);
   // What the receiver is confirmed to be holding. Re-LOADing the same id would

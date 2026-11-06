@@ -28,24 +28,39 @@ export const useSleepTimer = create<SleepTimer>()((set) => ({
  *  it pauses there, on the next track, and disarms. A skip by hand never
  *  comes through here, so it keeps the timer armed for the new track. */
 export function pauseIfSleepingAfterTrack(): void {
+  if (takeEndOfTrack()) usePlaybackStore.getState().setPlaying(false);
+}
+
+/** Disarm "end of track" if it is set, and say whether it was. Casting
+ *  uses this as is: a LOAD on the receiver always starts playing, so there
+ *  the queue stays on the finished track instead of moving on. */
+export function takeEndOfTrack(): boolean {
   const timer = useSleepTimer.getState();
-  if (!timer.afterTrack) return;
-  usePlaybackStore.getState().setPlaying(false);
+  if (!timer.afterTrack) return false;
   timer.clear();
+  return true;
+}
+
+/** Wall-clock check, not one long timeout: WebKit's timers stop while the
+ *  Mac sleeps, which would push the pause past the deadline after a wake. */
+const CHECK_MS = 15_000;
+
+/** Pause once the wall clock passes `endsAt`; returns the cleanup. */
+export function watchDeadline(endsAt: number): () => void {
+  const check = () => {
+    if (Date.now() < endsAt) return;
+    useSleepTimer.getState().clear();
+    // toggle, not setPlaying: while casting it pauses the receiver.
+    const pb = usePlaybackStore.getState();
+    if (pb.playing) pb.toggle();
+  };
+  const t = window.setInterval(check, CHECK_MS);
+  return () => window.clearInterval(t);
 }
 
 export function useSleepTimerEngine(): void {
   const endsAt = useSleepTimer((s) => s.endsAt);
-
   useEffect(() => {
-    if (endsAt === null) return;
-    const t = window.setTimeout(
-      () => {
-        usePlaybackStore.getState().setPlaying(false);
-        useSleepTimer.getState().clear();
-      },
-      Math.max(0, endsAt - Date.now()),
-    );
-    return () => window.clearTimeout(t);
+    if (endsAt !== null) return watchDeadline(endsAt);
   }, [endsAt]);
 }
