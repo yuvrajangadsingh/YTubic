@@ -12,6 +12,7 @@ import {
 } from "@/lib/stream";
 import { useLoudnessGain } from "@/lib/loudness";
 import { advanceAfterTrack } from "@/lib/sleep-timer";
+import { followSlot, type PlayingSlot } from "@/lib/playing-slot";
 import { usePlaybackStore, type QueueTrack } from "@/lib/store/playback";
 import { videoQualityTier } from "@/lib/video-quality-tier";
 import { isCasting, useCastStore } from "@/lib/store/cast";
@@ -246,13 +247,13 @@ export function useAudioEngine() {
   // changes and same-id duplicates at another queue index don't carry.
   const prevResolveKeyRef = useRef<{
     videoId?: string;
-    index: number;
+    slot: number;
     premiumOk: boolean;
   } | null>(null);
   const carrySeekRef = useRef<{ token: number; seconds: number } | null>(null);
   // Which queue slot the element's src belongs to; unset from the moment a
   // resolve drops the old src until the new one is installed.
-  const loadedSlotRef = useRef<{ videoId?: string; index: number } | null>(
+  const loadedSlotRef = useRef<{ videoId?: string; slot: number } | null>(
     null,
   );
   // Counts how many tracks have failed in a row without a successful
@@ -656,6 +657,12 @@ export function useAudioEngine() {
       return { videoId: t?.videoId, track: t, index: s.index };
     }),
   );
+  // The playing slot, which survives `index` shifting under it (an earlier
+  // row removed or moved). Everything below that means "this queue slot"
+  // keys on it, so editing the queue around a song never reloads it.
+  const slotRef = useRef<PlayingSlot>({ entry: track, index, videoId, id: 0 });
+  slotRef.current = followSlot(slotRef.current, track, index, videoId);
+  const slot = slotRef.current.id;
 
   // Substitute the streaming videoId via the user's per-track source
   // preference (Song ↔ Music Video). Subscribing here means the effect
@@ -833,13 +840,13 @@ export function useAudioEngine() {
     // request, so it breaks the carry.
     const prevKey = prevResolveKeyRef.current;
     const sameSlot =
-      !!prevKey && prevKey.videoId === videoId && prevKey.index === index;
+      !!prevKey && prevKey.videoId === videoId && prevKey.slot === slot;
     const sameTrack = sameSlot && prevKey.premiumOk === premiumOk;
     // The gate lifting on the same slot (Premium status landing after
     // launch) is not a gating event for a seek made while it was parked.
     const gateLifted = sameSlot && !prevKey.premiumOk && premiumOk;
     const posBefore = el.currentTime;
-    prevResolveKeyRef.current = { videoId, index, premiumOk };
+    prevResolveKeyRef.current = { videoId, slot, premiumOk };
     // Invalidate in-flight resolutions of ANY earlier run before the
     // early returns below: without this, gating (premium loss, empty
     // queue) leaves the previous token live and a stale streamUrlFor()
@@ -977,7 +984,7 @@ export function useAudioEngine() {
           console.debug("[audio] setting src for", videoId, "→", src);
         }
         el.src = src;
-        loadedSlotRef.current = { videoId, index };
+        loadedSlotRef.current = { videoId, slot };
         const st = usePlaybackStore.getState();
         st.setStreamUrl(src);
         const carry = carrySeekRef.current;
@@ -1083,17 +1090,19 @@ export function useAudioEngine() {
         usePlaybackStore.getState().setStatus("error", e.message);
         usePlaybackStore.getState().setPlaying(false);
       });
-    // `index` is in the deps so advancing to a different queue slot that
+    // `slot` is in the deps so advancing to a different queue slot that
     // holds the *same* videoId (a duplicate in a playlist, radio dupes)
     // still re-resolves and plays instead of stalling on "loading" —
-    // videoId/streamVideoId alone wouldn't change. Repeating a *single*
-    // track (repeat-one, or repeat-all on a 1-track queue) keeps the same
-    // index, so the store replays it via pendingSeek instead — see
+    // videoId/streamVideoId alone wouldn't change, and so that a row
+    // removed or moved above the song (which shifts `index`) doesn't.
+    // Repeating a *single* track (repeat-one, or repeat-all on a 1-track
+    // queue) keeps the same slot, so the store replays it via pendingSeek
+    // instead — see
     // `next()` in store/playback.ts. `premiumOk` so that gaining Premium
     // (sign-in, status re-check) re-resolves a track the gate parked.
     // `retryNonce` so the error handler can force a fresh stream-URL fetch
     // for the current track after a transient failure without changing id.
-  }, [streamVideoId, wantVideo, videoId, index, premiumOk, retryNonce]);
+  }, [streamVideoId, wantVideo, videoId, slot, premiumOk, retryNonce]);
 
   // Companion video: when the user picked the video version, stream the
   // high-res video-only DASH track into a muted element and keep it
@@ -1514,7 +1523,7 @@ export function useAudioEngine() {
     // Keyed to the same load generation as the resolve effect: a source
     // flip (song<->video) or an adjacent duplicate id starts a fresh load
     // that must get a fresh timer, not inherit one about to fire.
-  }, [videoId, streamVideoId, wantVideo, index, playing, retryNonce]);
+  }, [videoId, streamVideoId, wantVideo, slot, playing, retryNonce]);
 
   // Volume / mute follow store.
   const volume = usePlaybackStore((s) => s.volume);
@@ -2224,7 +2233,7 @@ export function useAudioEngine() {
         started:
           !!el &&
           loadedSlotRef.current?.videoId === t.videoId &&
-          loadedSlotRef.current?.index === s.index &&
+          loadedSlotRef.current?.slot === slotRef.current.id &&
           !el.paused &&
           el.readyState >= 3 &&
           !el.ended,
