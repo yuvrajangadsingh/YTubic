@@ -5,15 +5,17 @@ import { useAccounts } from "@/lib/store/accounts";
 import { useSettingsStore } from "@/lib/store/settings";
 
 /**
- * Tracks louder than this are turned down to it. YouTube's own reference is
- * -7 LKFS, and its attenuate-only rule changed nothing on the four tracks
+ * Tracks louder than this are turned down to it. YouTube Music's own reference
+ * is -7 LKFS, and attenuating to that changed nothing on the four tracks
  * measured (-7.58 to -14.22), so this sits where those actually differ.
  */
 const TARGET_LKFS = -14;
 const YOUTUBE_REFERENCE_LKFS = -7;
 
 /** Element gain from `playerConfig.audioConfig`. `loudnessDb` is the track
- *  relative to YouTube's reference. Never above 1: an element can't boost. */
+ *  relative to YouTube's reference. Only ever turns down: at full slider an
+ *  element has no room above 1, so boosting would make the same setting behave
+ *  differently at different volumes. */
 export function loudnessGain(audioConfig: unknown): number {
   const c = audioConfig as
     { loudnessDb?: unknown; loudnessTargetLkfs?: unknown } | null | undefined;
@@ -29,7 +31,9 @@ export function loudnessGain(audioConfig: unknown): number {
  *  track's answer lands the previous track's gain stays in place. */
 export function useLoudnessGain(videoId: string | undefined): number {
   const enabled = useSettingsStore((s) => s.normalizeVolume);
-  const account = useAccounts().data?.find((a) => a.isActive)?.id;
+  const active = useAccounts().data?.find((a) => a.isActive);
+  const account = active?.id;
+  const pageId = active?.pageId ?? null;
   const [gain, setGain] = useState(1);
   useEffect(() => {
     if (!enabled || !videoId || !account) {
@@ -37,7 +41,7 @@ export function useLoudnessGain(videoId: string | undefined): number {
       return;
     }
     let stale = false;
-    playerInfo(videoId, account).then(
+    playerInfo(videoId, account, pageId).then(
       (player) => {
         if (stale) return;
         const config = player?.playerConfig?.audioConfig;
@@ -58,6 +62,6 @@ export function useLoudnessGain(videoId: string | undefined): number {
     return () => {
       stale = true;
     };
-  }, [enabled, videoId, account]);
+  }, [enabled, videoId, account, pageId]);
   return gain;
 }

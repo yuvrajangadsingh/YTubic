@@ -161,7 +161,7 @@ export async function reportListen(
       );
       return;
     }
-    const player = await playerInfo(videoId, account);
+    const player = await playerInfo(videoId, account, pageId);
     const url = playbackPingUrl(
       player?.playbackTracking?.videostatsPlaybackUrl?.baseUrl,
       newCpn(),
