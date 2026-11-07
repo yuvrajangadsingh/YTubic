@@ -50,7 +50,7 @@ describe("nextSelectionLine", () => {
   it("announces a source that lands after the empty result", () => {
     const empty = nextSelectionLine(EMPTY, at("aaa", ""));
     expect(
-      nextSelectionLine(empty.state, at("aaa", "genius plain")).event,
+      nextSelectionLine(empty.state, at("aaa", "lrclib plain")).event,
     ).toBe("switch");
   });
 
@@ -68,7 +68,7 @@ describe("nextSelectionLine", () => {
 
   it("announces the user pinning a different source", () => {
     const auto = nextSelectionLine(EMPTY, at("aaa", "ytmusic timed"));
-    expect(nextSelectionLine(auto.state, at("aaa", "genius plain")).event).toBe(
+    expect(nextSelectionLine(auto.state, at("aaa", "lrclib plain")).event).toBe(
       "switch",
     );
   });
@@ -77,7 +77,7 @@ describe("nextSelectionLine", () => {
   // having the track, so the two must not share a key.
   it("keeps a pinned source's miss apart from nobody having it", () => {
     const auto = nextSelectionLine(EMPTY, at("aaa", "ytmusic timed"));
-    const pinnedMiss = nextSelectionLine(auto.state, at("aaa", "genius none"));
+    const pinnedMiss = nextSelectionLine(auto.state, at("aaa", "lrclib none"));
     expect(pinnedMiss.event).toBe("switch");
     expect(nextSelectionLine(pinnedMiss.state, at("aaa", "")).event).toBe(
       "none",
@@ -110,18 +110,18 @@ describe("selectionKey", () => {
   });
 
   it("stays silent while the pinned source is loading", () => {
-    expect(selectionKey("genius", null, "loading")).toBe("");
+    expect(selectionKey("lrclib", null, "loading")).toBe("");
   });
 
   it("calls a settled empty answer a miss", () => {
-    expect(selectionKey("genius", null, "settled")).toBe("genius none");
+    expect(selectionKey("lrclib", null, "settled")).toBe("lrclib none");
   });
 
   it("keeps a source that was never asked apart from a miss", () => {
-    expect(selectionKey("genius", null, "skipped")).toBe("genius skipped");
+    expect(selectionKey("lrclib", null, "skipped")).toBe("lrclib skipped");
   });
 
   it("keeps a source that failed apart from a miss", () => {
-    expect(selectionKey("genius", null, "failed")).toBe("genius failed");
+    expect(selectionKey("lrclib", null, "failed")).toBe("lrclib failed");
   });
 });

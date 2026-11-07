@@ -4,9 +4,9 @@ import { InnerTubeHttpError } from "@/lib/innertube/shared";
  * The one distinction every lyrics provider has to keep intact: "this track
  * has no lyrics" and "we could not find out" are different answers.
  *
- * They used to collapse. Genius wrapped every request in
- * `catch { return null }` and returned null for any non-OK status, so a DNS
- * blip and a Genius 403 both arrived as the same `null` a genuinely
+ * They used to collapse. A provider (Genius, since removed) wrapped every
+ * request in `catch { return null }` and returned null for any non-OK status,
+ * so a DNS blip and a 403 both arrived as the same `null` a genuinely
  * lyric-less track produces. React Query stores `null` as
  * a SUCCESS, `App.tsx` dehydrates successes into IndexedDB and
  * `query-client.ts` keeps them for 24h (staleTime an hour), so one dropped
@@ -45,8 +45,6 @@ export class LyricsRateLimitError extends Error {
  * entry it is about to match.
  */
 export const LYRICS_OPS = Object.freeze([
-  "Genius search",
-  "Genius page",
   "LRCLIB /get",
   "LRCLIB /search",
   "YouTube Music browse",
