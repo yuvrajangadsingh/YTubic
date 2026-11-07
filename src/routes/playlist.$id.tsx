@@ -325,16 +325,22 @@ function PlaylistPageView() {
           openedFromArtist
             ? undefined
             : () => {
-                if (tracks.length > 0) {
-                  usePlaybackStore.getState().playShelfItems(tracks, 0);
+                // With a filter on, Play means the tracks it shows, like
+                // Shuffle (both wait for every page to load).
+                const list = normalizedQuery ? visibleTracks : tracks;
+                if (normalizedQuery && query.hasNextPage) return;
+                if (list.length > 0) {
+                  // Off first: with shuffle on, building the queue would
+                  // shuffle what Play promised in order.
                   usePlaybackStore.getState().setShuffle(false);
+                  usePlaybackStore.getState().playShelfItems(list, 0);
                 }
               }
         }
         onShuffle={
           openedFromArtist ? undefined : () => void shufflePlaylist()
         }
-        shuffleDisabled={
+        playbackDisabled={
           !!normalizedQuery && (visibleTracks.length === 0 || query.hasNextPage)
         }
         actions={
