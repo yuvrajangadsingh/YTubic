@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { correctedDuration, shouldSkipOutro } from "@/lib/outro";
+import { correctedDuration, shouldSkipOutro, trackEndLatch } from "@/lib/outro";
 
 describe("shouldSkipOutro", () => {
   it("skips deep into a long dead tail (No Guidance 8:41, vocals end ~4:35)", () => {
@@ -59,5 +59,37 @@ describe("correctedDuration across a song/video pair", () => {
 
   it("leaves the element alone when there is no reference", () => {
     expect(correctedDuration(undefined, DOUBLED)).toBe(DOUBLED);
+  });
+});
+
+describe("trackEndLatch", () => {
+  const setup = () => {
+    let advances = 0;
+    return { latch: trackEndLatch(() => advances++), count: () => advances };
+  };
+  const playing = { ended: false, paused: false };
+  const atEnd = { ended: true, paused: false };
+
+  it("advances once on a normal end, which gets both signals", () => {
+    const { latch, count } = setup();
+    latch.onTimeUpdate(playing);
+    latch.onTimeUpdate(atEnd);
+    latch.onEnded();
+    expect(count()).toBe(1);
+  });
+
+  it("advances on a replay's end, which never gets the ended event", () => {
+    const { latch, count } = setup();
+    latch.onEnded();
+    latch.onTimeUpdate({ ended: true, paused: true });
+    latch.onTimeUpdate(playing);
+    latch.onTimeUpdate(atEnd);
+    expect(count()).toBe(2);
+  });
+
+  it("does nothing for an element parked at the end, paused", () => {
+    const { latch, count } = setup();
+    latch.onTimeUpdate({ ended: true, paused: true });
+    expect(count()).toBe(0);
   });
 });

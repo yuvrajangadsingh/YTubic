@@ -29,7 +29,7 @@ import {
 import { fetchPanelDuration } from "@/lib/innertube/radio";
 import { pickThumbnail } from "@/components/shared/thumbnail";
 import { useLyricsSources } from "@/lib/lyrics/sources";
-import { correctedDuration, shouldSkipOutro } from "@/lib/outro";
+import { correctedDuration, shouldSkipOutro, trackEndLatch } from "@/lib/outro";
 import { appLog, mediaState } from "@/lib/app-log";
 
 /**
@@ -395,6 +395,8 @@ export function useAudioEngine() {
     if (!el) return;
     const store = usePlaybackStore.getState;
 
+    const trackEnd = trackEndLatch(advanceAfterTrack);
+    const onEnded = trackEnd.onEnded;
     const onTimeUpdate = () => {
       store().setPosition(el.currentTime);
       // End-guard for the double-length m4a header bug: correctedDuration
@@ -427,6 +429,8 @@ export function useAudioEngine() {
         el.currentTime = 0;
         advanceAfterTrack();
       }
+      // Last: advancing swaps the track these checks read.
+      trackEnd.onTimeUpdate(el);
     };
     const onDurationChange = () => {
       if (Number.isFinite(el.duration) && el.duration > 0) {
@@ -456,9 +460,6 @@ export function useAudioEngine() {
       }
     };
     const onProgress = () => syncSeekableDuration();
-    const onEnded = () => {
-      advanceAfterTrack();
-    };
     // External pause/play — the system Now Playing widget or WebKit's
     // built-in media session can pause the element directly, bypassing
     // the store, which left the UI showing a stale playing state. Sync
