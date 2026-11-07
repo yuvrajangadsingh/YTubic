@@ -12,8 +12,9 @@ time; they are quoted, not rounded up.
 ## 2026-11-07 · Genius removed as a lyrics source
 
 **Decided:** delete the provider, its allowlist entry and its README and About
-mentions. Sources are now YouTube Music and LRCLIB. Lyrics queries no longer
-refetch on window focus.
+mentions. Sources are now YouTube Music and LRCLIB. A failed lyrics query
+refetches on window focus only after a network or 5xx failure, not after a
+rate limit or a 4xx.
 
 **Why:** every Genius search in the M5 log since Nov 6 answered HTTP 403 (276
 of 276, then about 20 more in the QA pass on Nov 7), and the app's own
