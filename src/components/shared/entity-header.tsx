@@ -10,7 +10,7 @@ type Props = {
   round?: boolean;
   onPlay?: () => void;
   onShuffle?: () => void;
-  shuffleDisabled?: boolean;
+  playbackDisabled?: boolean;
   /** Extra buttons rendered after Play/Shuffle — used for entity-
    *  specific actions (Pin playlist, Follow artist, etc.). */
   actions?: ReactNode;
@@ -36,7 +36,7 @@ export function EntityHeader({
   round = false,
   onPlay,
   onShuffle,
-  shuffleDisabled,
+  playbackDisabled,
   actions,
   toolbar,
   keepSubtitleInCompact = false,
@@ -54,7 +54,7 @@ export function EntityHeader({
       round,
       onPlay,
       onShuffle,
-      shuffleDisabled,
+      playbackDisabled,
       actions,
       toolbar,
       keepSubtitleInCompact,
@@ -65,7 +65,7 @@ export function EntityHeader({
     keepSubtitleInCompact,
     onPlay,
     onShuffle,
-    shuffleDisabled,
+    playbackDisabled,
     round,
     setConfig,
     subtitle,
