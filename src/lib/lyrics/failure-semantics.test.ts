@@ -8,6 +8,7 @@ import {
   LyricsTimeoutError,
   shouldRetryLyricsQuery,
   type LyricsOp,
+  shouldRefetchLyricsOnFocus,
 } from "./errors";
 
 // `vi.resetModules()` gives the providers a fresh copy of ./errors, so the
@@ -21,7 +22,7 @@ import {
  * React Query stores `null` as a success, App.tsx dehydrates successes into
  * IndexedDB and query-client.ts keeps them for a day, so a swallowed 503 was
  * being written to disk and replayed as an authoritative "No lyrics found."
- * Genius did this, on transport errors AND on plain HTTP errors. LRCLIB already had the right contract and is the control here.
+ * Genius (since removed) did this, on transport errors AND on plain HTTP errors. LRCLIB already had the right contract and is the control here.
  *
  * The other half of the rule matters just as much: a 404 and an empty result
  * set are real answers and must stay `null`, or every track without lyrics
@@ -53,11 +54,9 @@ async function setup(route: Route) {
       typeof r.body === "string" ? r.body : JSON.stringify(r.body ?? {});
     return Promise.resolve(new Response(body, { status: r.status ?? 200 }));
   });
-  const genius = await import("./genius");
   const lrclib = await import("./lrclib");
   const errors = await import("./errors");
   return {
-    ...genius,
     ...lrclib,
     RateLimit: errors.LyricsRateLimitError,
   };
@@ -65,30 +64,9 @@ async function setup(route: Route) {
 
 const TRACK = { title: "Bohemian Rhapsody", artist: "Queen" };
 
-const geniusHit = {
-  response: {
-    hits: [
-      {
-        type: "song",
-        result: {
-          url: "https://genius.com/Queen-bohemian-rhapsody-lyrics",
-          title: "Bohemian Rhapsody",
-          primary_artist: { name: "Queen" },
-          lyrics_state: "complete",
-        },
-      },
-    ],
-  },
-};
-
 beforeEach(() => vi.clearAllMocks());
 
 describe("a transport failure is not 'no lyrics'", () => {
-  it("Genius throws instead of resolving null", async () => {
-    const { fetchGeniusLyrics } = await setup(() => "reject");
-    await expect(fetchGeniusLyrics(TRACK)).rejects.toThrow(/Network request/);
-  });
-
   it("LRCLIB already did (the control)", async () => {
     const { fetchLrclibLyrics } = await setup(() => "reject");
     await expect(fetchLrclibLyrics(TRACK)).rejects.toThrow(/Network request/);
@@ -96,28 +74,60 @@ describe("a transport failure is not 'no lyrics'", () => {
 });
 
 describe("an HTTP error is not 'no lyrics' either", () => {
-  it("Genius throws on a 503 from the search endpoint", async () => {
-    const { fetchGeniusLyrics } = await setup(() => ({ status: 503 }));
-    await expect(fetchGeniusLyrics(TRACK)).rejects.toThrow(/Genius search 503/);
+  it("LRCLIB throws on a 503", async () => {
+    const { fetchLrclibLyrics } = await setup(() => ({ status: 503 }));
+    await expect(fetchLrclibLyrics(TRACK)).rejects.toThrow(/LRCLIB/);
   });
-
-  it("Genius throws on a 503 from the song page", async () => {
-    const { fetchGeniusLyrics } = await setup((url) =>
-      url.includes("/api/search")
-        ? { body: geniusHit }
-        : { status: 503, body: "" },
-    );
-    await expect(fetchGeniusLyrics(TRACK)).rejects.toThrow(/Genius page 503/);
-  });
-
 });
 
 describe("a refusal is not 'no lyrics', and must not be retried at once", () => {
   it("a 429 is a rate limit, not a plain error", async () => {
-    const { fetchGeniusLyrics, RateLimit } = await setup(() => ({
+    const { fetchLrclibLyrics, RateLimit } = await setup(() => ({
       status: 429,
     }));
-    await expect(fetchGeniusLyrics(TRACK)).rejects.toBeInstanceOf(RateLimit);
+    await expect(fetchLrclibLyrics(TRACK)).rejects.toBeInstanceOf(RateLimit);
+  });
+
+  it("a rate limit wins when the other LRCLIB endpoint failed too", async () => {
+    const { fetchLrclibLyrics, RateLimit } = await setup((url) =>
+      url.includes("/api/get") ? { status: 503 } : { status: 429 },
+    );
+    await expect(fetchLrclibLyrics(TRACK)).rejects.toBeInstanceOf(RateLimit);
+  });
+
+  it("refetches on focus after a network or server failure only", () => {
+    const failed = (error: unknown) => ({
+      state: { status: "error", data: undefined, error },
+    });
+    expect(shouldRefetchLyricsOnFocus(failed(new Error("offline")))).toBe(true);
+    expect(
+      shouldRefetchLyricsOnFocus(
+        failed(new LyricsHttpError(503, "LRCLIB /get")),
+      ),
+    ).toBe(true);
+    expect(
+      shouldRefetchLyricsOnFocus(
+        failed(new LyricsHttpError(403, "LRCLIB /get")),
+      ),
+    ).toBe(false);
+    expect(
+      shouldRefetchLyricsOnFocus(failed(new LyricsRateLimitError("gated"))),
+    ).toBe(false);
+    expect(
+      shouldRefetchLyricsOnFocus(
+        failed(new InnerTubeHttpError("next", 403, "")),
+      ),
+    ).toBe(false);
+    expect(
+      shouldRefetchLyricsOnFocus(
+        failed(new InnerTubeHttpError("next", 503, "")),
+      ),
+    ).toBe(true);
+    expect(
+      shouldRefetchLyricsOnFocus({
+        state: { status: "success", data: null, error: null },
+      }),
+    ).toBe(false);
   });
 
   it("shouldRetryLyricsQuery refuses to re-run a rate limit", () => {
@@ -132,22 +142,6 @@ describe("a refusal is not 'no lyrics', and must not be retried at once", () => 
 });
 
 describe("a real answer is still an answer", () => {
-  it("Genius returns null when no hit matches the request", async () => {
-    const { fetchGeniusLyrics } = await setup(() => ({
-      body: { response: { hits: [] } },
-    }));
-    await expect(fetchGeniusLyrics(TRACK)).resolves.toBeNull();
-  });
-
-  it("Genius returns null when the song page is gone (404)", async () => {
-    const { fetchGeniusLyrics } = await setup((url) =>
-      url.includes("/api/search")
-        ? { body: geniusHit }
-        : { status: 404, body: "" },
-    );
-    await expect(fetchGeniusLyrics(TRACK)).resolves.toBeNull();
-  });
-
   it("LRCLIB returns null for a 404 plus an empty search", async () => {
     const { fetchLrclibLyrics } = await setup((url) =>
       url.includes("/api/get") ? { status: 404 } : { body: [] },
@@ -163,8 +157,8 @@ describe("a real answer is still an answer", () => {
 describe("describeLyricsError", () => {
   it("names the request and the status from our own typed error", () => {
     expect(
-      describeLyricsError(new LyricsHttpError(503, "Genius search")),
-    ).toBe("Genius search HTTP 503");
+      describeLyricsError(new LyricsHttpError(503, "LRCLIB /search")),
+    ).toBe("LRCLIB /search HTTP 503");
     expect(describeLyricsError(new LyricsHttpError(404, "LRCLIB /get"))).toBe(
       "LRCLIB /get HTTP 404",
     );
@@ -175,16 +169,14 @@ describe("describeLyricsError", () => {
   it("does not read a status out of a plain message", () => {
     expect(
       describeLyricsError(
-        new Error("Genius HTTP 503: <html>upstream said no</html>"),
+        new Error("LRCLIB HTTP 503: <html>upstream said no</html>"),
       ),
     ).toBe("failed");
   });
 
   it("names a rate limit without quoting the message", () => {
     expect(
-      describeLyricsError(
-        new LyricsRateLimitError("gated for token abc123"),
-      ),
+      describeLyricsError(new LyricsRateLimitError("gated for token abc123")),
     ).toBe("rate limited");
   });
 
@@ -230,7 +222,7 @@ describe("describeLyricsError", () => {
       'server said {"key":"secretToken"} then HTTP 503',
     ],
     ["a bare token", "rejected token sk_live_secretToken0123456789"],
-    ["an address", "Genius rejected signup for nobody@example.com"],
+    ["an address", "LRCLIB rejected signup for nobody@example.com"],
     [
       "a parse-shaped message",
       "Unexpected token 's', \"secretToken\" is not valid JSON",
@@ -260,9 +252,9 @@ describe("describeLyricsError", () => {
       get: () => (reads++ === 0 ? 503 : "secretToken@example.com"),
     });
     Object.defineProperty(hostile, "op", {
-      get: () => (reads++ === 1 ? "Genius page" : "secretToken@example.com"),
+      get: () => (reads++ === 1 ? "LRCLIB /get" : "secretToken@example.com"),
     });
-    expect(describeLyricsError(hostile)).toBe("Genius page HTTP 503");
+    expect(describeLyricsError(hostile)).toBe("LRCLIB /get HTTP 503");
     expect(reads).toBe(2);
   });
 
@@ -283,7 +275,7 @@ describe("describeLyricsError", () => {
       },
     });
     expect(describeLyricsError(hostile)).toBe("HTTP 503");
-    expect(LYRICS_OPS[0]).toBe("Genius search");
+    expect(LYRICS_OPS[0]).toBe("LRCLIB /get");
   });
 
   it("does not consult an Array.prototype.find a getter swapped in", () => {

@@ -4,9 +4,9 @@ import { InnerTubeHttpError } from "@/lib/innertube/shared";
  * The one distinction every lyrics provider has to keep intact: "this track
  * has no lyrics" and "we could not find out" are different answers.
  *
- * They used to collapse. Genius wrapped every request in
- * `catch { return null }` and returned null for any non-OK status, so a DNS
- * blip and a Genius 403 both arrived as the same `null` a genuinely
+ * They used to collapse. A provider (Genius, since removed) wrapped every
+ * request in `catch { return null }` and returned null for any non-OK status,
+ * so a DNS blip and a 403 both arrived as the same `null` a genuinely
  * lyric-less track produces. React Query stores `null` as
  * a SUCCESS, `App.tsx` dehydrates successes into IndexedDB and
  * `query-client.ts` keeps them for 24h (staleTime an hour), so one dropped
@@ -45,8 +45,6 @@ export class LyricsRateLimitError extends Error {
  * entry it is about to match.
  */
 export const LYRICS_OPS = Object.freeze([
-  "Genius search",
-  "Genius page",
   "LRCLIB /get",
   "LRCLIB /search",
   "YouTube Music browse",
@@ -146,6 +144,24 @@ const AUTO_RETRIES = 1;
  * `TError` from this predicate, and widening it here would widen every
  * consumer of `queries[s].error` along with it.
  */
+/** Focus refetch for a lyrics query that failed with nothing to show: worth
+ *  it after a network or server failure (an offline launch), not after a
+ *  refusal or a 4xx, which the next focus would only repeat. */
+export function shouldRefetchLyricsOnFocus(query: {
+  state: { status: string; data: unknown; error: unknown };
+}): boolean {
+  const { status, data, error } = query.state;
+  if (status !== "error" || data !== undefined) return false;
+  if (error instanceof LyricsRateLimitError) return false;
+  // Both our providers' HTTP errors and YouTube Music's own (the ytmusic
+  // source goes through InnerTube).
+  const httpStatus =
+    error instanceof LyricsHttpError || error instanceof InnerTubeHttpError
+      ? error.status
+      : undefined;
+  return !(httpStatus !== undefined && httpStatus < 500);
+}
+
 export function shouldRetryLyricsQuery(
   failureCount: number,
   error: Error,

@@ -41,7 +41,7 @@ Next track is prefetched. 64% of plays start from disk and are instant.
 - **Auth writes are atomic** (temp + fsync + rename) with a wall-clock refresh schedule that survives sleep.
 - **Resolve hedge at 12s**: a signed-in resolve still running at 12s gets an anonymous one raced beside it; an anonymous winner is served but never kept as the cached copy.
 - **Plays before prefetch**: prefetch resolves take one slot and yield to plays; a play waiting on a queued prefetch promotes it.
-- **Lyrics**: YouTube Music's own lyrics first (keyed by videoId), then LRCLIB, Genius; every result passes a gate that rejects scraped site navigation. Upstream's scorer rewrite was measured and rejected.
+- **Lyrics**: YouTube Music's own lyrics first (keyed by videoId), then LRCLIB; every result passes a gate that rejects scraped site navigation. Upstream's scorer rewrite was measured and rejected.
 - **Video match gates**: title (with artist tokens stripped), artist, and a duration window plus a 1.5x ratio ceiling. No swap beats a wrong swap.
 - **Storm breaker**: if the element flips play/pause 8 times in a second, the app goes silent for 5s and hard-resets the element if the flipping persists.
 - **WebKit occlusion detection is off** for the main window: a window on another Space was being marked hidden, which froze rendering, throttled timers and swallowed media keys.

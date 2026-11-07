@@ -1,13 +1,13 @@
 import { useEffect } from "react";
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { fetchLrclibLyrics } from "@/lib/lyrics/lrclib";
-import { fetchGeniusLyrics } from "@/lib/lyrics/genius";
 import { fetchYtMusicLyrics } from "@/lib/lyrics/ytmusic";
 import { rejectSiteChrome } from "@/lib/lyrics/plausibility";
 import { useLyricsSkip } from "@/lib/lyrics/skip";
 import {
   describeLyricsError,
   LyricsTimeoutError,
+  shouldRefetchLyricsOnFocus,
   shouldRetryLyricsQuery,
 } from "@/lib/lyrics/errors";
 import { appLog } from "@/lib/app-log";
@@ -15,19 +15,18 @@ import { cleanTrackTitle, lyricsArtist } from "@/lib/track-meta";
 import type { Lyrics } from "@/lib/lyrics/types";
 import type { QueueTrack } from "@/lib/store/playback";
 
-export type LyricsSource = "ytmusic" | "lrclib" | "genius";
+export type LyricsSource = "ytmusic" | "lrclib";
 
 /**
  * YouTube Music leads because it is the only source keyed on the videoId
  * rather than on a fuzzy title/artist string: it structurally cannot hand
  * back another song's words, and the words it has are line-synced.
  */
-export const SOURCE_ORDER: LyricsSource[] = ["ytmusic", "lrclib", "genius"];
+export const SOURCE_ORDER: LyricsSource[] = ["ytmusic", "lrclib"];
 
 export const SOURCE_LABELS: Record<LyricsSource, string> = {
   ytmusic: "YouTube Music",
   lrclib: "LRCLIB",
-  genius: "Genius",
 };
 
 const ONE_HOUR = 60 * 60 * 1000;
@@ -37,7 +36,7 @@ const ONE_HOUR = 60 * 60 * 1000;
  *  query in `isLoading` forever — the fetch never resolved, so
  *  `retry: 1` never fired and the panel sat on "Loading lyrics…"
  *  until a track change. The budget covers a provider's WHOLE call
- *  chain (Genius does a search and then a page fetch), so it's
+ *  chain (LRCLIB can do a get and then a search), so it's
  *  deliberately roomier than a single-request timeout would be. */
 const PROVIDER_TIMEOUT_MS = 8_000;
 
@@ -124,7 +123,7 @@ export function pickBest(
  * "No lyrics found." instead of hanging on one dead source. An errored
  * source has `data === undefined`, so it is skipped by both passes below
  * and the remaining sources still answer — a YouTube Music outage degrades
- * to the other two rather than blanking the panel.
+ * to LRCLIB rather than blanking the panel.
  */
 export function useLyricsSources(
   track: QueueTrack | undefined,
@@ -149,7 +148,7 @@ export function useLyricsSources(
   // Deliberately NOT applied to YouTube Music: that lookup is keyed on the
   // videoId, so there is no title to be ambiguous about. One track here
   // proves the difference — "Aarzu (with Asim Azhar)" carries no artist at
-  // all, so both text providers stay disabled, and YTM returns 47
+  // all, so the text provider stays disabled, and YTM returns 47
   // line-synced lines for it.
   const verifiable = !!artistName?.trim();
   // The two enablement conditions, named once: the settled check below
@@ -173,6 +172,7 @@ export function useLyricsSources(
     enabled: askYtMusic,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
+    refetchOnWindowFocus: shouldRefetchLyricsOnFocus,
   });
 
   // v2: matching semantics changed (artist-less tracks are no longer
@@ -217,30 +217,12 @@ export function useLyricsSources(
     enabled: askByText,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
-  });
-
-  const genius = useQuery({
-    // v4: site-chrome gate; orphan v3 entries that bypass it from the cache.
-    queryKey: ["lyrics", "genius-v4", title, artistName],
-    queryFn: () =>
-      logAttempt("genius", () =>
-        fetchGeniusLyrics(
-          {
-            title: title!,
-            artist: artistName,
-          },
-          lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
-        ).then(rejectSiteChrome("Genius")),
-      ),
-    enabled: askByText,
-    staleTime: ONE_HOUR,
-    retry: shouldRetryLyricsQuery,
+    refetchOnWindowFocus: shouldRefetchLyricsOnFocus,
   });
 
   const queries: Record<LyricsSource, UseQueryResult<Lyrics | null>> = {
     ytmusic,
     lrclib,
-    genius,
   };
 
   const skipped = useLyricsSkip((s) =>

@@ -685,7 +685,11 @@ export function LyricsSourceButton({
             Wrong lyrics? Try another source
           </DropdownMenuItem>
         ) : null}
-        {pref === "auto" && videoId && skipped?.length ? (
+        {/* Only skips of sources that still exist: a saved one for a removed
+            provider would offer a reset that does nothing. */}
+        {pref === "auto" &&
+        videoId &&
+        skipped?.some((s) => SOURCE_ORDER.includes(s)) ? (
           <DropdownMenuItem onSelect={() => reset(videoId)}>
             Use skipped sources again
           </DropdownMenuItem>
