@@ -16,6 +16,8 @@ export type EntityHeaderConfig = {
   round: boolean;
   onPlay?: () => void;
   onShuffle?: () => void;
+  /** Shown but not pressable, e.g. while a filter matches nothing. */
+  shuffleDisabled?: boolean;
   actions?: ReactNode;
   toolbar?: ReactNode;
   keepSubtitleInCompact?: boolean;

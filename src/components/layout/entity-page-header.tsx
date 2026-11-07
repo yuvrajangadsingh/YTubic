@@ -289,7 +289,11 @@ const HeaderActions = memo(function HeaderActions({
         </Button>
       ) : null}
       {config.onShuffle ? (
-        <Button variant="outline" onClick={config.onShuffle}>
+        <Button
+          variant="outline"
+          onClick={config.onShuffle}
+          disabled={config.shuffleDisabled}
+        >
           <ShuffleIcon />
           Shuffle
         </Button>
