@@ -192,11 +192,19 @@ function parse(word: string, s: Script): Akshara[] {
 
 /** Hindi and Punjabi don't say a word's last inherent vowel (kar, not kara), or
  *  one between two pronounced syllables (shikva, not shikava). A single letter
- *  keeps it (na), and so does a letter right after a cluster (mitra, zindagi). */
+ *  keeps it (na), a final r or y after a cluster keeps it (mitra), and a letter
+ *  right after a nasal cluster keeps it mid-word (zindagi). */
 function deleteSchwas(a: Akshara[]): void {
   const last = a.length - 1;
-  const clusterBeforeLast = last > 0 && a[last - 1].vowel === "";
-  if (last > 0 && a[last].inherent && !clusterBeforeLast) a[last].vowel = "";
+  // After a cluster the vowel stays only in the Sanskrit shapes: a t or d
+  // before a final r (mitra, chandra) or a final y (satya). vaqt, dard,
+  // fikr and umr drop it like any other word.
+  const cluster = last > 0 && a[last - 1].vowel === "";
+  const keepsFinal =
+    cluster &&
+    (a[last].consonant === "y" ||
+      (a[last].consonant === "r" && /^d?[td]h?$/.test(a[last - 1].consonant)));
+  if (last > 0 && a[last].inherent && !keepsFinal) a[last].vowel = "";
   for (let i = last - 1; i >= 1; i--) {
     if (!a[i].inherent || a[i].nasal) continue;
     if (a[i - 1].nasal) continue;
@@ -211,11 +219,23 @@ function spell(a: Akshara[], s: Script): string {
     // Word-final long vowels are written short in the usual spelling (mera,
     // meri, tu). Tamil keeps them.
     let vowel = x.vowel;
-    if (end && s.schwaDeletion) {
+    const nasalEnd = end && x.nasal && s.schwaDeletion;
+    if (nasalEnd && vowel === "e") {
+      // A final nasal e is written the way it sounds (mein, not men).
+      out += (x.doubled ? x.consonant[0] : "") + x.consonant + "ein";
+      return;
+    }
+    // A final long aa keeps its length when nasal (maa, haan, not man).
+    if (end && s.schwaDeletion && !(nasalEnd && vowel === "aa")) {
       vowel = { aa: "a", ee: "i", oo: "u" }[vowel] ?? vowel;
     }
     out += (x.doubled ? x.consonant[0] : "") + x.consonant + vowel;
     if (!x.nasal) return;
+    // A one-letter maa: the m already carries the nasal. Longer words keep
+    // the n (aasmaan, armaan).
+    if (nasalEnd && vowel === "aa" && a.length === 1 && x.consonant === "m") {
+      return;
+    }
     // A final nasalized u is barely voiced (saanu, tu), and a nasal takes the
     // lips' shape before them (kambal).
     if (end && vowel === "u") return;
