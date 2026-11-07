@@ -454,11 +454,22 @@ function QueueRow({
     <PlayIcon className="size-4 fill-current" />
   );
 
+  // The row buttons exist only while the row is hovered or has focus. Hidden
+  // ones were still pressed: WebKit sends an AX press on a role="button" row
+  // to its first descendant button, visible or not (QA L3).
+  const [showActions, setShowActions] = useState(false);
+
   return (
     <div
       role="button"
       tabIndex={0}
       draggable={draggable}
+      onMouseEnter={() => setShowActions(true)}
+      onMouseLeave={() => setShowActions(false)}
+      onFocus={() => setShowActions(true)}
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget)) setShowActions(false);
+      }}
       onClick={onActivate}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
@@ -552,25 +563,19 @@ function QueueRow({
         </span>
       </div>
 
-      {/* Row buttons are `invisible` until the row is hovered or focused:
-          zero width alone left them in the accessibility tree, where an
-          AX press on the row hit Play next instead of the row (QA L3).
-          Duration + remove. The remove button has zero width by
-          default — `w-0 overflow-hidden opacity-0` — and animates to
-          `w-6 + ml-1` on row hover, sliding in from the right and
-          pushing the duration leftwards instead of being permanently
-          reserved space that's just invisible. */}
+      {/* Duration, then the row buttons while the row is hovered or
+          focused (see showActions). */}
       <div className="flex items-center">
         <span className="text-xs tabular-nums text-muted-foreground">
           {formatDuration(track.duration)}
         </span>
-        {onPlayNext && (
+        {showActions && onPlayNext && (
           <Button
             variant="ghost"
             size="icon-xs"
             aria-label="Play next"
             title="Play next"
-            className="invisible w-0 overflow-hidden opacity-0 transition-[width,opacity,margin] duration-150 group-hover:visible group-hover:ml-1 group-hover:w-6 group-hover:opacity-100 group-focus-within:visible group-focus-within:ml-1 group-focus-within:w-6 group-focus-within:opacity-100"
+            className="ml-1"
             // The row plays on Enter and Space; this button's own keys stay its own.
             onKeyDown={(e) => e.stopPropagation()}
             onClick={(e) => {
@@ -581,12 +586,12 @@ function QueueRow({
             <ListStartIcon />
           </Button>
         )}
-        {onRemove && (
+        {showActions && onRemove && (
           <Button
             variant="ghost"
             size="icon-xs"
             aria-label="Remove from queue"
-            className="invisible w-0 overflow-hidden opacity-0 transition-[width,opacity,margin] duration-150 group-hover:visible group-hover:ml-1 group-hover:w-6 group-hover:opacity-100 group-focus-within:visible group-focus-within:ml-1 group-focus-within:w-6 group-focus-within:opacity-100"
+            className="ml-1"
             // The row plays on Enter and Space; this button's own keys stay its own.
             onKeyDown={(e) => e.stopPropagation()}
             onClick={(e) => {
