@@ -26,7 +26,6 @@ const CREDITS: { name: string; role: string; url: string }[] = [
     url: "https://github.com/yt-dlp/yt-dlp",
   },
   { name: "LRCLIB", role: "synced lyrics", url: "https://lrclib.net" },
-  { name: "Musixmatch", role: "lyrics", url: "https://www.musixmatch.com" },
   { name: "Genius", role: "lyrics", url: "https://genius.com" },
   { name: "Tauri", role: "app shell", url: "https://tauri.app" },
   { name: "shadcn/ui", role: "components", url: "https://ui.shadcn.com" },

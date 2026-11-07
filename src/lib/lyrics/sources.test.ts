@@ -13,8 +13,7 @@ describe("pickBest", () => {
   const data: Partial<Record<LyricsSource, Lyrics | null>> = {
     ytmusic: plain,
     lrclib: timed,
-    musixmatch: timed,
-    genius: plain,
+    genius: timed,
   };
   const get = (s: LyricsSource) => data[s];
 
@@ -23,9 +22,9 @@ describe("pickBest", () => {
   });
 
   it("passes over skipped sources, timed first", () => {
-    expect(pickBest(get, ["lrclib"])).toBe("musixmatch");
-    expect(pickBest(get, ["lrclib", "musixmatch"])).toBe("ytmusic");
-    expect(pickBest(get, ["ytmusic", "lrclib", "musixmatch", "genius"])).toBe(
+    expect(pickBest(get, ["lrclib"])).toBe("genius");
+    expect(pickBest(get, ["lrclib", "genius"])).toBe("ytmusic");
+    expect(pickBest(get, ["ytmusic", "lrclib", "genius"])).toBe(
       null,
     );
   });
@@ -35,18 +34,18 @@ describe("useLyricsSkip", () => {
   it("keeps the 200 most recently touched tracks", () => {
     const { skip } = useLyricsSkip.getState();
     for (let i = 0; i < 205; i++) skip(`v${i}`, "lrclib");
-    skip("v0", "musixmatch");
+    skip("v0", "genius");
     const byVideo = useLyricsSkip.getState().byVideo;
     expect(Object.keys(byVideo)).toHaveLength(200);
     // v0..v5 fell off; v0 came back as the newest.
     expect(byVideo.v5).toBeUndefined();
     expect(byVideo.v6).toEqual(["lrclib"]);
-    expect(byVideo.v0).toEqual(["musixmatch"]);
+    expect(byVideo.v0).toEqual(["genius"]);
     expect(byVideo.v204).toEqual(["lrclib"]);
-    skip("v204", "musixmatch");
+    skip("v204", "genius");
     expect(useLyricsSkip.getState().byVideo.v204).toEqual([
       "lrclib",
-      "musixmatch",
+      "genius",
     ]);
     useLyricsSkip.getState().reset("v204");
     expect(useLyricsSkip.getState().byVideo.v204).toBeUndefined();

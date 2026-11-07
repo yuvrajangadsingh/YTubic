@@ -297,7 +297,7 @@ describe("YouTube Music lyrics", () => {
   });
 
   it("throws on a server error rather than reporting no lyrics", async () => {
-    // Same contract as the other three providers: a failure to look up is
+    // Same contract as the other providers: a failure to look up is
     // not evidence of absence, and must not be cached as one.
     nextMock.mockResolvedValue(nextResponse([tab({})]));
     browseReturns({}, 503);

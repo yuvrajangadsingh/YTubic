@@ -21,8 +21,7 @@ import {
  * React Query stores `null` as a success, App.tsx dehydrates successes into
  * IndexedDB and query-client.ts keeps them for a day, so a swallowed 503 was
  * being written to disk and replayed as an authoritative "No lyrics found."
- * Genius and Musixmatch both did this, on transport errors AND on plain HTTP
- * errors. LRCLIB already had the right contract and is the control here.
+ * Genius did this, on transport errors AND on plain HTTP errors. LRCLIB already had the right contract and is the control here.
  *
  * The other half of the rule matters just as much: a 404 and an empty result
  * set are real answers and must stay `null`, or every track without lyrics
@@ -38,11 +37,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 type Route = (url: string) => { status?: number; body?: unknown } | "reject";
 
-/**
- * Fresh module registry per case: Musixmatch caches its session token in
- * module state, so without this the second test in a file would silently
- * skip token.get and stop exercising the path under test.
- */
+/** Fresh module registry per case, so no provider's module state carries over. */
 async function setup(route: Route) {
   vi.resetModules();
   const http = await import("@tauri-apps/plugin-http");
@@ -59,12 +54,10 @@ async function setup(route: Route) {
     return Promise.resolve(new Response(body, { status: r.status ?? 200 }));
   });
   const genius = await import("./genius");
-  const musixmatch = await import("./musixmatch");
   const lrclib = await import("./lrclib");
   const errors = await import("./errors");
   return {
     ...genius,
-    ...musixmatch,
     ...lrclib,
     RateLimit: errors.LyricsRateLimitError,
   };
@@ -88,21 +81,12 @@ const geniusHit = {
   },
 };
 
-const mxmToken = { message: { body: { user_token: "a-real-looking-token" } } };
-
 beforeEach(() => vi.clearAllMocks());
 
 describe("a transport failure is not 'no lyrics'", () => {
   it("Genius throws instead of resolving null", async () => {
     const { fetchGeniusLyrics } = await setup(() => "reject");
     await expect(fetchGeniusLyrics(TRACK)).rejects.toThrow(/Network request/);
-  });
-
-  it("Musixmatch throws instead of resolving null", async () => {
-    const { fetchMusixmatchLyrics } = await setup(() => "reject");
-    await expect(fetchMusixmatchLyrics(TRACK)).rejects.toThrow(
-      /Network request/,
-    );
   });
 
   it("LRCLIB already did (the control)", async () => {
@@ -126,44 +110,9 @@ describe("an HTTP error is not 'no lyrics' either", () => {
     await expect(fetchGeniusLyrics(TRACK)).rejects.toThrow(/Genius page 503/);
   });
 
-  it("Musixmatch throws on a 503 from token.get", async () => {
-    const { fetchMusixmatchLyrics } = await setup(() => ({ status: 503 }));
-    await expect(fetchMusixmatchLyrics(TRACK)).rejects.toThrow(
-      /Musixmatch token\.get 503/,
-    );
-  });
-
-  it("Musixmatch throws on a 503 from track.search", async () => {
-    const { fetchMusixmatchLyrics } = await setup((url) =>
-      url.includes("token.get") ? { body: mxmToken } : { status: 503 },
-    );
-    await expect(fetchMusixmatchLyrics(TRACK)).rejects.toThrow(
-      /Musixmatch track\.search 503/,
-    );
-  });
 });
 
 describe("a refusal is not 'no lyrics', and must not be retried at once", () => {
-  it("Musixmatch's UpgradeOnly token is a rate limit", async () => {
-    // The token shape looks valid but every later call 401s. Returning null
-    // wrote a gated IP to disk as a permanent absence of lyrics.
-    const { fetchMusixmatchLyrics, RateLimit } = await setup(() => ({
-      body: { message: { body: { user_token: "UpgradeOnlyUpgradeOnly" } } },
-    }));
-    await expect(fetchMusixmatchLyrics(TRACK)).rejects.toBeInstanceOf(
-      RateLimit,
-    );
-  });
-
-  it("Musixmatch rejecting a fresh token twice is a rate limit", async () => {
-    const { fetchMusixmatchLyrics, RateLimit } = await setup((url) =>
-      url.includes("token.get") ? { body: mxmToken } : { status: 401 },
-    );
-    await expect(fetchMusixmatchLyrics(TRACK)).rejects.toBeInstanceOf(
-      RateLimit,
-    );
-  });
-
   it("a 429 is a rate limit, not a plain error", async () => {
     const { fetchGeniusLyrics, RateLimit } = await setup(() => ({
       status: 429,
@@ -199,15 +148,6 @@ describe("a real answer is still an answer", () => {
     await expect(fetchGeniusLyrics(TRACK)).resolves.toBeNull();
   });
 
-  it("Musixmatch returns null for an empty result set", async () => {
-    const { fetchMusixmatchLyrics } = await setup((url) =>
-      url.includes("token.get")
-        ? { body: mxmToken }
-        : { body: { message: { body: { track_list: [] } } } },
-    );
-    await expect(fetchMusixmatchLyrics(TRACK)).resolves.toBeNull();
-  });
-
   it("LRCLIB returns null for a 404 plus an empty search", async () => {
     const { fetchLrclibLyrics } = await setup((url) =>
       url.includes("/api/get") ? { status: 404 } : { body: [] },
@@ -223,8 +163,8 @@ describe("a real answer is still an answer", () => {
 describe("describeLyricsError", () => {
   it("names the request and the status from our own typed error", () => {
     expect(
-      describeLyricsError(new LyricsHttpError(503, "Musixmatch token.get")),
-    ).toBe("Musixmatch token.get HTTP 503");
+      describeLyricsError(new LyricsHttpError(503, "Genius search")),
+    ).toBe("Genius search HTTP 503");
     expect(describeLyricsError(new LyricsHttpError(404, "LRCLIB /get"))).toBe(
       "LRCLIB /get HTTP 404",
     );
@@ -235,15 +175,15 @@ describe("describeLyricsError", () => {
   it("does not read a status out of a plain message", () => {
     expect(
       describeLyricsError(
-        new Error("Musixmatch HTTP 503: <html>upstream said no</html>"),
+        new Error("Genius HTTP 503: <html>upstream said no</html>"),
       ),
     ).toBe("failed");
   });
 
-  it("names a rate limit without quoting the token", () => {
+  it("names a rate limit without quoting the message", () => {
     expect(
       describeLyricsError(
-        new LyricsRateLimitError("Musixmatch token UpgradeOnly_abc123"),
+        new LyricsRateLimitError("gated for token abc123"),
       ),
     ).toBe("rate limited");
   });

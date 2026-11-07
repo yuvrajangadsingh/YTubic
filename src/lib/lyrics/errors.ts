@@ -4,15 +4,15 @@ import { InnerTubeHttpError } from "@/lib/innertube/shared";
  * The one distinction every lyrics provider has to keep intact: "this track
  * has no lyrics" and "we could not find out" are different answers.
  *
- * They used to collapse. Genius and Musixmatch wrapped every request in
+ * They used to collapse. Genius wrapped every request in
  * `catch { return null }` and returned null for any non-OK status, so a DNS
- * blip, a Musixmatch captcha gate and a Genius 403 all arrived as the same
- * `null` a genuinely lyric-less track produces. React Query stores `null` as
+ * blip and a Genius 403 both arrived as the same `null` a genuinely
+ * lyric-less track produces. React Query stores `null` as
  * a SUCCESS, `App.tsx` dehydrates successes into IndexedDB and
  * `query-client.ts` keeps them for 24h (staleTime an hour), so one dropped
  * packet was written to disk and replayed as an authoritative "No lyrics
- * found." with no way to ask again. Confirmed end to end for both providers,
- * including on a plain HTTP 503.
+ * found." with no way to ask again. Confirmed end to end, including on a
+ * plain HTTP 503.
  *
  * The rule, which `lrclib.ts` already followed: throw for anything that
  * might succeed on a retry, return a value only for a real answer. A 404 and
@@ -22,9 +22,8 @@ import { InnerTubeHttpError } from "@/lib/innertube/shared";
 
 /**
  * Raised when a provider refuses to serve us for now, as opposed to failing.
- * Musixmatch gates hard (its token endpoint hands back a literal
- * "UpgradeOnly…" token when the IP is flagged) and the lyrics panel fires on
- * every track change whether or not anyone is looking at it.
+ * The lyrics panel fires on every track change whether or not anyone is
+ * looking at it, so a 429 can arrive at any time.
  *
  * Kept separate from the others for one reason: an immediate retry is the
  * exact wrong response to being told "too often", so `shouldRetryLyricsQuery`
@@ -48,10 +47,6 @@ export class LyricsRateLimitError extends Error {
 export const LYRICS_OPS = Object.freeze([
   "Genius search",
   "Genius page",
-  "Musixmatch token.get",
-  "Musixmatch track.search",
-  "Musixmatch track.subtitle.get",
-  "Musixmatch track.lyrics.get",
   "LRCLIB /get",
   "LRCLIB /search",
   "YouTube Music browse",
@@ -91,7 +86,7 @@ export class LyricsTimeoutError extends Error {
  * Classification only. Nothing here reads a message, a URL or an error
  * name, because all three are written by somebody else: a slice of
  * response body, the address the transport was handed (which holds the
- * search terms and, on Musixmatch, the signed token), a `name` any object
+ * search terms), a `name` any object
  * can set. Two earlier versions of this tried to redact the dangerous
  * parts and both leaked, the second through a trailing three-digit number
  * it read as a status and through the error's own name.
