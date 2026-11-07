@@ -196,10 +196,14 @@ function parse(word: string, s: Script): Akshara[] {
  *  right after a nasal cluster keeps it mid-word (zindagi). */
 function deleteSchwas(a: Akshara[]): void {
   const last = a.length - 1;
-  // After a cluster the vowel stays only where the cluster ends in r or y
-  // (mitra, satya); vaqt, dard and dost drop it like any other word.
+  // After a cluster the vowel stays only in the Sanskrit shapes: a t or d
+  // before a final r (mitra, chandra) or a final y (satya). vaqt, dard,
+  // fikr and umr drop it like any other word.
+  const cluster = last > 0 && a[last - 1].vowel === "";
   const keepsFinal =
-    last > 0 && a[last - 1].vowel === "" && /^[ry]$/.test(a[last].consonant);
+    cluster &&
+    (a[last].consonant === "y" ||
+      (a[last].consonant === "r" && /^d?[td]h?$/.test(a[last - 1].consonant)));
   if (last > 0 && a[last].inherent && !keepsFinal) a[last].vowel = "";
   for (let i = last - 1; i >= 1; i--) {
     if (!a[i].inherent || a[i].nasal) continue;
@@ -227,8 +231,11 @@ function spell(a: Akshara[], s: Script): string {
     }
     out += (x.doubled ? x.consonant[0] : "") + x.consonant + vowel;
     if (!x.nasal) return;
-    // After m or n the nasal is already heard (maa).
-    if (nasalEnd && vowel === "aa" && /^[mn]$/.test(x.consonant)) return;
+    // A one-letter maa: the m already carries the nasal. Longer words keep
+    // the n (aasmaan, armaan).
+    if (nasalEnd && vowel === "aa" && a.length === 1 && x.consonant === "m") {
+      return;
+    }
     // A final nasalized u is barely voiced (saanu, tu), and a nasal takes the
     // lips' shape before them (kambal).
     if (end && vowel === "u") return;

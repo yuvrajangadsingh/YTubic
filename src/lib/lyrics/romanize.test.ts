@@ -96,6 +96,10 @@ describe("romanize", () => {
     expect(romanize("सख़्त")).toBe("sakht");
     expect(romanize("मित्र")).toBe("mitra");
     expect(romanize("सत्य")).toBe("satya");
+    expect(romanize("चंद्र")).toBe("chandra");
+    expect(romanize("फ़िक्र")).toBe("fikr");
+    expect(romanize("उम्र")).toBe("umr");
+    expect(romanize("सब्र")).toBe("sabr");
     expect(romanize("तुम हो तो वक़्त थमा है")).toBe("tum ho to vaqt thama hai");
   });
 
@@ -105,6 +109,10 @@ describe("romanize", () => {
     expect(romanize("में")).toBe("mein");
     expect(romanize("मैं")).toBe("main");
     expect(romanize("नहीं")).toBe("nahin");
+    expect(romanize("आसमाँ")).toBe("aasmaan");
+    expect(romanize("अरमाँ")).toBe("armaan");
+    expect(romanize("कहाँ")).toBe("kahaan");
+    expect(romanize("ਜਾਨਾਂ")).toBe("jaanaan");
   });
 
   it("keeps other text in a mixed line", () => {
