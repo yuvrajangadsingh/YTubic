@@ -120,7 +120,9 @@ function BehaviorGroup() {
   const normalizeVolume = useSettingsStore((s) => s.normalizeVolume);
   // The same check the gain itself uses (lib/loudness.ts): no active account,
   // no measurement, so the switch would do nothing.
-  const signedIn = !!useAccounts().data?.some((a) => a.isActive);
+  // Still loading counts as signed in, so the switch doesn't flash off.
+  const accounts = useAccounts().data;
+  const signedIn = !accounts || accounts.some((a) => a.isActive);
   const setNormalizeVolume = useSettingsStore((s) => s.setNormalizeVolume);
   const notchSongPeek = useSettingsStore((s) => s.notchSongPeek);
   const setNotchSongPeek = useSettingsStore((s) => s.setNotchSongPeek);
