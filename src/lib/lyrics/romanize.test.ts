@@ -51,6 +51,19 @@ describe("romanize", () => {
     expect(romanize("முன்பே வா என் அன்பே வா")).toBe("munbe vaa en anbe vaa");
   });
 
+  it("keeps Tamil s, unvoiced clusters and ற clusters right", () => {
+    expect(romanize("பாசம்")).toBe("paasam");
+    expect(romanize("காசு")).toBe("kaasu");
+    expect(romanize("ஆசை")).toBe("aasai");
+    expect(romanize("இசை")).toBe("isai");
+    expect(romanize("லக்ஷ்மி")).toBe("lakshmi");
+    expect(romanize("காட்சி")).toBe("kaatchi");
+    expect(romanize("அந்தப் பாடல்")).toBe("andhap paadal");
+    expect(romanize("காற்று")).toBe("kaatru");
+    expect(romanize("வெற்றி")).toBe("vetri");
+    expect(romanize("தென்றல்")).toBe("thendral");
+  });
+
   it("handles the schwa rule's edges", () => {
     expect(romanize("न")).toBe("na");
     expect(romanize("मित्र")).toBe("mitra");
