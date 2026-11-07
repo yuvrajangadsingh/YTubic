@@ -28,9 +28,42 @@ describe("romanize", () => {
 
   it("spells Tamil, which keeps its vowels", () => {
     expect(romanize("நான் உன்னை காதலிக்கிறேன்")).toBe(
-      "naan unnai kaathalikkiren",
+      "naan unnai kaadhalikkiren",
     );
     expect(romanize("வாழ்க்கை ஒரு பயணம்")).toBe("vaazhkkai oru payanam");
+  });
+
+  it("voices Tamil stops after a nasal and between vowels (QA N1)", () => {
+    expect(romanize("அன்பே")).toBe("anbe");
+    expect(romanize("கண்டு")).toBe("kandu");
+    expect(romanize("நெஞ்சம்")).toBe("nenjam");
+    expect(romanize("சிங்கம்")).toBe("singam");
+    expect(romanize("பந்து")).toBe("pandhu");
+    expect(romanize("பாடல்")).toBe("paadal");
+    expect(romanize("மகன்")).toBe("magan");
+    expect(romanize("வந்தேன்")).toBe("vandhen");
+  });
+
+  it("keeps Tamil stops unvoiced when doubled or at the start", () => {
+    expect(romanize("அக்கா")).toBe("akka");
+    expect(romanize("அப்பா")).toBe("appa");
+    expect(romanize("பட்டு")).toBe("pattu");
+    expect(romanize("முன்பே வா என் அன்பே வா")).toBe("munbe vaa en anbe vaa");
+  });
+
+  it("keeps Tamil s, unvoiced clusters and ற clusters right", () => {
+    expect(romanize("பாசம்")).toBe("paasam");
+    expect(romanize("காசு")).toBe("kaasu");
+    expect(romanize("ஆசை")).toBe("aasai");
+    expect(romanize("இசை")).toBe("isai");
+    expect(romanize("லக்ஷ்மி")).toBe("lakshmi");
+    expect(romanize("காட்சி")).toBe("kaatchi");
+    expect(romanize("அந்தப் பாடல்")).toBe("andhap paadal");
+    expect(romanize("காற்று")).toBe("kaatru");
+    expect(romanize("வெற்றி")).toBe("vetri");
+    expect(romanize("தென்றல்")).toBe("thendral");
+    expect(romanize("மின்சாரம்")).toBe("minsaaram");
+    expect(romanize("அம்சம்")).toBe("amsam");
   });
 
   it("handles the schwa rule's edges", () => {
