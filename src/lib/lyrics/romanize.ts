@@ -68,34 +68,55 @@ function indicScript(block: number, extra: Partial<Script>): Script {
   };
 }
 
-const DEVANAGARI = indicScript(0x900, {});
+const DEVANAGARI = (() => {
+  const s = indicScript(0x900, {});
+  // Sanskrit's ri, and the o and e that English loanwords are written with.
+  Object.assign(s.vowels, { "\u090B": "ri", "\u0911": "o", "\u090D": "e" });
+  Object.assign(s.matras, { "\u0943": "ri", "\u0949": "o", "\u0945": "e" });
+  return s;
+})();
 const GURMUKHI = (() => {
-  const s = indicScript(0xa00, { nasals: "ਁਂੰ", doubler: "ੱ" });
-  s.consonants["ੜ"] = "r";
+  const s = indicScript(0xa00, {
+    nasals: "\u0A01\u0A02\u0A70",
+    doubler: "\u0A71",
+  });
+  s.consonants["\u0A5C"] = "r";
+  // The bare vowel carriers; a matra on one overrides this as on a consonant.
+  Object.assign(s.vowels, { "\u0A72": "i", "\u0A73": "u" });
   return s;
 })();
 const TAMIL: Script = {
   consonants: {
     க: "k", ங: "ng", ச: "s", ஞ: "nj", ட: "t", ண: "n", த: "th", ந: "n",
     ப: "p", ம: "m", ய: "y", ர: "r", ல: "l", வ: "v", ழ: "zh", ள: "l",
-    ற: "r", ன: "n", ஜ: "j", ஷ: "sh", ஸ: "s", ஹ: "h",
+    ற: "r", ன: "n", ஜ: "j", ஷ: "sh", ஶ: "sh", ஸ: "s", ஹ: "h",
   },
   vowels: {
     அ: "a", ஆ: "aa", இ: "i", ஈ: "ee", உ: "u", ஊ: "oo", எ: "e", ஏ: "e",
     ஐ: "ai", ஒ: "o", ஓ: "o", ஔ: "au",
   },
   matras: {
-    "ா": "aa", "ி": "i", "ீ": "ee", "ு": "u",
-    "ூ": "oo", "ெ": "e", "ே": "e", "ை": "ai",
-    "ொ": "o", "ோ": "o", "ௌ": "au",
+    "\u0BBE": "aa", "\u0BBF": "i", "\u0BC0": "ee", "\u0BC1": "u",
+    "\u0BC2": "oo", "\u0BC6": "e", "\u0BC7": "e", "\u0BC8": "ai",
+    "\u0BCA": "o", "\u0BCB": "o", "\u0BCC": "au",
   },
-  virama: "்",
+  virama: "\u0BCD",
   nasals: "",
   schwaDeletion: false,
 };
 
-const SCRIPT_RUN =
-  /[ऀ-ॣ०-ॿ]+|[਀-੿]+|[஀-௿]+/gu;
+// A word of one script: letters and marks, with joiners inside it, which only
+// shape the letters. Danda and native digits sit outside and pass through.
+const SCRIPT_RUN = new RegExp(
+  [
+    "\u0900-\u0963\u0970-\u097F",
+    "\u0A00-\u0A65\u0A70-\u0A7F",
+    "\u0B80-\u0BE5",
+  ]
+    .map((letters) => `[${letters}](?:[${letters}]|\u200C|\u200D)*`)
+    .join("|"),
+  "gu",
+);
 
 function scriptOf(run: string): Script {
   const cp = run.codePointAt(0)!;
@@ -104,6 +125,8 @@ function scriptOf(run: string): Script {
 
 type Akshara = {
   consonant: string;
+  /** Written twice: Gurmukhi's addak on the letter after it. */
+  doubled: boolean;
   vowel: string;
   /** The consonant's own vowel, not one a mark or a letter wrote. */
   inherent: boolean;
@@ -116,16 +139,22 @@ function parse(word: string, s: Script): Akshara[] {
   for (const ch of word) {
     const last = out[out.length - 1];
     if (s.consonants[ch]) {
-      const latin = s.consonants[ch];
       out.push({
-        consonant: (doubled ? latin[0] : "") + latin,
+        consonant: s.consonants[ch],
+        doubled,
         vowel: "a",
         inherent: true,
         nasal: false,
       });
       doubled = false;
     } else if (s.vowels[ch]) {
-      out.push({ consonant: "", vowel: s.vowels[ch], inherent: false, nasal: false });
+      out.push({
+        consonant: "",
+        doubled: false,
+        vowel: s.vowels[ch],
+        inherent: false,
+        nasal: false,
+      });
     } else if (last && s.matras[ch]) {
       last.vowel = s.matras[ch];
       last.inherent = false;
@@ -167,7 +196,7 @@ function spell(a: Akshara[], s: Script): string {
     if (end && s.schwaDeletion) {
       vowel = { aa: "a", ee: "i", oo: "u" }[vowel] ?? vowel;
     }
-    out += x.consonant + vowel;
+    out += (x.doubled ? x.consonant[0] : "") + x.consonant + vowel;
     if (!x.nasal) return;
     // A final nasalized u is barely voiced (saanu, tu), and a nasal takes the
     // lips' shape before them (kambal).

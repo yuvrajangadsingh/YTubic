@@ -344,7 +344,8 @@ function TimedLyrics({
   offsetRef.current = offset;
   const prevActiveRef = useRef(activeIdx);
 
-  // On mount and whenever the lyric set changes (new track), snap the
+  // On mount, whenever the lyric set changes (new track) and when the Latin
+  // row comes or goes (every line changes height), snap the
   // active line into view without animation. Without this the animated
   // effect below never fires on mount (prevActiveRef starts equal to the
   // initial activeIdx), so opening the panel mid-song — or skipping tracks
@@ -383,7 +384,7 @@ function TimedLyrics({
     const { top, target } = measureLine(container, el, idx, viewportRatio);
     container.scrollTop = Math.max(0, top - target);
     setAnchored(top >= target);
-  }, [lines]);
+  }, [lines, romanizeOn]);
 
   useEffect(() => {
     if (activeIdx === prevActiveRef.current) return;

@@ -54,6 +54,33 @@ describe("romanize", () => {
     expect(romanize("ਸ਼ਾਮ")).toBe("shaam");
   });
 
+  it("doesn't lose less common letters", () => {
+    expect(romanize("ऋतु")).toBe("ritu");
+    expect(romanize("कृपा")).toBe("kripa");
+    expect(romanize("कॉफी")).toBe("kophi");
+    expect(romanize("ஶ்ரீ")).toBe("shree");
+    expect(romanize("ੲਹ")).toBe("ih");
+  });
+
+  it("applies a nukta to a doubled letter", () => {
+    expect(romanize("ਇੱਜ਼ਤ")).toBe("izzat");
+  });
+
+  it("ignores joiners inside a word", () => {
+    const plain = "र्य";
+    expect(romanize(plain)).toBe("rya");
+    expect(romanize("र\u200D्य")).toBe("rya");
+    expect(romanize("र\u200C्य")).toBe("rya");
+  });
+
+  it("passes digits and danda through, and splits words on them", () => {
+    const ram = "राम";
+    const digits = "१२";
+    expect(romanize(`${ram} ${digits}।`)).toBe(`raam ${digits}।`);
+    expect(romanize(`${ram}${digits}${ram}`)).toBe(`raam${digits}raam`);
+    expect(romanize(digits)).toBeNull();
+  });
+
   it("keeps other text in a mixed line", () => {
     expect(romanize("Baby तू (ooh), 2 बार")).toBe("Baby tu (ooh), 2 baar");
   });
