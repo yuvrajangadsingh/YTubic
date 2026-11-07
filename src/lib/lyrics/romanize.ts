@@ -178,6 +178,16 @@ function parse(word: string, s: Script): Akshara[] {
       last.inherent = false;
     } else if (ch === s.doubler) {
       doubled = true;
+    } else if (ch === "\u0B83") {
+      // Tamil's aytham, a breathy h with no vowel of its own (ehku);
+      // tamilVoicing reads it before ப as f.
+      out.push({
+        consonant: "H",
+        doubled: false,
+        vowel: "",
+        inherent: false,
+        nasal: false,
+      });
     } else if (ch !== "\u200C" && ch !== "\u200D") {
       // Nothing in a line is dropped: what the tables don't know stays.
       out.push({
@@ -235,6 +245,15 @@ function tamilVoicing(a: Akshara[]): void {
     const prev = i > 0 ? a[i - 1] : undefined;
     const prevLatin = i > 0 ? latin[i - 1] : "";
     const cluster = !!prev && prev.vowel === "";
+    if (latin[i] === "H") {
+      // ஃப is f in loanwords (fan, coffee); otherwise h.
+      x.consonant = latin[i + 1] === "P" ? "" : "h";
+      return;
+    }
+    if (latin[i] === "P" && prevLatin === "H") {
+      x.consonant = "f";
+      return;
+    }
     if (latin[i] === "R") {
       // The first of a doubled ற is t; one after ன் is dr.
       const doubledR = x.vowel === "" && latin[i + 1] === "R";

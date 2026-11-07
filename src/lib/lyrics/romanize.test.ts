@@ -66,6 +66,13 @@ describe("romanize", () => {
     expect(romanize("அம்சம்")).toBe("amsam");
   });
 
+  it("spells the Tamil aytham as h (QA r3 N1)", () => {
+    expect(romanize("எஃகு")).toBe("ehku");
+    expect(romanize("ஃ")).toBe("h");
+    expect(romanize("ஃபேன்")).toBe("fen");
+    expect(romanize("காஃபி")).toBe("kaafi");
+  });
+
   it("handles the schwa rule's edges", () => {
     expect(romanize("न")).toBe("na");
     expect(romanize("मित्र")).toBe("mitra");
