@@ -9,6 +9,23 @@ time; they are quoted, not rounded up.
 
 ---
 
+## 2026-11-07 · QA round 2 findings left for 0.8
+
+**Decided:** not in 0.7.0 (the M4's call on QA round 2, report in the M5's
+gitignored `.notes/qa-2026-11-07-r2.md`).
+
+- **Long vowels spelled as written, not as typed (QA N3).** ਕਾਲੀਆਂ ਗੱਡੀਆਂ
+  comes out kaaleeaan gaddeeaan where people type kaaliyan gaddiyan, and हूँ
+  comes out hu (typed hoon or hun). Romanization keeps medial long vowels
+  long on purpose (naal, pyaar); the vowel-plus-aan endings and हूँ need their
+  own rules.
+- **"Play again restarts the playing track", unconfirmed.** QA pressed Play
+  on a playlist whose first track was playing and saw it restart, but the
+  playing stream may have been the video counterpart of that song, so it may
+  be a different id. QA pins the ids next round; decide then.
+
+---
+
 ## 2026-11-07 · QA findings left for after 0.7.0
 
 **Decided:** these stay as they are in 0.7.0 (the M4's call on the QA pass of
