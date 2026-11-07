@@ -290,6 +290,7 @@ function QueueTabBody({
                     e.preventDefault();
                     setDragOver(end + 1);
                   }}
+                  onDragLeave={() => setDragOver(null)}
                   onDrop={(e) => {
                     e.preventDefault();
                     if (dragFrom !== null && dragFrom !== end) {
