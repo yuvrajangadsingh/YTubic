@@ -60,7 +60,7 @@ export async function fetchGeniusLyrics(
   if (!p.title) return null;
   // With no artist to verify against, an exact-title Genius hit can be a
   // completely different song sharing the name — and Genius search results
-  // carry no duration to vouch for the match (unlike LRCLIB/Musixmatch).
+  // carry no duration to vouch for the match (unlike LRCLIB).
   // Unverifiable means no lyrics beats confidently-wrong lyrics.
   if (!p.artist?.trim()) return null;
 
