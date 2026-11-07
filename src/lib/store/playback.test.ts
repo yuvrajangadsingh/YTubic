@@ -212,3 +212,56 @@ describe("launch resume", () => {
     expect(usePlaybackStore.getState().resumeAt).toBeUndefined();
   });
 });
+
+describe("landing on the slot already playing", () => {
+  const playing = {
+    queue: [track("a")],
+    index: 0,
+    status: "ready" as const,
+    streamUrl: "blob:a",
+    position: 42,
+    duration: 200,
+  };
+  const kept = () => {
+    const s = usePlaybackStore.getState();
+    expect(s.status).toBe("ready");
+    expect(s.streamUrl).toBe("blob:a");
+    expect(s.position).toBe(42);
+    expect(s.duration).toBe(200);
+    expect(s.playing).toBe(true);
+  };
+
+  it("keeps playing when a queue replaces it with the same song first", () => {
+    setup(playing);
+    usePlaybackStore.getState().setQueue([track("a"), track("b")], 0);
+    expect(usePlaybackStore.getState().queue).toHaveLength(2);
+    kept();
+  });
+
+  it("keeps playing through goTo on its own slot", () => {
+    setup({ ...playing, queue: [track("a"), track("b")] });
+    usePlaybackStore.getState().goTo(0);
+    kept();
+  });
+
+  it("keeps playing when Start radio replaces the queue around it", () => {
+    setup(playing);
+    usePlaybackStore
+      .getState()
+      .playNow({ kind: "song", id: "a", title: "a", thumbnails: [] }, [
+        track("b"),
+      ]);
+    expect(usePlaybackStore.getState().queue).toHaveLength(2);
+    kept();
+  });
+
+  it("still reloads for another song or another slot of the same song", () => {
+    setup(playing);
+    usePlaybackStore.getState().setQueue([track("b")], 0);
+    expect(usePlaybackStore.getState().status).toBe("loading");
+    setup({ ...playing, queue: [track("a"), track("a")] });
+    usePlaybackStore.getState().goTo(1);
+    expect(usePlaybackStore.getState().status).toBe("loading");
+    expect(usePlaybackStore.getState().streamUrl).toBeUndefined();
+  });
+});

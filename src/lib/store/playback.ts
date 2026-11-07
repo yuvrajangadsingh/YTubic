@@ -248,6 +248,26 @@ export function createThrottledStorage(delay = 1000): StateStorage {
   };
 }
 
+/** The reset for landing on slot `i` of `queue`. The audio engine reloads on
+ *  a new video or slot; the same song staying in the same slot (Start radio on
+ *  what's playing, clicking its card) loads nothing, so resetting here
+ *  left a spinner and a 0:00 duration that nothing ever cleared. It just keeps
+ *  playing. */
+function slotChange(
+  s: PlaybackState,
+  queue: QueueTrack[],
+  i: number,
+): Partial<PlaybackState> {
+  if (s.index === i && s.queue[i]?.videoId === queue[i].videoId) return {};
+  return {
+    status: "loading",
+    streamUrl: undefined,
+    position: 0,
+    duration: queue[i].duration ?? 0,
+    error: undefined,
+  };
+}
+
 const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
   queue: [],
   index: -1,
@@ -285,12 +305,8 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
     set({
       queue,
       index: 0,
-      status: "loading",
-      streamUrl: undefined,
-      position: 0,
-      duration: mapped.duration ?? 0,
+      ...slotChange(get(), queue, 0),
       playing: true,
-      error: undefined,
       queueContinuation: undefined,
     });
   },
@@ -307,12 +323,8 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
     set({
       queue,
       index: i,
-      status: "loading",
-      streamUrl: undefined,
-      position: 0,
-      duration: queue[i].duration ?? 0,
+      ...slotChange(get(), queue, i),
       playing: true,
-      error: undefined,
       queueContinuation: undefined,
     });
   },
@@ -528,16 +540,7 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
   goTo: (i) => {
     const { queue } = get();
     if (i < 0 || i >= queue.length) return;
-    const track = queue[i];
-    set({
-      index: i,
-      status: "loading",
-      streamUrl: undefined,
-      position: 0,
-      duration: track.duration ?? 0,
-      playing: true,
-      error: undefined,
-    });
+    set({ index: i, ...slotChange(get(), queue, i), playing: true });
   },
 
   setStatus: (status, error) => set({ status, error }),
