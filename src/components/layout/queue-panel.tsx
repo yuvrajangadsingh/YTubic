@@ -552,7 +552,10 @@ function QueueRow({
         </span>
       </div>
 
-      {/* Duration + remove. The remove button has zero width by
+      {/* Row buttons are `invisible` until the row is hovered or focused:
+          zero width alone left them in the accessibility tree, where an
+          AX press on the row hit Play next instead of the row (QA L3).
+          Duration + remove. The remove button has zero width by
           default — `w-0 overflow-hidden opacity-0` — and animates to
           `w-6 + ml-1` on row hover, sliding in from the right and
           pushing the duration leftwards instead of being permanently
@@ -567,7 +570,7 @@ function QueueRow({
             size="icon-xs"
             aria-label="Play next"
             title="Play next"
-            className="w-0 overflow-hidden opacity-0 transition-[width,opacity,margin] duration-150 group-hover:ml-1 group-hover:w-6 group-hover:opacity-100 focus-visible:ml-1 focus-visible:w-6 focus-visible:opacity-100"
+            className="invisible w-0 overflow-hidden opacity-0 transition-[width,opacity,margin] duration-150 group-hover:visible group-hover:ml-1 group-hover:w-6 group-hover:opacity-100 group-focus-within:visible group-focus-within:ml-1 group-focus-within:w-6 group-focus-within:opacity-100"
             // The row plays on Enter and Space; this button's own keys stay its own.
             onKeyDown={(e) => e.stopPropagation()}
             onClick={(e) => {
@@ -583,7 +586,7 @@ function QueueRow({
             variant="ghost"
             size="icon-xs"
             aria-label="Remove from queue"
-            className="w-0 overflow-hidden opacity-0 transition-[width,opacity,margin] duration-150 group-hover:ml-1 group-hover:w-6 group-hover:opacity-100 focus-visible:ml-1 focus-visible:w-6 focus-visible:opacity-100"
+            className="invisible w-0 overflow-hidden opacity-0 transition-[width,opacity,margin] duration-150 group-hover:visible group-hover:ml-1 group-hover:w-6 group-hover:opacity-100 group-focus-within:visible group-focus-within:ml-1 group-focus-within:w-6 group-focus-within:opacity-100"
             // The row plays on Enter and Space; this button's own keys stay its own.
             onKeyDown={(e) => e.stopPropagation()}
             onClick={(e) => {
