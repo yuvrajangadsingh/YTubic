@@ -238,9 +238,12 @@ function PlaylistPageView() {
   const shufflePlaylist = async () => {
     const store = usePlaybackStore.getState();
     // With a filter on, Shuffle means the tracks it shows. The filter loads
-    // every page first, so this is the whole matching set.
+    // every page; Shuffle stays disabled until it has, so this is the whole
+    // matching set.
     if (normalizedQuery) {
-      if (visibleTracks.length > 0) store.shufflePlayShelfItems(visibleTracks);
+      if (visibleTracks.length > 0 && !query.hasNextPage) {
+        store.shufflePlayShelfItems(visibleTracks);
+      }
       return;
     }
     // Prefer YTM's server-side shuffle: one /next call returns a fresh
@@ -331,7 +334,9 @@ function PlaylistPageView() {
         onShuffle={
           openedFromArtist ? undefined : () => void shufflePlaylist()
         }
-        shuffleDisabled={!!normalizedQuery && visibleTracks.length === 0}
+        shuffleDisabled={
+          !!normalizedQuery && (visibleTracks.length === 0 || query.hasNextPage)
+        }
         actions={
           isArtistTopSongs ||
           openedFromArtist ? null : isLikedSongs ? null : pinned ? (
