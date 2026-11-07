@@ -71,7 +71,12 @@ function indicScript(block: number, extra: Partial<Script>): Script {
 const DEVANAGARI = (() => {
   const s = indicScript(0x900, {});
   // Sanskrit's ri, and the o and e that English loanwords are written with.
-  Object.assign(s.vowels, { "\u090B": "ri", "\u0911": "o", "\u090D": "e" });
+  Object.assign(s.vowels, {
+    "\u090B": "ri",
+    "\u0911": "o",
+    "\u090D": "e",
+    "\u0950": "om",
+  });
   Object.assign(s.matras, { "\u0943": "ri", "\u0949": "o", "\u0945": "e" });
   return s;
 })();
@@ -109,7 +114,7 @@ const TAMIL: Script = {
 // shape the letters. Danda and native digits sit outside and pass through.
 const SCRIPT_RUN = new RegExp(
   [
-    "\u0900-\u0963\u0970-\u097F",
+    "\u0900-\u0963\u0971-\u097F",
     "\u0A00-\u0A65\u0A70-\u0A7F",
     "\u0B80-\u0BE5",
   ]
@@ -165,8 +170,21 @@ function parse(word: string, s: Script): Akshara[] {
       last.consonant = NUKTA[last.consonant] ?? last.consonant;
     } else if (last && s.nasals.includes(ch)) {
       last.nasal = true;
+    } else if (last && ch === "\u0903") {
+      // Visarga, a breath after the vowel (namah).
+      last.vowel += "h";
+      last.inherent = false;
     } else if (ch === s.doubler) {
       doubled = true;
+    } else if (ch !== "\u200C" && ch !== "\u200D") {
+      // Nothing in a line is dropped: what the tables don't know stays.
+      out.push({
+        consonant: ch,
+        doubled: false,
+        vowel: "",
+        inherent: false,
+        nasal: false,
+      });
     }
   }
   return out;

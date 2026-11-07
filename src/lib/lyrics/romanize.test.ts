@@ -81,6 +81,11 @@ describe("romanize", () => {
     expect(romanize(digits)).toBeNull();
   });
 
+  it("never drops what it doesn't know", () => {
+    expect(romanize("ॐ नमः")).toBe("om namah");
+    expect(romanize("राम॰राम")).toBe("raam॰raam");
+  });
+
   it("keeps other text in a mixed line", () => {
     expect(romanize("Baby तू (ooh), 2 बार")).toBe("Baby tu (ooh), 2 baar");
   });
