@@ -1,10 +1,10 @@
 import { useEffect } from "react";
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { fetchLrclibLyrics } from "@/lib/lyrics/lrclib";
-import { fetchMusixmatchLyrics } from "@/lib/lyrics/musixmatch";
 import { fetchGeniusLyrics } from "@/lib/lyrics/genius";
 import { fetchYtMusicLyrics } from "@/lib/lyrics/ytmusic";
 import { rejectSiteChrome } from "@/lib/lyrics/plausibility";
+import { useLyricsSkip } from "@/lib/lyrics/skip";
 import {
   describeLyricsError,
   LyricsTimeoutError,
@@ -15,24 +15,18 @@ import { cleanTrackTitle, lyricsArtist } from "@/lib/track-meta";
 import type { Lyrics } from "@/lib/lyrics/types";
 import type { QueueTrack } from "@/lib/store/playback";
 
-export type LyricsSource = "ytmusic" | "lrclib" | "musixmatch" | "genius";
+export type LyricsSource = "ytmusic" | "lrclib" | "genius";
 
 /**
  * YouTube Music leads because it is the only source keyed on the videoId
  * rather than on a fuzzy title/artist string: it structurally cannot hand
  * back another song's words, and the words it has are line-synced.
  */
-export const SOURCE_ORDER: LyricsSource[] = [
-  "ytmusic",
-  "lrclib",
-  "musixmatch",
-  "genius",
-];
+export const SOURCE_ORDER: LyricsSource[] = ["ytmusic", "lrclib", "genius"];
 
 export const SOURCE_LABELS: Record<LyricsSource, string> = {
   ytmusic: "YouTube Music",
   lrclib: "LRCLIB",
-  musixmatch: "Musixmatch",
   genius: "Genius",
 };
 
@@ -43,7 +37,7 @@ const ONE_HOUR = 60 * 60 * 1000;
  *  query in `isLoading` forever — the fetch never resolved, so
  *  `retry: 1` never fired and the panel sat on "Loading lyrics…"
  *  until a track change. The budget covers a provider's WHOLE call
- *  chain (Musixmatch does up to 4 sequential requests), so it's
+ *  chain (Genius does a search and then a page fetch), so it's
  *  deliberately roomier than a single-request timeout would be. */
 const PROVIDER_TIMEOUT_MS = 8_000;
 
@@ -103,18 +97,34 @@ function logAttempt(
   );
 }
 
+const NONE_SKIPPED: LyricsSource[] = [];
+
+/** The auto pick: timed beats plain, then `SOURCE_ORDER`, passing over
+ *  the sources the listener skipped for this track. */
+export function pickBest(
+  data: (s: LyricsSource) => Lyrics | null | undefined,
+  skipped: LyricsSource[],
+): LyricsSource | null {
+  const open = SOURCE_ORDER.filter((s) => !skipped.includes(s));
+  return (
+    open.find((s) => data(s)?.kind === "timed") ??
+    open.find((s) => data(s)?.kind === "plain") ??
+    null
+  );
+}
+
 /**
  * Fire every lyric query in parallel, plus a derived "best" selection.
  * Auto-pick rule: first source (in `SOURCE_ORDER`) that has any lyrics,
- * with timed lyrics ALWAYS winning over plain — i.e. if LRCLIB has plain
- * text but Musixmatch has synced LRC, Musixmatch wins.
+ * with timed lyrics ALWAYS winning over plain — i.e. if YouTube Music has
+ * plain text but LRCLIB has synced LRC, LRCLIB wins.
  *
  * Every provider runs under `PROVIDER_TIMEOUT_MS`, so all queries are
  * guaranteed to settle (data, null, or error) and the panel always reaches
  * "No lyrics found." instead of hanging on one dead source. An errored
  * source has `data === undefined`, so it is skipped by both passes below
  * and the remaining sources still answer — a YouTube Music outage degrades
- * to the other three rather than blanking the panel.
+ * to the other two rather than blanking the panel.
  */
 export function useLyricsSources(
   track: QueueTrack | undefined,
@@ -139,7 +149,7 @@ export function useLyricsSources(
   // Deliberately NOT applied to YouTube Music: that lookup is keyed on the
   // videoId, so there is no title to be ambiguous about. One track here
   // proves the difference — "Aarzu (with Asim Azhar)" carries no artist at
-  // all, so all three text providers stay disabled, and YTM returns 47
+  // all, so both text providers stay disabled, and YTM returns 47
   // line-synced lines for it.
   const verifiable = !!artistName?.trim();
   // The two enablement conditions, named once: the settled check below
@@ -209,25 +219,6 @@ export function useLyricsSources(
     retry: shouldRetryLyricsQuery,
   });
 
-  const musixmatch = useQuery({
-    // v4: site-chrome gate; orphan v3 entries that bypass it from the cache.
-    queryKey: ["lyrics", "musixmatch-v4", title, artistName, track?.duration],
-    queryFn: () =>
-      logAttempt("musixmatch", () =>
-        fetchMusixmatchLyrics(
-          {
-            title: title!,
-            artist: artistName,
-            duration: track?.duration,
-          },
-          lyricsTimeoutSignal(PROVIDER_TIMEOUT_MS),
-        ).then(rejectSiteChrome("Musixmatch")),
-      ),
-    enabled: askByText,
-    staleTime: ONE_HOUR,
-    retry: shouldRetryLyricsQuery,
-  });
-
   const genius = useQuery({
     // v4: site-chrome gate; orphan v3 entries that bypass it from the cache.
     queryKey: ["lyrics", "genius-v4", title, artistName],
@@ -249,25 +240,16 @@ export function useLyricsSources(
   const queries: Record<LyricsSource, UseQueryResult<Lyrics | null>> = {
     ytmusic,
     lrclib,
-    musixmatch,
     genius,
   };
 
-  let best: LyricsSource | null = null;
-  for (const s of SOURCE_ORDER) {
-    if (queries[s].data?.kind === "timed") {
-      best = s;
-      break;
-    }
-  }
-  if (!best) {
-    for (const s of SOURCE_ORDER) {
-      if (queries[s].data?.kind === "plain") {
-        best = s;
-        break;
-      }
-    }
-  }
+  const skipped = useLyricsSkip((s) =>
+    track ? s.byVideo[track.videoId] : undefined,
+  );
+  const best = pickBest(
+    (s) => queries[s].data,
+    skipped ?? NONE_SKIPPED,
+  );
 
   const isLoading = SOURCE_ORDER.some((s) => queries[s].isLoading);
   // Every source has answered, one way or the other. Not `!isFetching`: a

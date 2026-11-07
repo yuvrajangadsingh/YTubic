@@ -29,6 +29,8 @@ import { useCacheAutoClean } from "@/lib/cache-cleanup";
 import { usePlaybackNotifications } from "@/lib/playback-notifications";
 import { useNotchPeek } from "@/lib/notch";
 import { useLastfmScrobbler } from "@/lib/lastfm-scrobbler";
+import { useYtHistory } from "@/lib/yt-history";
+import { useSleepTimerEngine } from "@/lib/sleep-timer";
 import { useYtdlpSetup } from "@/lib/ytdlp";
 import { useUpdateStartupCheck } from "@/lib/updater";
 import { useWhatsNewOnUpdate } from "@/lib/store/whats-new";
@@ -107,6 +109,8 @@ export function AppShell({ children }: { children: ReactNode }) {
   usePlaybackNotifications();
   useNotchPeek();
   useLastfmScrobbler();
+  useYtHistory();
+  useSleepTimerEngine();
   const mode = useLayoutStore((s) => s.mode);
   const setMode = useLayoutStore((s) => s.setMode);
   const sidebarWidth = useLayoutStore((s) => s.sidebarWidth);

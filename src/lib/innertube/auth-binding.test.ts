@@ -50,6 +50,43 @@ describe("innertubePost bound to an account", () => {
     expect(tauriFetch).not.toHaveBeenCalled();
   });
 
+  it("hands the account to the cookie merge, so a late response cannot land in another jar", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd) =>
+      cmd === "get_auth_context" ? context("A") : false,
+    );
+    vi.mocked(tauriFetch).mockResolvedValue({
+      ok: true,
+      status: 200,
+      url: "https://music.youtube.com/youtubei/v1/browse",
+      headers: { getSetCookie: () => ["SIDCC=x; Domain=.youtube.com"] },
+      json: async () => ({}),
+    } as unknown as Response);
+    await innertubePost("browse", {}, { auth: "required", forAccount: "A" });
+    expect(invoke).toHaveBeenCalledWith(
+      "merge_response_cookies",
+      expect.objectContaining({ forAccount: "A" }),
+    );
+  });
+
+  it("keeps the cookies of a request bound to no account out of every jar", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd) =>
+      cmd === "get_auth_context" ? context(null) : false,
+    );
+    vi.mocked(tauriFetch).mockResolvedValue({
+      ok: true,
+      status: 200,
+      url: "https://music.youtube.com/youtubei/v1/browse",
+      headers: { getSetCookie: () => ["YSC=x; Domain=.youtube.com"] },
+      json: async () => ({}),
+    } as unknown as Response);
+    await innertubePost("browse", {}, { forAccount: null });
+    expect(tauriFetch).toHaveBeenCalledTimes(1);
+    expect(invoke).not.toHaveBeenCalledWith(
+      "merge_response_cookies",
+      expect.anything(),
+    );
+  });
+
   it("sends when the credentials are that account's", async () => {
     vi.mocked(invoke).mockResolvedValue(context("A"));
     vi.mocked(tauriFetch).mockResolvedValue(

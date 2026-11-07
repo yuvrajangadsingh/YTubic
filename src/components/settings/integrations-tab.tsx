@@ -8,7 +8,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
-import { Loader2, Unplug } from "lucide-react";
+import { HistoryIcon, Loader2, Unplug } from "lucide-react";
 
 import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
@@ -272,10 +272,24 @@ export function IntegrationsTab() {
   const setDiscordRichPresence = useSettingsStore(
     (s) => s.setDiscordRichPresence,
   );
+  const ytHistory = useSettingsStore((s) => s.ytHistory);
+  const setYtHistory = useSettingsStore((s) => s.setYtHistory);
 
   return (
     <TabPane tightTop>
       <Group>
+        <SettingRow
+          icon={HistoryIcon}
+          title="Add plays to YouTube history"
+          description="Songs you play here show up in your YouTube history and shape your home feed and radio, like in YouTube's own apps."
+          control={
+            <Switch
+              checked={ytHistory}
+              onCheckedChange={setYtHistory}
+              aria-label="Add plays to YouTube history"
+            />
+          }
+        />
         <SettingRow
           icon={DiscordIcon}
           title="Discord Rich Presence"

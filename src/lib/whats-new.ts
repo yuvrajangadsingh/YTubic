@@ -55,6 +55,59 @@ export type WhatsNewEntry = {
  */
 export const WHATS_NEW: WhatsNewEntry[] = [
   {
+    version: "0.6.0",
+    date: "November 7, 2026",
+    summary:
+      "Pick up where you stopped, a sleep timer, and a way out of wrong lyrics",
+    changes: [
+      {
+        type: "new",
+        title: "Resume after a restart",
+        text: "The last track comes back at the point where it stopped, paused, ready for you to press play.",
+      },
+      {
+        type: "new",
+        title: "Sleep timer",
+        text: "More, then Sleep timer: pause after 15, 30, 45 or 60 minutes, or when the current track ends.",
+      },
+      {
+        type: "new",
+        title: "Wrong lyrics? Try another source",
+        text: "The lyrics source menu can now skip a source for one song, without pinning a source for every other song.",
+      },
+      {
+        type: "new",
+        title: "Plays reach your YouTube history",
+        text: "Songs you play here now show up in your YouTube history and shape your home feed and radio, like in YouTube's own apps. It's on by default. Turn it off in Settings, Integrations.",
+      },
+      {
+        type: "improved",
+        title: "Musixmatch removed",
+        text: "It had stopped returning lyrics, so the app no longer asks it. Lyrics come from YouTube Music, LRCLIB and Genius.",
+      },
+      {
+        type: "fixed",
+        title: "Lyrics display",
+        text: "A long active line no longer loses its last word off the right edge in the fullscreen player, and the music-break note sits on the right in Urdu and other RTL songs.",
+      },
+      {
+        type: "fixed",
+        title: "The queue saves while a track plays",
+        text: "Quitting in the middle of a track used to lose queue changes made since the last pause.",
+      },
+      {
+        type: "security",
+        title: "Casting no longer logs the stream token",
+        text: "The log used to include the stream server's access token while casting. It's now hidden.",
+      },
+      {
+        type: "security",
+        title: "Sign-out with a download running",
+        text: "Each account now has its own yt-dlp cookie copy in a private folder, so a download still running at sign-out can't write the old session into the next account's copy.",
+      },
+    ],
+  },
+  {
     version: "0.5.4",
     date: "November 4, 2026",
     summary: "Signing out now removes saved Google cookies",

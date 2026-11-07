@@ -2,6 +2,7 @@ import { useState } from "react";
 import {
   CheckIcon,
   Loader2Icon,
+  MoonIcon,
   MoreVerticalIcon,
   MusicIcon,
   VideoIcon,
@@ -22,6 +23,9 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -32,6 +36,7 @@ import {
 } from "@/components/shared/track-context-menu";
 import { findAlternateVideoId } from "@/lib/innertube/alternate-source";
 import { isFloatingPlayerWindow } from "@/lib/floating-player";
+import { useSleepTimer } from "@/lib/sleep-timer";
 import {
   useTrackSourceStore,
   type SourceKind,
@@ -172,6 +177,14 @@ function PlayerMoreMenuInner({
                 onGoToArtist={onGoToArtist}
                 onGoToAlbum={onGoToAlbum}
               />
+              {/* The timer runs beside the audio engine, in the main
+                  window; the floating player only mirrors its state. */}
+              {isFloatingPlayerWindow() ? null : (
+                <>
+                  <DropdownMenuSeparator />
+                  <SleepTimerMenu />
+                </>
+              )}
             </>
           ) : null}
         </DropdownMenuContent>
@@ -270,5 +283,49 @@ function SourceMenuItems({ track }: { track: QueueTrack }) {
         {selected === "video" ? <CheckIcon className="size-4" /> : null}
       </DropdownMenuItem>
     </>
+  );
+}
+
+const SLEEP_MINUTES = [15, 30, 45, 60];
+
+function SleepTimerMenu() {
+  const { endsAt, afterTrack, setMinutes, setAfterTrack, clear } =
+    useSleepTimer();
+  // Read when the menu renders; it isn't open long enough to need a tick.
+  const left = endsAt
+    ? Math.max(1, Math.ceil((endsAt - Date.now()) / 60_000))
+    : 0;
+  const status = afterTrack
+    ? "end of track"
+    : endsAt
+      ? `${left} min left`
+      : null;
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger>
+        <MoonIcon className="size-4" />
+        <span className="flex-1">Sleep timer</span>
+        {status ? (
+          <span className="text-xs text-muted-foreground">{status}</span>
+        ) : null}
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent>
+        {SLEEP_MINUTES.map((m) => (
+          <DropdownMenuItem key={m} onSelect={() => setMinutes(m)}>
+            {m === 60 ? "1 hour" : `${m} minutes`}
+          </DropdownMenuItem>
+        ))}
+        <DropdownMenuItem onSelect={setAfterTrack}>
+          <span className="flex-1">End of track</span>
+          {afterTrack ? <CheckIcon className="size-4" /> : null}
+        </DropdownMenuItem>
+        {status ? (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={clear}>Turn off</DropdownMenuItem>
+          </>
+        ) : null}
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
   );
 }

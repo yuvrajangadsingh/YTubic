@@ -9,6 +9,27 @@ time; they are quoted, not rounded up.
 
 ---
 
+## 2026-11-07 · Musixmatch removed as a lyrics source
+
+**Decided:** delete the provider, its allowlist entry and its mentions in the
+README and About. Sources are now YouTube Music, LRCLIB and Genius.
+
+**Why:** on 2026-11-06 and 2026-11-07 `apic-desktop.musixmatch.com` answered
+every `track.search` ("Lady in Black", "Die With A Smile", "Flowers") with the
+same list headed by "Casual" by Doja Cat, whose subtitles 404. A fresh token,
+a fresh token with its cookies, and an all-zeros token got identical answers,
+so it is not our token. One IP tested. The title/artist matcher dropped those
+hits, so listeners saw nothing wrong, but every uncached track's title and
+artist still went there for no lyrics. pear-desktop #4684 reports made-up
+words from the same endpoint.
+
+**Rejected:** `apic-appmobile` with an iOS app id. It returned the right synced
+lyrics for three songs once, then `token.get` answered `401 captcha` within
+minutes. An endpoint meant for another app, gated after a few requests, is not
+something to send every listener's plays to.
+
+---
+
 ## 2026-09-06 · Windows support removed from the code
 
 **Decided:** delete the Windows code, not just the CI job. Gone: the DPAPI

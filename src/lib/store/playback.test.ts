@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PlaybackState, QueueTrack } from "@/lib/store/playback";
 
 // The store decides at import time whether to wrap itself in
@@ -11,7 +11,8 @@ import type { PlaybackState, QueueTrack } from "@/lib/store/playback";
   location: { search: "?floating-player" },
 };
 
-const { usePlaybackStore } = await import("@/lib/store/playback");
+const { usePlaybackStore, resumePoint, createThrottledStorage } =
+  await import("@/lib/store/playback");
 
 function track(videoId: string): QueueTrack {
   return { videoId, title: videoId, thumbnails: [] };
@@ -151,5 +152,63 @@ describe("queueContinuation lifecycle", () => {
     expect(usePlaybackStore.getState().queueContinuation).toBe("tok2");
     usePlaybackStore.getState().setQueueContinuation(undefined);
     expect(usePlaybackStore.getState().queueContinuation).toBeUndefined();
+  });
+});
+
+describe("resumePoint", () => {
+  const t = { ...track("a"), duration: 200 };
+
+  it("resumes the saved playhead of the current track", () => {
+    expect(resumePoint(t, 73)).toEqual({ videoId: "a", seconds: 73 });
+    expect(resumePoint(track("b"), 73)).toEqual({ videoId: "b", seconds: 73 });
+  });
+
+  it("starts over near the start or the end, or with nothing saved", () => {
+    expect(resumePoint(t, 4)).toBeUndefined();
+    expect(resumePoint(t, 195)).toBeUndefined();
+    expect(resumePoint(t, undefined)).toBeUndefined();
+    expect(resumePoint(undefined, 73)).toBeUndefined();
+  });
+});
+
+describe("createThrottledStorage", () => {
+  it("keeps writing while changes never stop, the newest value each time", () => {
+    vi.useFakeTimers();
+    const saved: string[] = [];
+    Object.assign(globalThis.window as object, {
+      setTimeout,
+      clearTimeout,
+      localStorage: { setItem: (_: string, v: string) => saved.push(v) },
+    });
+    const storage = createThrottledStorage(1000);
+    // A position tick every 250 ms for 3 s: the old debounce wrote nothing.
+    for (let i = 1; i <= 12; i++) {
+      void storage.setItem("k", String(i));
+      vi.advanceTimersByTime(250);
+    }
+    expect(saved).toEqual(["4", "8", "12"]);
+    vi.useRealTimers();
+  });
+});
+
+describe("launch resume", () => {
+  const resume = { videoId: "a", seconds: 73 };
+
+  it("survives a queue edit that keeps the track, not a seek or a new track", () => {
+    usePlaybackStore.setState({
+      queue: [track("x"), track("a"), track("b")],
+      index: 1,
+      pendingSeek: undefined,
+      resumeAt: resume,
+    });
+    usePlaybackStore.setState({ queue: [track("a"), track("b")], index: 0 });
+    expect(usePlaybackStore.getState().resumeAt).toEqual(resume);
+
+    usePlaybackStore.setState({ pendingSeek: 20 });
+    expect(usePlaybackStore.getState().resumeAt).toBeUndefined();
+
+    usePlaybackStore.setState({ pendingSeek: undefined, resumeAt: resume });
+    usePlaybackStore.setState({ index: 1 });
+    expect(usePlaybackStore.getState().resumeAt).toBeUndefined();
   });
 });

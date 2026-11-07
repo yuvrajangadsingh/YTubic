@@ -25,7 +25,8 @@ import {
 } from "@/lib/lyrics/sources";
 import { usePlaybackStore } from "@/lib/store/playback";
 import { estimateLeadInOffset } from "@/lib/lyrics/auto-align";
-import { textDir } from "@/lib/lyrics/text-dir";
+import { lineDir } from "@/lib/lyrics/text-dir";
+import { useLyricsSkip } from "@/lib/lyrics/skip";
 import type { QueueTrack } from "@/lib/store/playback";
 import { cn } from "@/lib/utils";
 
@@ -67,6 +68,7 @@ export type LyricsViewState = {
   availability: Record<LyricsSource, Availability>;
   /** Estimated lead-in in seconds; positive = lyrics fire later. */
   offset: number;
+  videoId: string | undefined;
 };
 
 /**
@@ -171,6 +173,7 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
     best,
     availability,
     offset: autoOffset,
+    videoId,
   };
 }
 
@@ -300,6 +303,11 @@ function TimedLyrics({
   const rafRef = useRef<number | null>(null);
   const position = usePlaybackStore((s) => s.position);
   const seek = usePlaybackStore((s) => s.seek);
+  // Once per sheet, not per playback tick: a run of breaks scans outward.
+  const dirs = useMemo(() => {
+    const texts = lines.map((l) => l.text);
+    return texts.map((_, i) => lineDir(texts, i));
+  }, [lines]);
   // False while the active line sits above its anchor because the column
   // is already scrolled to the top (a line early in the song): it then
   // overlaps the blur strip, which has to get out of the way.
@@ -500,7 +508,7 @@ function TimedLyrics({
               key={i}
               type="button"
               data-line-idx={i}
-              dir={textDir(line.text)}
+              dir={dirs[i]}
               onClick={() => seek(line.start + offset)}
               style={{ "--line-o": String(fall) } as React.CSSProperties}
               className={cn(
@@ -529,13 +537,18 @@ function TimedLyrics({
                 // next few lines are visible with a steep falloff.
                 // Hovering the column (group-hover, fast duration)
                 // brings everything back for scanning/seeking.
+                // The active line's 1.04 scale grows from the start edge,
+                // so a line that wraps to the full column width would end
+                // 4% past it and get clipped by the scroll container. The
+                // width is cut by the same factor to keep it inside; RTL
+                // lines push to the right edge, where they start.
                 // NOTE: `filter` is deliberately NOT in the transition
                 // list. Animating blur forces WebKit to re-rasterize
                 // every line's layer each frame, which starves the
                 // rAF scroll (the column visibly stutter-jumped on
                 // every line change). Snapped blur under motion is
                 // imperceptible; scroll stays pure compositing.
-                "lyrics-line origin-left rtl:origin-right cursor-pointer rounded-md px-2 py-1 text-start text-lg font-[650] leading-snug opacity-(--line-o) transition-[scale,color,opacity] duration-[1260ms] ease-in-out hover:bg-black/30 hover:blur-none group-hover:duration-200",
+                "lyrics-line w-[calc(100%/1.04)] wrap-break-word origin-left rtl:ml-auto rtl:origin-right cursor-pointer rounded-md px-2 py-1 text-start text-lg font-[650] leading-snug opacity-(--line-o) transition-[scale,color,opacity] duration-[1260ms] ease-in-out hover:bg-black/30 hover:blur-none group-hover:duration-200",
                 isActive
                   ? "scale-[1.04] text-foreground blur-none"
                   : melt === "full"
@@ -596,7 +609,12 @@ export function LyricsSourceButton({
   state: LyricsViewState;
   className?: string;
 }) {
-  const { pref, setPref, best, availability } = state;
+  const { pref, setPref, best, availability, videoId } = state;
+  const skipped = useLyricsSkip((s) =>
+    videoId ? s.byVideo[videoId] : undefined,
+  );
+  const skip = useLyricsSkip((s) => s.skip);
+  const reset = useLyricsSkip((s) => s.reset);
 
   return (
     <DropdownMenu>
@@ -628,6 +646,18 @@ export function LyricsSourceButton({
           </span>
           {pref === "auto" ? <CheckIcon className="size-4" /> : null}
         </DropdownMenuItem>
+        {/* The per-song escape: a pinned source is for every song, and
+            wrong words on one song should not cost the rest theirs. */}
+        {pref === "auto" && videoId && best ? (
+          <DropdownMenuItem onSelect={() => skip(videoId, best)}>
+            Wrong lyrics? Try another source
+          </DropdownMenuItem>
+        ) : null}
+        {pref === "auto" && videoId && skipped?.length ? (
+          <DropdownMenuItem onSelect={() => reset(videoId)}>
+            Use skipped sources again
+          </DropdownMenuItem>
+        ) : null}
         <DropdownMenuSeparator />
         {SOURCE_ORDER.map((s) => {
           const a = availability[s];

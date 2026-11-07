@@ -926,7 +926,13 @@ async fn ytdlp_cookie_file(app: &tauri::AppHandle) -> Option<PathBuf> {
         // failure mode.
         return None;
     }
-    let path = ytdlp_cookie_dir(app)?.join("cookies.txt");
+    // One file per account. yt-dlp writes its cookie file back when it exits,
+    // so a download still running at a sign-out writes the old session out
+    // then. Removing the dir stops that (the write fails), but a sign-in
+    // before the exit recreates the dir, and with one shared name the old
+    // session would land in the new account's file.
+    let dir = ytdlp_cookie_dir(app)?;
+    let path = dir.join(format!("{id}.txt"));
     // yt-dlp rewrites this file when YouTube rotates a cookie mid-run, so
     // it has to be our own copy and never the real jar.
     //
@@ -945,11 +951,36 @@ async fn ytdlp_cookie_file(app: &tauri::AppHandle) -> Option<PathBuf> {
     if read_index(app).await.active.as_deref() != Some(id.as_str()) {
         return None;
     }
+    // Owner-only before anything is written into it: a late write-back
+    // creates its file with yt-dlp's default mode, so the dir is what keeps
+    // it private. No export rather than an exposed one.
+    if let Err(e) = private_dir(&dir) {
+        eprintln!("[auth] yt-dlp cookie dir: {e}");
+        return None;
+    }
     if let Err(e) = authfs::write_atomic(path.clone(), jar.into_bytes(), 0o600).await {
         eprintln!("[auth] yt-dlp cookie export: {e}");
         return None;
     }
+    // Again: a sign-out that removed the dir mid-write let write_atomic
+    // recreate it with the default mode.
+    if let Err(e) = private_dir(&dir) {
+        eprintln!("[auth] yt-dlp cookie dir: {e}");
+        return None;
+    }
     Some(path)
+}
+
+fn private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        // An existing dir from an older build keeps its old mode otherwise.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
 }
 
 fn ytdlp_cookie_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
@@ -3108,6 +3139,7 @@ async fn merge_response_cookies(
     app: tauri::AppHandle,
     host: String,
     set_cookies: Vec<String>,
+    for_account: Option<String>,
 ) -> Result<bool, String> {
     if set_cookies.is_empty() {
         return Ok(false);
@@ -3115,6 +3147,12 @@ async fn merge_response_cookies(
     let Some(id) = read_index(&app).await.active else {
         return Ok(false);
     };
+    // A request bound to an account names it here. After a switch mid-flight
+    // the active jar is someone else's, and the rotation is dropped rather
+    // than written into it.
+    if for_account.is_some_and(|a| a != id) {
+        return Ok(false);
+    }
     // Held across the whole read-modify-write, and shared with the refresh
     // commit and the login write, so a rotation can no longer be lost to a
     // snapshot landing between the read and the rename.
@@ -5954,6 +5992,20 @@ mod tests {
         std::fs::write(dir.join("cookies.txt.tmp"), "SAPISID").unwrap();
         super::remove_dir_if_present(&dir).unwrap();
         assert!(!dir.exists());
+        super::remove_dir_if_present(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_export_dir_is_owner_only_even_when_it_already_existed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("radif-export-mode-{}", std::process::id()));
+        let mode = |d: &std::path::Path| std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
+        super::private_dir(&dir).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::private_dir(&dir).unwrap();
+        assert_eq!(mode(&dir), 0o700);
         super::remove_dir_if_present(&dir).unwrap();
     }
 
