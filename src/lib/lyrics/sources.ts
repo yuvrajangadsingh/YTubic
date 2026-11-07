@@ -7,6 +7,7 @@ import { useLyricsSkip } from "@/lib/lyrics/skip";
 import {
   describeLyricsError,
   LyricsTimeoutError,
+  shouldRefetchLyricsOnFocus,
   shouldRetryLyricsQuery,
 } from "@/lib/lyrics/errors";
 import { appLog } from "@/lib/app-log";
@@ -171,7 +172,7 @@ export function useLyricsSources(
     enabled: askYtMusic,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
-    refetchOnWindowFocus: false,
+    refetchOnWindowFocus: shouldRefetchLyricsOnFocus,
   });
 
   // v2: matching semantics changed (artist-less tracks are no longer
@@ -216,7 +217,7 @@ export function useLyricsSources(
     enabled: askByText,
     staleTime: ONE_HOUR,
     retry: shouldRetryLyricsQuery,
-    refetchOnWindowFocus: false,
+    refetchOnWindowFocus: shouldRefetchLyricsOnFocus,
   });
 
   const queries: Record<LyricsSource, UseQueryResult<Lyrics | null>> = {

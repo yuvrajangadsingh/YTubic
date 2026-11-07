@@ -8,6 +8,7 @@ import {
   LyricsTimeoutError,
   shouldRetryLyricsQuery,
   type LyricsOp,
+  shouldRefetchLyricsOnFocus,
 } from "./errors";
 
 // `vi.resetModules()` gives the providers a fresh copy of ./errors, so the
@@ -85,6 +86,38 @@ describe("a refusal is not 'no lyrics', and must not be retried at once", () => 
       status: 429,
     }));
     await expect(fetchLrclibLyrics(TRACK)).rejects.toBeInstanceOf(RateLimit);
+  });
+
+  it("a rate limit wins when the other LRCLIB endpoint failed too", async () => {
+    const { fetchLrclibLyrics, RateLimit } = await setup((url) =>
+      url.includes("/api/get") ? { status: 503 } : { status: 429 },
+    );
+    await expect(fetchLrclibLyrics(TRACK)).rejects.toBeInstanceOf(RateLimit);
+  });
+
+  it("refetches on focus after a network or server failure only", () => {
+    const failed = (error: unknown) => ({
+      state: { status: "error", data: undefined, error },
+    });
+    expect(shouldRefetchLyricsOnFocus(failed(new Error("offline")))).toBe(true);
+    expect(
+      shouldRefetchLyricsOnFocus(
+        failed(new LyricsHttpError(503, "LRCLIB /get")),
+      ),
+    ).toBe(true);
+    expect(
+      shouldRefetchLyricsOnFocus(
+        failed(new LyricsHttpError(403, "LRCLIB /get")),
+      ),
+    ).toBe(false);
+    expect(
+      shouldRefetchLyricsOnFocus(failed(new LyricsRateLimitError("gated"))),
+    ).toBe(false);
+    expect(
+      shouldRefetchLyricsOnFocus({
+        state: { status: "success", data: null, error: null },
+      }),
+    ).toBe(false);
   });
 
   it("shouldRetryLyricsQuery refuses to re-run a rate limit", () => {

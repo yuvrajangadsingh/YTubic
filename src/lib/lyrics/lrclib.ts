@@ -116,8 +116,13 @@ async function lookup(
     get ??
     search;
   if (!rec) {
-    if (getRes.status === "rejected") throw getRes.reason;
-    if (searchRes.status === "rejected") throw searchRes.reason;
+    // A rate limit wins over the other endpoint's failure: it's the one
+    // that must not be retried at once.
+    const failures = [getRes, searchRes].flatMap((r) =>
+      r.status === "rejected" ? [r.reason] : [],
+    );
+    const limited = failures.find((e) => e instanceof LyricsRateLimitError);
+    if (limited || failures.length > 0) throw limited ?? failures[0];
   }
   return rec ? mapRecord(rec, p.duration) : null;
 }

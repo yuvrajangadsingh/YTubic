@@ -144,6 +144,18 @@ const AUTO_RETRIES = 1;
  * `TError` from this predicate, and widening it here would widen every
  * consumer of `queries[s].error` along with it.
  */
+/** Focus refetch for a lyrics query that failed with nothing to show: worth
+ *  it after a network or server failure (an offline launch), not after a
+ *  refusal or a 4xx, which the next focus would only repeat. */
+export function shouldRefetchLyricsOnFocus(query: {
+  state: { status: string; data: unknown; error: unknown };
+}): boolean {
+  const { status, data, error } = query.state;
+  if (status !== "error" || data !== undefined) return false;
+  if (error instanceof LyricsRateLimitError) return false;
+  return !(error instanceof LyricsHttpError && error.status < 500);
+}
+
 export function shouldRetryLyricsQuery(
   failureCount: number,
   error: Error,
