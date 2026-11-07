@@ -22,4 +22,20 @@ describe("play next", () => {
     expect(s.queue.map((x) => x.videoId)).toEqual(["a", "b", "d", "c"]);
     expect(s.index).toBe(1);
   });
+
+  it("moves a row to the end through the drop zone below the last row", () => {
+    usePlaybackStore.setState({
+      queue: ["a", "b", "c", "d"].map(t),
+      index: 0,
+    });
+    const { index, queue, moveTrack } = usePlaybackStore.getState();
+    // What the drop zone does: moveTrack(dragFrom, index + upcoming.length).
+    moveTrack(1, index + (queue.length - 1 - index));
+    expect(usePlaybackStore.getState().queue.map((x) => x.videoId)).toEqual([
+      "a",
+      "c",
+      "d",
+      "b",
+    ]);
+  });
 });

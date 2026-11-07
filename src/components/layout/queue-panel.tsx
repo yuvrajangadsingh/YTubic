@@ -273,6 +273,35 @@ function QueueTabBody({
                 />
               );
             })}
+            {/* Drop below the last row: dropping on a row inserts before it,
+                so without this a song could never be moved to the end (QA L4). */}
+            {(() => {
+              const end = index + upcoming.length;
+              return (
+                <div
+                  aria-hidden
+                  className={cn(
+                    "relative h-6",
+                    dragOver === end + 1 &&
+                      "before:pointer-events-none before:absolute before:inset-x-1 before:top-0 before:h-0.5 before:rounded-full before:bg-brand",
+                  )}
+                  onDragOver={(e) => {
+                    if (dragFrom === null) return;
+                    e.preventDefault();
+                    setDragOver(end + 1);
+                  }}
+                  onDragLeave={() => setDragOver(null)}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    if (dragFrom !== null && dragFrom !== end) {
+                      onMoveTrack(dragFrom, end);
+                    }
+                    setDragFrom(null);
+                    setDragOver(null);
+                  }}
+                />
+              );
+            })()}
           </QueueSection>
         </>
       ) : active ? (
