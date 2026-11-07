@@ -178,6 +178,15 @@ function parse(word: string, s: Script): Akshara[] {
       last.inherent = false;
     } else if (ch === s.doubler) {
       doubled = true;
+    } else if (ch === "\u0B83") {
+      // Tamil's aytham, a breathy h with no vowel of its own (ehku).
+      out.push({
+        consonant: "h",
+        doubled: false,
+        vowel: "",
+        inherent: false,
+        nasal: false,
+      });
     } else if (ch !== "\u200C" && ch !== "\u200D") {
       // Nothing in a line is dropped: what the tables don't know stays.
       out.push({
