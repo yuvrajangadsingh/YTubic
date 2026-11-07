@@ -3,6 +3,7 @@ import { toast } from "sonner";
 import { useShallow } from "zustand/react/shallow";
 import {
   ListMusicIcon,
+  ListStartIcon,
   PlayIcon,
   PauseIcon,
   Volume2Icon,
@@ -170,6 +171,7 @@ export function QueueBody({ onClose }: { onClose?: () => void }) {
               onGoTo={goTo}
               onRemoveAt={removeAt}
               onMoveTrack={moveTrack}
+              onPlayNext={(i) => moveTrack(i, index + 1)}
             />
           ) : (
             <HistoryTabBody
@@ -197,6 +199,7 @@ function QueueTabBody({
   onGoTo,
   onRemoveAt,
   onMoveTrack,
+  onPlayNext,
 }: {
   active: ReturnType<typeof currentTrack>;
   playing: boolean;
@@ -210,6 +213,7 @@ function QueueTabBody({
   onGoTo: (i: number) => void;
   onRemoveAt: (i: number) => void;
   onMoveTrack: (from: number, to: number) => void;
+  onPlayNext: (i: number) => void;
 }) {
   if (!active && upcoming.length === 0) {
     return (
@@ -239,6 +243,7 @@ function QueueTabBody({
                   track={t}
                   onActivate={() => onGoTo(queueIdx)}
                   onRemove={() => onRemoveAt(queueIdx)}
+                  onPlayNext={i > 0 ? () => onPlayNext(queueIdx) : undefined}
                   draggable
                   isDragging={dragFrom === queueIdx}
                   isDropTarget={dragOver === queueIdx && dragFrom !== queueIdx}
@@ -401,6 +406,7 @@ function QueueRow({
   playing = false,
   onActivate,
   onRemove,
+  onPlayNext,
   draggable = false,
   isDragging = false,
   isDropTarget = false,
@@ -421,6 +427,7 @@ function QueueRow({
   playing?: boolean;
   onActivate: () => void;
   onRemove?: () => void;
+  onPlayNext?: () => void;
   draggable?: boolean;
   isDragging?: boolean;
   isDropTarget?: boolean;
@@ -554,12 +561,31 @@ function QueueRow({
         <span className="text-xs tabular-nums text-muted-foreground">
           {formatDuration(track.duration)}
         </span>
+        {onPlayNext && (
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Play next"
+            title="Play next"
+            className="w-0 overflow-hidden opacity-0 transition-[width,opacity,margin] duration-150 group-hover:ml-1 group-hover:w-6 group-hover:opacity-100 focus-visible:ml-1 focus-visible:w-6 focus-visible:opacity-100"
+            // The row plays on Enter and Space; this button's own keys stay its own.
+            onKeyDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              onPlayNext();
+            }}
+          >
+            <ListStartIcon />
+          </Button>
+        )}
         {onRemove && (
           <Button
             variant="ghost"
             size="icon-xs"
             aria-label="Remove from queue"
-            className="w-0 overflow-hidden opacity-0 transition-[width,opacity,margin] duration-150 group-hover:ml-1 group-hover:w-6 group-hover:opacity-100"
+            className="w-0 overflow-hidden opacity-0 transition-[width,opacity,margin] duration-150 group-hover:ml-1 group-hover:w-6 group-hover:opacity-100 focus-visible:ml-1 focus-visible:w-6 focus-visible:opacity-100"
+            // The row plays on Enter and Space; this button's own keys stay its own.
+            onKeyDown={(e) => e.stopPropagation()}
             onClick={(e) => {
               e.stopPropagation();
               onRemove();
