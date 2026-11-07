@@ -45,3 +45,26 @@ export function correctedDuration(
   if (ratio > 1.8 && ratio < 2.2) return metaSec;
   return elementSec;
 }
+
+/**
+ * The "track finished" signal. WebKit reports `ended` true on an element
+ * replayed after it ended (play() at the end, then running out again) but
+ * never fires the event, so playback sat on the last second forever. The
+ * final timeupdate does arrive with `ended` true, so both lead here, and the
+ * latch keeps a normal end, which gets both, from advancing twice.
+ */
+export function trackEndLatch(advance: () => void) {
+  let handled = false;
+  const finish = () => {
+    if (handled) return;
+    handled = true;
+    advance();
+  };
+  return {
+    onEnded: finish,
+    onTimeUpdate: (el: { ended: boolean; paused: boolean }) => {
+      if (!el.ended) handled = false;
+      else if (!el.paused) finish();
+    },
+  };
+}
