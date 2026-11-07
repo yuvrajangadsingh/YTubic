@@ -454,18 +454,15 @@ function QueueRow({
     <PlayIcon className="size-4 fill-current" />
   );
 
+  // The row's own button covers the cover and title, and the action buttons
+  // sit beside it, not inside: WebKit sends an AX press on a role="button"
+  // element to its first descendant button, visible or not, so a press on
+  // the row used to hit Play next (QA L3). A click anywhere on the row still
+  // plays it.
   return (
     <div
-      role="button"
-      tabIndex={0}
       draggable={draggable}
       onClick={onActivate}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onActivate();
-        }
-      }}
       onDragStart={(e) => {
         if (!draggable) return;
         // Some browsers refuse to start a drag without dataTransfer payload.
@@ -491,72 +488,81 @@ function QueueRow({
       className={cn(
         "group relative grid grid-cols-[auto_1fr_auto] items-center gap-3 rounded-md px-2 py-1.5 outline-none",
         "cursor-pointer select-none",
-        "focus-visible:ring-2 focus-visible:ring-ring",
         active ? "bg-accent" : "hover:bg-accent/60",
         isDragging && "opacity-40",
         isDropTarget &&
           "before:pointer-events-none before:absolute before:inset-x-1 before:-top-px before:h-0.5 before:rounded-full before:bg-brand",
       )}
     >
-      {/* `pointer-events-none` — the inner <img> is `draggable` by
+      <div
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onActivate();
+          }
+        }}
+        className="col-span-2 grid grid-cols-[auto_1fr] items-center gap-3 rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        {/* `pointer-events-none` — the inner <img> is `draggable` by
           default in every browser, which competes with the row's own
           drag (the user grabs the cover, the browser starts a native
           image-drag instead of our row reorder). Disabling pointer
           events on the wrapper makes the thumbnail transparent to
           mouse/drag events, so they bubble straight to the row. */}
-      <div className="pointer-events-none relative size-10 shrink-0 overflow-hidden rounded-md">
-        <Thumbnail
-          thumbnails={track.thumbnails}
-          alt={track.title}
-          className="size-10"
-          targetSize={80}
-        />
-        <span
-          className={cn(
-            "absolute inset-0 flex items-center justify-center bg-black/50 text-white",
-            active ? "opacity-100" : "opacity-0 group-hover:opacity-100",
-          )}
-        >
-          {/* Active+playing also shows the speaker glyph at rest as a
+        <div className="pointer-events-none relative size-10 shrink-0 overflow-hidden rounded-md">
+          <Thumbnail
+            thumbnails={track.thumbnails}
+            alt={track.title}
+            className="size-10"
+            targetSize={80}
+          />
+          <span
+            className={cn(
+              "absolute inset-0 flex items-center justify-center bg-black/50 text-white",
+              active ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+            )}
+          >
+            {/* Active+playing also shows the speaker glyph at rest as a
               state indicator; on hover we swap to the Pause icon to
               make the click action obvious. */}
-          {active && playing ? (
-            <>
-              <Volume2Icon className="size-4 group-hover:hidden" />
-              <PauseIcon className="hidden size-4 fill-current group-hover:block" />
-            </>
-          ) : (
-            overlayIcon
-          )}
-        </span>
-        {/* Adaptive hairline — last in DOM so it stays on top of the
+            {active && playing ? (
+              <>
+                <Volume2Icon className="size-4 group-hover:hidden" />
+                <PauseIcon className="hidden size-4 fill-current group-hover:block" />
+              </>
+            ) : (
+              overlayIcon
+            )}
+          </span>
+          {/* Adaptive hairline — last in DOM so it stays on top of the
             hover overlay; the difference blend keeps it readable
             against both the cover and the bg-black/50 hover wash. */}
-        <span
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-0 rounded-md border border-white opacity-10 mix-blend-difference"
-        />
+          <span
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-0 rounded-md border border-white opacity-10 mix-blend-difference"
+          />
+        </div>
+
+        <div className="flex min-w-0 flex-col text-left">
+          <span
+            className={cn(
+              "truncate text-sm font-medium",
+              active && "text-brand",
+            )}
+          >
+            {track.title}
+          </span>
+          <span className="truncate text-xs text-muted-foreground">
+            {subtitle}
+          </span>
+        </div>
       </div>
 
-      <div className="flex min-w-0 flex-col text-left">
-        <span
-          className={cn(
-            "truncate text-sm font-medium",
-            active && "text-brand",
-          )}
-        >
-          {track.title}
-        </span>
-        <span className="truncate text-xs text-muted-foreground">
-          {subtitle}
-        </span>
-      </div>
-
-      {/* Duration + remove. The remove button has zero width by
-          default — `w-0 overflow-hidden opacity-0` — and animates to
-          `w-6 + ml-1` on row hover, sliding in from the right and
-          pushing the duration leftwards instead of being permanently
-          reserved space that's just invisible. */}
+      {/* Duration, then the row buttons: zero-width and invisible (out of
+          the accessibility tree and the tab order) until the row is hovered
+          or focused, then they slide in. */}
       <div className="flex items-center">
         <span className="text-xs tabular-nums text-muted-foreground">
           {formatDuration(track.duration)}
@@ -567,9 +573,7 @@ function QueueRow({
             size="icon-xs"
             aria-label="Play next"
             title="Play next"
-            className="w-0 overflow-hidden opacity-0 transition-[width,opacity,margin] duration-150 group-hover:ml-1 group-hover:w-6 group-hover:opacity-100 focus-visible:ml-1 focus-visible:w-6 focus-visible:opacity-100"
-            // The row plays on Enter and Space; this button's own keys stay its own.
-            onKeyDown={(e) => e.stopPropagation()}
+            className="invisible w-0 overflow-hidden opacity-0 transition-[width,opacity,margin] duration-150 group-hover:visible group-hover:ml-1 group-hover:w-6 group-hover:opacity-100 group-focus-within:visible group-focus-within:ml-1 group-focus-within:w-6 group-focus-within:opacity-100"
             onClick={(e) => {
               e.stopPropagation();
               onPlayNext();
@@ -583,9 +587,7 @@ function QueueRow({
             variant="ghost"
             size="icon-xs"
             aria-label="Remove from queue"
-            className="w-0 overflow-hidden opacity-0 transition-[width,opacity,margin] duration-150 group-hover:ml-1 group-hover:w-6 group-hover:opacity-100 focus-visible:ml-1 focus-visible:w-6 focus-visible:opacity-100"
-            // The row plays on Enter and Space; this button's own keys stay its own.
-            onKeyDown={(e) => e.stopPropagation()}
+            className="invisible w-0 overflow-hidden opacity-0 transition-[width,opacity,margin] duration-150 group-hover:visible group-hover:ml-1 group-hover:w-6 group-hover:opacity-100 group-focus-within:visible group-focus-within:ml-1 group-focus-within:w-6 group-focus-within:opacity-100"
             onClick={(e) => {
               e.stopPropagation();
               onRemove();

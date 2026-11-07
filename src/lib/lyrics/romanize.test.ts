@@ -86,6 +86,35 @@ describe("romanize", () => {
     expect(romanize("राम॰राम")).toBe("raam॰raam");
   });
 
+  it("drops the final vowel after a cluster, unless it ends in r or y (QA M2)", () => {
+    expect(romanize("वक़्त")).toBe("vaqt");
+    expect(romanize("इश्क़")).toBe("ishq");
+    expect(romanize("दर्द")).toBe("dard");
+    expect(romanize("दोस्त")).toBe("dost");
+    expect(romanize("मस्त")).toBe("mast");
+    expect(romanize("शब्द")).toBe("shabd");
+    expect(romanize("सख़्त")).toBe("sakht");
+    expect(romanize("मित्र")).toBe("mitra");
+    expect(romanize("सत्य")).toBe("satya");
+    expect(romanize("चंद्र")).toBe("chandra");
+    expect(romanize("फ़िक्र")).toBe("fikr");
+    expect(romanize("उम्र")).toBe("umr");
+    expect(romanize("सब्र")).toBe("sabr");
+    expect(romanize("तुम हो तो वक़्त थमा है")).toBe("tum ho to vaqt thama hai");
+  });
+
+  it("keeps a final long vowel long when it is nasal (QA L2)", () => {
+    expect(romanize("माँ")).toBe("maa");
+    expect(romanize("हाँ")).toBe("haan");
+    expect(romanize("में")).toBe("mein");
+    expect(romanize("मैं")).toBe("main");
+    expect(romanize("नहीं")).toBe("nahin");
+    expect(romanize("आसमाँ")).toBe("aasmaan");
+    expect(romanize("अरमाँ")).toBe("armaan");
+    expect(romanize("कहाँ")).toBe("kahaan");
+    expect(romanize("ਜਾਨਾਂ")).toBe("jaanaan");
+  });
+
   it("keeps other text in a mixed line", () => {
     expect(romanize("Baby तू (ooh), 2 बार")).toBe("Baby tu (ooh), 2 baar");
   });

@@ -1076,11 +1076,13 @@ export function PlayerBar({
             {lyricsState.hasTrack &&
             !lyricsState.isLoading &&
             !lyricsState.active ? (
-              <div className="flex min-h-0 flex-1 flex-col">
+              <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
                 <QueueBody />
               </div>
             ) : (
-              <div className="flex min-h-0 flex-1 flex-col px-3">
+              // Clipped: at the minimum window height this box gets no
+              // room, and the lyrics painted over the bottom row (QA L6).
+              <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-3">
                 <LyricsBody state={lyricsState} />
               </div>
             )}

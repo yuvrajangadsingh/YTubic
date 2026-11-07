@@ -9,7 +9,7 @@ import {
   normalizeTitleForMatch,
 } from "@/lib/lyrics/match";
 import { cleanTrackTitle, reattributedFromTitle } from "@/lib/track-meta";
-import { LyricsHttpError } from "@/lib/lyrics/errors";
+import { LyricsHttpError, LyricsRateLimitError } from "@/lib/lyrics/errors";
 
 /**
  * LRCLIB (https://lrclib.net) — free, open lyrics database with synced
@@ -116,8 +116,13 @@ async function lookup(
     get ??
     search;
   if (!rec) {
-    if (getRes.status === "rejected") throw getRes.reason;
-    if (searchRes.status === "rejected") throw searchRes.reason;
+    // A rate limit wins over the other endpoint's failure: it's the one
+    // that must not be retried at once.
+    const failures = [getRes, searchRes].flatMap((r) =>
+      r.status === "rejected" ? [r.reason] : [],
+    );
+    const limited = failures.find((e) => e instanceof LyricsRateLimitError);
+    if (limited || failures.length > 0) throw limited ?? failures[0];
   }
   return rec ? mapRecord(rec, p.duration) : null;
 }
@@ -143,6 +148,7 @@ async function lrclibGet(
     signal,
   });
   if (r.status === 404) return null;
+  if (r.status === 429) throw new LyricsRateLimitError("LRCLIB /get 429");
   if (!r.ok) throw new LyricsHttpError(r.status, "LRCLIB /get");
   return (await r.json()) as LrclibRecord;
 }
@@ -161,6 +167,7 @@ async function lrclibSearch(
     headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
     signal,
   });
+  if (r.status === 429) throw new LyricsRateLimitError("LRCLIB /search 429");
   if (!r.ok) throw new LyricsHttpError(r.status, "LRCLIB /search");
   const results = (await r.json()) as LrclibRecord[];
   if (!Array.isArray(results) || results.length === 0) return null;
