@@ -9,6 +9,29 @@ time; they are quoted, not rounded up.
 
 ---
 
+## 2026-11-07 · QA findings left for after 0.7.0
+
+**Decided:** these stay as they are in 0.7.0 (the M4's call on the QA pass of
+develop @ 81c9fe7, report in the M5's gitignored `.notes/qa-2026-11-07.md`).
+
+- **Gain arrives late at track start (QA L1).** With Normalize volume on, a
+  track plays at the previous track's gain (gain 1 for the first after launch)
+  until its player response lands, 0.5 to 1 s, or longer if the 60 s memo
+  expired. Already listed as Known on the PR. A fix would hold the element's
+  volume until the gain is known, or fetch the next track's response ahead.
+- **Shuffle on after Play next reshuffles the tail.** `setShuffle` shuffles
+  everything after the current track, so a song placed next loses its place.
+  A fix would keep the next slot out of the shuffle.
+- **Cover and controls overflow at the minimum height** (found by Codex on the
+  L6 fix). At 600 pt with a 420 pt right panel the cover, title and transport
+  controls need more height than the panel has. Lyrics no longer draw over the
+  bottom row; the cover sizing is what's left.
+- **Retry allowance keyed on videoId and index.** The stall watchdog and the
+  error retry remember a retried track as `videoId:index`, so moving it resets
+  its one retry. Harmless; noted while fixing M1.
+
+---
+
 ## 2026-11-07 · Musixmatch removed as a lyrics source
 
 **Decided:** delete the provider, its allowlist entry and its mentions in the
