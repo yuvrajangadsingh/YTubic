@@ -9,6 +9,25 @@ time; they are quoted, not rounded up.
 
 ---
 
+## 2026-11-07 · Genius removed as a lyrics source
+
+**Decided:** delete the provider, its allowlist entry and its README and About
+mentions. Sources are now YouTube Music and LRCLIB. Lyrics queries no longer
+refetch on window focus.
+
+**Why:** every Genius search in the M5 log since Nov 6 answered HTTP 403 (276
+of 276, then about 20 more in the QA pass on Nov 7), and the app's own
+`genius.com/api/search` call 403s from curl too. Errored queries refetch on
+focus by design, so each app activation sent two more doomed requests with the
+track's title and artist. A source that never answers is a dead menu option
+and a privacy cost for nothing.
+
+**Rejected:** keeping it in the menu disabled; nothing on our side can make it
+answer. LRCLIB now treats a 429 as a rate limit (the contract Genius was the
+only provider testing).
+
+---
+
 ## 2026-11-07 · Musixmatch removed as a lyrics source
 
 **Decided:** delete the provider, its allowlist entry and its mentions in the
