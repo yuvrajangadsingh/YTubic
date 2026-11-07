@@ -254,7 +254,7 @@ function tamilVoicing(a: Akshara[]): void {
       x.consonant =
         doubled || (cluster && /^(T|R)$/.test(prevLatin))
           ? "ch"
-          : afterNasal
+          : cluster && prevLatin === "nj"
             ? "j"
             : "s";
     } else {

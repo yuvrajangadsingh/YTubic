@@ -62,6 +62,8 @@ describe("romanize", () => {
     expect(romanize("காற்று")).toBe("kaatru");
     expect(romanize("வெற்றி")).toBe("vetri");
     expect(romanize("தென்றல்")).toBe("thendral");
+    expect(romanize("மின்சாரம்")).toBe("minsaaram");
+    expect(romanize("அம்சம்")).toBe("amsam");
   });
 
   it("handles the schwa rule's edges", () => {
