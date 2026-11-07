@@ -682,7 +682,7 @@ export function LyricsSourceButton({
             wrong words on one song should not cost the rest theirs. */}
         {pref === "auto" && videoId && best ? (
           <DropdownMenuItem onSelect={() => skip(videoId, best)}>
-            Wrong lyrics? Try another source
+            Wrong lyrics? Try another source for this song
           </DropdownMenuItem>
         ) : null}
         {/* Only skips of sources that still exist: a saved one for a removed
@@ -695,6 +695,12 @@ export function LyricsSourceButton({
           </DropdownMenuItem>
         ) : null}
         <DropdownMenuSeparator />
+        {/* A pick here is saved for every song (one ytm:lyrics-source key);
+            the per-song escape is "Wrong lyrics?" above. Say so, since QA
+            took a pick on one song for a per-song choice. */}
+        <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
+          Use for every song
+        </DropdownMenuLabel>
         {SOURCE_ORDER.map((s) => {
           const a = availability[s];
           const dot =
