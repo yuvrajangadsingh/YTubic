@@ -106,7 +106,7 @@ when it launches, at most once every three days.
 
 The fullscreen player shows the cover and synced lyrics over a backdrop taken
 from the artwork, and it crossfades when the track changes. Lyrics come from
-YouTube Music, LRCLIB, Musixmatch and Genius. The app checks that a result is
+YouTube Music, LRCLIB and Genius. The app checks that a result is
 for the song that's playing, prefers timed lyrics, and tries to shift the
 timing when an upload has a padded intro.
 
@@ -196,7 +196,7 @@ by [@NUber-dev](https://github.com/NUber-dev), and has been its own project
 since August. Most of the app is built on their work.
 
 Thanks to [yt-dlp](https://github.com/yt-dlp/yt-dlp) for audio streaming,
-[LRCLIB](https://lrclib.net), Musixmatch and Genius for lyrics, and
+[LRCLIB](https://lrclib.net) and Genius for lyrics, and
 [Tauri](https://tauri.app), [shadcn/ui](https://ui.shadcn.com) and
 [TanStack](https://tanstack.com).
 
