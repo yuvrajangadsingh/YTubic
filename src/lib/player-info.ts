@@ -1,17 +1,16 @@
 import { innertubePost } from "@/lib/innertube/shared";
 
-/** A listen report usually comes 30 s after the loudness read. A listen
- *  stretched past this by pausing just asks again. */
+/** Long enough for a track's loudness to be read once per play. */
 const TTL_MS = 60_000;
 
 type Entry = { at: number; response: ReturnType<typeof innertubePost> };
 const cache = new Map<string, Entry>();
 
 /**
- * The signed-in `player` response for a track, shared by what needs it
- * (loudness at the start of a track, the listen report after 30 s) so a
- * listen normally costs one. Bound to the account, and kept per account and
- * brand channel: the tracking url it holds is the channel's.
+ * The signed-in `player` response for a track, for loudness. Bound to the
+ * account and kept per account and channel. The listen report does not use
+ * it: a channel switch while a request is out can store one channel's
+ * tracking url under the other, which is harmless for loudness only.
  */
 export function playerInfo(
   videoId: string,

@@ -55,7 +55,6 @@ vi.mock("@/lib/innertube/shared", () => ({
 
 const { heardBetween, newCpn, playbackPingUrl, reportListen, watchListen } =
   await import("./yt-history");
-const { clearPlayerInfo } = await import("./player-info");
 
 const BASE = "https://s.youtube.com/api/stats/playback?cl=1&docid=abc&fexp=1,2";
 const playerWith = (baseUrl: unknown) => ({
@@ -256,7 +255,6 @@ describe("watchListen", () => {
 
 describe("reportListen", () => {
   beforeEach(() => {
-    clearPlayerInfo();
     settings.ytHistory = true;
   });
 
