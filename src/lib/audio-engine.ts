@@ -651,17 +651,22 @@ export function useAudioEngine() {
   }, []);
 
   // React to current-track changes → resolve stream → set src.
-  const { videoId, track, index } = usePlaybackStore(
+  const { videoId, track, index, loaded } = usePlaybackStore(
     useShallow((s) => {
       const t = s.index >= 0 ? s.queue[s.index] : undefined;
-      return { videoId: t?.videoId, track: t, index: s.index };
+      return {
+        videoId: t?.videoId,
+        track: t,
+        index: s.index,
+        loaded: s.streamUrl !== undefined,
+      };
     }),
   );
   // The playing slot, which survives `index` shifting under it (an earlier
   // row removed or moved). Everything below that means "this queue slot"
   // keys on it, so editing the queue around a song never reloads it.
   const slotRef = useRef<PlayingSlot>({ entry: track, index, videoId, id: 0 });
-  slotRef.current = followSlot(slotRef.current, track, index, videoId);
+  slotRef.current = followSlot(slotRef.current, track, index, videoId, loaded);
   const slot = slotRef.current.id;
 
   // Substitute the streaming videoId via the user's per-track source
@@ -2233,7 +2238,11 @@ export function useAudioEngine() {
         started:
           !!el &&
           loadedSlotRef.current?.videoId === t.videoId &&
-          loadedSlotRef.current?.slot === slotRef.current.id &&
+          // The live slot, not the last render's: an end guard may have
+          // advanced the store before this ran.
+          loadedSlotRef.current?.slot ===
+            followSlot(slotRef.current, t, s.index, t.videoId, !!s.streamUrl)
+              .id &&
           !el.paused &&
           el.readyState >= 3 &&
           !el.ended,

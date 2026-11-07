@@ -18,11 +18,19 @@ export function followSlot(
   entry: unknown,
   index: number,
   videoId: string | undefined,
+  /** The store still holds a stream url. Every playback transition (next,
+   *  prev, goTo, a new queue, removing the playing row) clears it; an edit
+   *  around the song (remove or move another row, shuffle on) doesn't. */
+  loaded: boolean,
 ): PlayingSlot {
   if (entry === prev.entry && index === prev.index) return prev;
   // The same entry somewhere else (a shift), or a new entry for the same song
-  // in the same slot (a queue rebuilt around it): still the same playback.
+  // in the same slot (a queue rebuilt around it): still the same playback,
+  // unless a transition cleared the stream (repeat-all reshuffling the same
+  // entry to the front, next onto a duplicate that shares the object).
   const sameSlot =
-    entry === prev.entry || (index === prev.index && videoId === prev.videoId);
+    loaded &&
+    (entry === prev.entry ||
+      (index === prev.index && videoId === prev.videoId));
   return { entry, index, videoId, id: sameSlot ? prev.id : prev.id + 1 };
 }
