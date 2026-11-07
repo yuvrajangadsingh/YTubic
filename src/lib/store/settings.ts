@@ -59,6 +59,9 @@ type State = {
    *  each one. Off by default: it changes how the app sounds. See
    *  `lib/loudness.ts`. */
   normalizeVolume: boolean;
+  /** Show a Latin spelling under Devanagari, Gurmukhi and Tamil lyric lines.
+   *  See `lib/lyrics/romanize.ts`. */
+  romanizeLyrics: boolean;
   setCloseAction: (v: CloseButtonAction) => void;
   setCacheAutoClean: (v: CacheAutoCleanPeriod) => void;
   markCacheCleaned: () => void;
@@ -72,6 +75,7 @@ type State = {
   setLastfmAvatar: (v: string | null) => void;
   setYtHistory: (v: boolean) => void;
   setNormalizeVolume: (v: boolean) => void;
+  setRomanizeLyrics: (v: boolean) => void;
   /** Store the account returned by the connect flow and enable scrobbling. */
   setLastfmSession: (username: string, sessionKey: string) => void;
   /** Forget the connected account and stop scrobbling. */
@@ -102,6 +106,7 @@ export const useSettingsStore = create<State>()(
       lastfmLoveSync: false,
       ytHistory: true,
       normalizeVolume: false,
+      romanizeLyrics: false,
       setCloseAction: (closeAction) => set({ closeAction }),
       setCacheAutoClean: (cacheAutoClean) => set({ cacheAutoClean }),
       markCacheCleaned: () => set({ lastCacheCleanAt: Date.now() }),
@@ -117,6 +122,7 @@ export const useSettingsStore = create<State>()(
       setLastfmAvatar: (lastfmAvatar) => set({ lastfmAvatar }),
       setYtHistory: (ytHistory) => set({ ytHistory }),
       setNormalizeVolume: (normalizeVolume) => set({ normalizeVolume }),
+      setRomanizeLyrics: (romanizeLyrics) => set({ romanizeLyrics }),
       setLastfmSession: (lastfmUsername, lastfmSessionKey) =>
         set({ lastfmUsername, lastfmSessionKey, lastfmEnabled: true }),
       clearLastfmSession: () =>

@@ -26,6 +26,8 @@ import {
 import { usePlaybackStore } from "@/lib/store/playback";
 import { estimateLeadInOffset } from "@/lib/lyrics/auto-align";
 import { lineDir } from "@/lib/lyrics/text-dir";
+import { romanize } from "@/lib/lyrics/romanize";
+import { useSettingsStore } from "@/lib/store/settings";
 import { useLyricsSkip } from "@/lib/lyrics/skip";
 import type { QueueTrack } from "@/lib/store/playback";
 import { cn } from "@/lib/utils";
@@ -308,6 +310,11 @@ function TimedLyrics({
     const texts = lines.map((l) => l.text);
     return texts.map((_, i) => lineDir(texts, i));
   }, [lines]);
+  const romanizeOn = useSettingsStore((s) => s.romanizeLyrics);
+  const romanized = useMemo(
+    () => (romanizeOn ? lines.map((l) => romanize(l.text)) : null),
+    [lines, romanizeOn],
+  );
   // False while the active line sits above its anchor because the column
   // is already scrolled to the top (a line early in the song): it then
   // overlaps the blur strip, which has to get out of the way.
@@ -568,6 +575,7 @@ function TimedLyrics({
               )}
             >
               {line.text || "♪"}
+              {romanized?.[i] ? <RomanizedLine text={romanized[i]} /> : null}
             </button>
           );
         })}
@@ -592,12 +600,33 @@ function TimedLyrics({
   );
 }
 
+/** Sits under the line it spells, always left to right, sized off the line so
+ *  the fullscreen player's bigger type carries through. */
+function RomanizedLine({ text }: { text: string }) {
+  return (
+    <span dir="ltr" className="mt-0.5 block text-[0.62em] font-medium opacity-70">
+      {text}
+    </span>
+  );
+}
+
 function PlainLyrics({ text }: { text: string }) {
+  const romanizeOn = useSettingsStore((s) => s.romanizeLyrics);
   return (
     <div
       dir="auto"
       className="lyrics-plain lyrics-mask app-scroll h-full overflow-y-auto whitespace-pre-wrap px-2 pt-0 pb-12 text-lg font-medium leading-relaxed text-foreground/90">
-      {text}
+      {romanizeOn
+        ? text.split("\n").map((line, i) => {
+            const roman = romanize(line);
+            return (
+              <div key={i}>
+                {line || "\u00A0"}
+                {roman ? <RomanizedLine text={roman} /> : null}
+              </div>
+            );
+          })
+        : text}
     </div>
   );
 }
@@ -615,6 +644,8 @@ export function LyricsSourceButton({
   );
   const skip = useLyricsSkip((s) => s.skip);
   const reset = useLyricsSkip((s) => s.reset);
+  const romanizeOn = useSettingsStore((s) => s.romanizeLyrics);
+  const setRomanize = useSettingsStore((s) => s.setRomanizeLyrics);
 
   return (
     <DropdownMenu>
@@ -683,6 +714,11 @@ export function LyricsSourceButton({
             </DropdownMenuItem>
           );
         })}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => setRomanize(!romanizeOn)}>
+          <span className="flex-1">Show Latin spelling</span>
+          {romanizeOn ? <CheckIcon className="size-4" /> : null}
+        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   );
