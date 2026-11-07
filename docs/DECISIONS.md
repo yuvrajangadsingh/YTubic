@@ -9,20 +9,24 @@ time; they are quoted, not rounded up.
 
 ---
 
-## 2026-11-07 · QA round 2 findings left for 0.8
+## 2026-11-07 · QA findings left for 0.8 (rounds 2 and 3)
 
-**Decided:** not in 0.7.0 (the M4's call on QA round 2, report in the M5's
-gitignored `.notes/qa-2026-11-07-r2.md`).
+**Decided:** not in 0.7.0 (the M4's calls on QA rounds 2 and 3, reports in
+the M5's gitignored `.notes/qa-2026-11-07-r2.md` and `-r3.md`). Round 2's
+"Play again restarts the playing track" was a misread, per round 3, so it's
+not listed.
 
 - **Long vowels spelled as written, not as typed (QA N3).** ਕਾਲੀਆਂ ਗੱਡੀਆਂ
   comes out kaaleeaan gaddeeaan where people type kaaliyan gaddiyan, and हूँ
   comes out hu (typed hoon or hun). Romanization keeps medial long vowels
   long on purpose (naal, pyaar); the vowel-plus-aan endings and हूँ need their
   own rules.
-- **"Play again restarts the playing track", unconfirmed.** QA pressed Play
-  on a playlist whose first track was playing and saw it restart, but the
-  playing stream may have been the video counterpart of that song, so it may
-  be a different id. QA pins the ids next round; decide then.
+- **Rule-based spellings that aren't how people type them (QA round 3 N2).**
+  Sanskrit loans in Tamil (மோகன்லால் moganlaal for Mohanlal, தீபம் theebam,
+  பக்தி pakthi), English in Tamil script (டாக்டர் taaktar, பஸ் pas), a
+  doubled ச spelled chch (pachchai, machchaan, where people write pachai,
+  machan), and no voicing after ழ் or ர் (vaazhka, malarkal). A rule can't
+  know a word's origin; these need a small word list.
 
 ---
 
