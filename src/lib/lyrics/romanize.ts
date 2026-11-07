@@ -92,8 +92,10 @@ const GURMUKHI = (() => {
 })();
 const TAMIL: Script = {
   consonants: {
-    க: "k", ங: "ng", ச: "s", ஞ: "nj", ட: "t", ண: "n", த: "th", ந: "n",
-    ப: "p", ம: "m", ய: "y", ர: "r", ல: "l", வ: "v", ழ: "zh", ள: "l",
+    // The five stops are placeholders: one letter covers both sounds, and
+    // tamilVoicing picks from the neighbours.
+    க: "K", ங: "ng", ச: "C", ஞ: "nj", ட: "T", ண: "n", த: "TH", ந: "n",
+    ப: "P", ம: "m", ய: "y", ர: "r", ல: "l", வ: "v", ழ: "zh", ள: "l",
     ற: "r", ன: "n", ஜ: "j", ஷ: "sh", ஶ: "sh", ஸ: "s", ஹ: "h",
   },
   vowels: {
@@ -212,6 +214,45 @@ function deleteSchwas(a: Akshara[]): void {
   }
 }
 
+const TAMIL_STOPS: Record<string, [unvoiced: string, voiced: string]> = {
+  K: ["k", "g"],
+  C: ["s", "j"],
+  T: ["t", "d"],
+  TH: ["th", "dh"],
+  P: ["p", "b"],
+};
+
+/** Tamil's stops are written once and said two ways: unvoiced at the start
+ *  of a word, after another consonant or doubled (kandu's k, akka, pattu),
+ *  voiced after a nasal (anbe, kandu's d, pandhu, nenjam) and between vowels
+ *  (magan, paadal). ச is s at the start and between vowels, j after ஞ, and
+ *  ch doubled. A word-final aa is typed short (akka, appa), except in a
+ *  one-letter word (vaa). */
+function tamilVoicing(a: Akshara[]): void {
+  const latin = a.map((x) => x.consonant);
+  a.forEach((x, i) => {
+    const stop = TAMIL_STOPS[latin[i]];
+    if (!stop) return;
+    const prev = i > 0 ? a[i - 1] : undefined;
+    const prevLatin = i > 0 ? latin[i - 1] : "";
+    const cluster = !!prev && prev.vowel === "";
+    const doubled =
+      (cluster && prevLatin === latin[i]) ||
+      (x.vowel === "" && latin[i + 1] === latin[i]);
+    const afterNasal = cluster && /^(ng|nj|n|m)$/.test(prevLatin);
+    const voiced =
+      !doubled && (afterNasal || (!!prev && !cluster && prev.vowel !== ""));
+    x.consonant =
+      latin[i] === "C" && doubled ? "ch" : voiced ? stop[1] : stop[0];
+    // The nasal before a voiced stop is just n: ng+g, nj+j.
+    if (afterNasal && (prevLatin === "ng" || prevLatin === "nj")) {
+      prev!.consonant = "n";
+    }
+  });
+  const last = a[a.length - 1];
+  if (a.length > 1 && last.vowel === "aa") last.vowel = "a";
+}
+
 function spell(a: Akshara[], s: Script): string {
   let out = "";
   a.forEach((x, i) => {
@@ -255,6 +296,7 @@ export function romanize(text: string): string | null {
     const s = scriptOf(word);
     const akshara = parse(word, s);
     if (s.schwaDeletion) deleteSchwas(akshara);
+    if (s === TAMIL) tamilVoicing(akshara);
     return spell(akshara, s);
   });
   return found ? out : null;

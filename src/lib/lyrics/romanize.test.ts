@@ -28,9 +28,27 @@ describe("romanize", () => {
 
   it("spells Tamil, which keeps its vowels", () => {
     expect(romanize("நான் உன்னை காதலிக்கிறேன்")).toBe(
-      "naan unnai kaathalikkiren",
+      "naan unnai kaadhalikkiren",
     );
     expect(romanize("வாழ்க்கை ஒரு பயணம்")).toBe("vaazhkkai oru payanam");
+  });
+
+  it("voices Tamil stops after a nasal and between vowels (QA N1)", () => {
+    expect(romanize("அன்பே")).toBe("anbe");
+    expect(romanize("கண்டு")).toBe("kandu");
+    expect(romanize("நெஞ்சம்")).toBe("nenjam");
+    expect(romanize("சிங்கம்")).toBe("singam");
+    expect(romanize("பந்து")).toBe("pandhu");
+    expect(romanize("பாடல்")).toBe("paadal");
+    expect(romanize("மகன்")).toBe("magan");
+    expect(romanize("வந்தேன்")).toBe("vandhen");
+  });
+
+  it("keeps Tamil stops unvoiced when doubled or at the start", () => {
+    expect(romanize("அக்கா")).toBe("akka");
+    expect(romanize("அப்பா")).toBe("appa");
+    expect(romanize("பட்டு")).toBe("pattu");
+    expect(romanize("முன்பே வா என் அன்பே வா")).toBe("munbe vaa en anbe vaa");
   });
 
   it("handles the schwa rule's edges", () => {
