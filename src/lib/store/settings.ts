@@ -55,6 +55,10 @@ type State = {
    *  so the home feed and radio learn from plays here. On by default, the
    *  same as YouTube's own apps. See `lib/yt-history.ts`. */
   ytHistory: boolean;
+  /** Turn tracks louder than the target down, using YouTube's measurement of
+   *  each one. Off by default: it changes how the app sounds. See
+   *  `lib/loudness.ts`. */
+  normalizeVolume: boolean;
   setCloseAction: (v: CloseButtonAction) => void;
   setCacheAutoClean: (v: CacheAutoCleanPeriod) => void;
   markCacheCleaned: () => void;
@@ -67,6 +71,7 @@ type State = {
   setLastfmLoveSync: (v: boolean) => void;
   setLastfmAvatar: (v: string | null) => void;
   setYtHistory: (v: boolean) => void;
+  setNormalizeVolume: (v: boolean) => void;
   /** Store the account returned by the connect flow and enable scrobbling. */
   setLastfmSession: (username: string, sessionKey: string) => void;
   /** Forget the connected account and stop scrobbling. */
@@ -96,6 +101,7 @@ export const useSettingsStore = create<State>()(
       lastfmAvatar: null,
       lastfmLoveSync: false,
       ytHistory: true,
+      normalizeVolume: false,
       setCloseAction: (closeAction) => set({ closeAction }),
       setCacheAutoClean: (cacheAutoClean) => set({ cacheAutoClean }),
       markCacheCleaned: () => set({ lastCacheCleanAt: Date.now() }),
@@ -110,6 +116,7 @@ export const useSettingsStore = create<State>()(
       setLastfmLoveSync: (lastfmLoveSync) => set({ lastfmLoveSync }),
       setLastfmAvatar: (lastfmAvatar) => set({ lastfmAvatar }),
       setYtHistory: (ytHistory) => set({ ytHistory }),
+      setNormalizeVolume: (normalizeVolume) => set({ normalizeVolume }),
       setLastfmSession: (lastfmUsername, lastfmSessionKey) =>
         set({ lastfmUsername, lastfmSessionKey, lastfmEnabled: true }),
       clearLastfmSession: () =>

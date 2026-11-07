@@ -6,8 +6,8 @@ import {
   InnerTubeHttpError,
   authHeaders,
   captureSetCookies,
-  innertubePost,
 } from "@/lib/innertube/shared";
+import { playerInfo } from "@/lib/player-info";
 import { useAccounts } from "@/lib/store/accounts";
 import { useCastStore } from "@/lib/store/cast";
 import { usePlaybackStore } from "@/lib/store/playback";
@@ -161,18 +161,7 @@ export async function reportListen(
       );
       return;
     }
-    const player = await innertubePost(
-      "player",
-      {
-        videoId,
-        playbackContext: {
-          contentPlaybackContext: {
-            signatureTimestamp: Math.floor(Date.now() / 86_400_000) - 1,
-          },
-        },
-      },
-      { auth: "required", forAccount: account },
-    );
+    const player = await playerInfo(videoId, account, pageId);
     const url = playbackPingUrl(
       player?.playbackTracking?.videostatsPlaybackUrl?.baseUrl,
       newCpn(),

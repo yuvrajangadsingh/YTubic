@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
+  AudioLinesIcon,
   BellIcon,
   Loader2Icon,
   LogInIcon,
@@ -115,6 +116,8 @@ function BehaviorGroup() {
   const setPlaybackNotifications = useSettingsStore(
     (s) => s.setPlaybackNotifications,
   );
+  const normalizeVolume = useSettingsStore((s) => s.normalizeVolume);
+  const setNormalizeVolume = useSettingsStore((s) => s.setNormalizeVolume);
   const notchSongPeek = useSettingsStore((s) => s.notchSongPeek);
   const setNotchSongPeek = useSettingsStore((s) => s.setNotchSongPeek);
 
@@ -161,6 +164,18 @@ function BehaviorGroup() {
             checked={playbackNotifications}
             onCheckedChange={setPlaybackNotifications}
             aria-label="Playback notifications"
+          />
+        }
+      />
+      <SettingRow
+        icon={AudioLinesIcon}
+        title="Normalize volume"
+        description="Plays tracks at a similar loudness, using YouTube's measurement of each one. Loud tracks get quieter; quiet ones stay as they are."
+        control={
+          <Switch
+            checked={normalizeVolume}
+            onCheckedChange={setNormalizeVolume}
+            aria-label="Normalize volume"
           />
         }
       />
