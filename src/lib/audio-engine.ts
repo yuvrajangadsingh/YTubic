@@ -10,6 +10,7 @@ import {
   saveTrackMeta,
   streamUrlFor,
 } from "@/lib/stream";
+import { useLoudnessGain } from "@/lib/loudness";
 import { advanceAfterTrack } from "@/lib/sleep-timer";
 import { usePlaybackStore, type QueueTrack } from "@/lib/store/playback";
 import { videoQualityTier } from "@/lib/video-quality-tier";
@@ -1517,6 +1518,7 @@ export function useAudioEngine() {
 
   // Volume / mute follow store.
   const volume = usePlaybackStore((s) => s.volume);
+  const loudnessGain = useLoudnessGain(streamVideoId);
   const muted = usePlaybackStore((s) => s.muted);
   useEffect(() => {
     const el = audioRef.current;
@@ -1526,9 +1528,16 @@ export function useAudioEngine() {
     // change into the bottom ~20% and 20–100% sounds nearly identical.
     // Apply a cubic curve so the slider tracks perceived loudness.
     const clamped = Math.max(0, Math.min(1, volume));
-    el.volume = clamped ** 3;
+    el.volume = clamped ** 3 * loudnessGain;
     el.muted = muted;
-  }, [volume, muted]);
+  }, [volume, muted, loudnessGain]);
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    appLog(
+      `[loudness] gain ${loudnessGain.toFixed(3)} el.volume ${el.volume.toFixed(4)}`,
+    );
+  }, [loudnessGain]);
 
   // Handle seek requests.
   const pendingSeek = usePlaybackStore((s) => s.pendingSeek);
