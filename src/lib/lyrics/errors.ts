@@ -153,7 +153,13 @@ export function shouldRefetchLyricsOnFocus(query: {
   const { status, data, error } = query.state;
   if (status !== "error" || data !== undefined) return false;
   if (error instanceof LyricsRateLimitError) return false;
-  return !(error instanceof LyricsHttpError && error.status < 500);
+  // Both our providers' HTTP errors and YouTube Music's own (the ytmusic
+  // source goes through InnerTube).
+  const httpStatus =
+    error instanceof LyricsHttpError || error instanceof InnerTubeHttpError
+      ? error.status
+      : undefined;
+  return !(httpStatus !== undefined && httpStatus < 500);
 }
 
 export function shouldRetryLyricsQuery(

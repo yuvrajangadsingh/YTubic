@@ -114,6 +114,16 @@ describe("a refusal is not 'no lyrics', and must not be retried at once", () => 
       shouldRefetchLyricsOnFocus(failed(new LyricsRateLimitError("gated"))),
     ).toBe(false);
     expect(
+      shouldRefetchLyricsOnFocus(
+        failed(new InnerTubeHttpError("next", 403, "")),
+      ),
+    ).toBe(false);
+    expect(
+      shouldRefetchLyricsOnFocus(
+        failed(new InnerTubeHttpError("next", 503, "")),
+      ),
+    ).toBe(true);
+    expect(
       shouldRefetchLyricsOnFocus({
         state: { status: "success", data: null, error: null },
       }),
